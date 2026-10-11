@@ -1,4 +1,5 @@
 use crate::prelude::*;
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 // Port of checker/services.go (all except GetConstantValue at services.go:859,
@@ -962,20 +963,148 @@ pub fn get_possible_symbol_reference_nodes(
 
 // Go: checker/services.go:655 getPossibleSymbolReferencePositions
 // PORT: Go has two copies of this function with the same body (here and
-// ls/findallreferences.go:1646). The port keeps one: the ls copy, which
-// searches Go bytes and reads the bytes next to a match as Go bytes (see
-// its PORT notes). Before, this copy read port bytes there, so a match
-// next to an invalid byte unit tested a port byte (0x85 for Go's 0xC5).
+// ls/findallreferences.go:1646). The port keeps one, here, and ls re-exports
+// it: it searches Go bytes and reads the bytes next to a match as Go bytes
+// (see the PORT notes below). Before, the checker copy read port bytes there,
+// so a match next to an invalid byte unit tested a port byte (0x85 for Go's
+// 0xC5).
+// Go: ls/findallreferences.go:1646 getPossibleSymbolReferencePositions
+// PORT: Go indexes the text by byte. The search runs on the bytes, because
+// `position + symbolNameLength + 1` can fall inside a multi-byte character,
+// where a `&str` slice would panic.
+// PORT: Go searches the Go bytes. The text is in the source form and a
+// string literal's name in the value form (see
+// `scanner_util::GO_STRING_MARKER`): a lone surrogate is 3 invalid byte
+// units in the text and one surrogate unit in the name, so a port search
+// does not find it. A name with a marker unit, or with a char that can be
+// the second char of one (lead byte 0xF4), is searched on the Go bytes
+// (`go_string_bytes`) and the Go positions are mapped back
+// (`port_byte_offset`, with one scan for all of them: `GoOffsets`). So is
+// any name in a text with a marker when the container does not start the
+// text: as in Go, the first index is relative
+// to the container start and is then used as an absolute position, which
+// is only the same position in both forms when the bytes before agree.
+// Otherwise the port search finds the same positions. When the container
+// starts the text, each is a match of whole units, and the bytes next to it
+// are read as Go bytes (`go_unit_before`, `go_unit_at`), since a marker
+// unit has other bytes than Go's. With another container the text has no
+// marker, so its bytes are Go's.
+// PERF: Go `strings.Index` is one `memmem::Finder`, built once per call. It
+// returns the same first index. A byte-by-byte compare cost 29% to 56% of
+// find-references time on large files such as lib.dom.d.ts. The usual name
+// costs no scan for markers: a byte before a match is a unit's only when it
+// is not ASCII, and a byte after one only when it is the marker's lead byte.
 pub fn get_possible_symbol_reference_positions(
     source_file: Node,
     symbol_name: &str,
     container: Node,
 ) -> Vec<i32> {
-    crate::ls::findallreferences_p2::get_possible_symbol_reference_positions(
-        source_file,
-        symbol_name,
-        container,
-    )
+    let mut positions: Vec<i32> = Vec::new();
+
+    // TODO: Cache symbol existence for files to save text search
+    // Also, need to make this work for unicode escapes.
+
+    // Be resilient in the face of a symbol with no name or zero length name
+    if symbol_name.is_empty() {
+        return positions;
+    }
+
+    let text_text = source_file_text(source_file);
+
+    let container = if container.is_nil() {
+        source_file
+    } else {
+        container
+    };
+
+    let go_search = contains_go_string_marker(symbol_name)
+        || symbol_name.as_bytes().contains(&0xF4)
+        || (container.pos() > 0 && contains_go_string_marker(&text_text));
+    let (text, symbol_name, container_pos, end_pos) = if go_search {
+        (
+            go_string_bytes(&text_text),
+            go_string_bytes(symbol_name),
+            go_byte_offset(&text_text, container.pos()),
+            go_byte_offset(&text_text, container.end()),
+        )
+    } else {
+        (
+            Cow::Borrowed(text_text.as_bytes()),
+            Cow::Borrowed(symbol_name.as_bytes()),
+            container.pos(),
+            container.end(),
+        )
+    };
+    // Go `text[position-1]` and `text[endPosition]`. The port search reads
+    // a unit next to a match only when the container starts the text. With
+    // another container the first position, relative to the container, can
+    // fall inside a char, and the text has no marker.
+    let units = !go_search && container.pos() == 0;
+    let go_byte_before = |position: usize| -> u8 {
+        let b = text[position - 1];
+        if !units || b < 0x80 {
+            return b;
+        }
+        let mut buf = [0u8; 4];
+        let (unit, _) = go_unit_before(&text_text, position);
+        *go_unit_bytes(unit, &mut buf)
+            .last()
+            .expect("a unit has Go bytes")
+    };
+    let go_byte_at = |position: usize| -> u8 {
+        let b = text[position];
+        if !units || b != 0xEF {
+            return b;
+        }
+        let mut buf = [0u8; 4];
+        let (unit, _) = go_unit_at(&text_text, position);
+        go_unit_bytes(unit, &mut buf)[0]
+    };
+    let source_length = text.len() as i32;
+    let symbol_name_length = symbol_name.len() as i32;
+    // Go `strings.Index(s, symbolName)` is `finder.find(s)`; -1 is `None`.
+    let finder = memchr::memmem::Finder::new(&symbol_name);
+
+    // PORT: as in Go, the first index is relative to `container.Pos()` and is
+    // compared with the absolute `container.End()`.
+    let mut position = finder
+        .find(&text[container_pos as usize..])
+        .map_or(-1, |index| index as i32);
+    while position >= 0 && position < end_pos {
+        // We found a match.  Make sure it's not part of a larger word (i.e. the char
+        // before and after it have to be a non-identifier char).
+        let end_position = position + symbol_name_length;
+
+        // PORT: Go `rune(text[i])` converts one byte to a rune; `char::from`
+        // does the same for a `u8`.
+        if (position == 0 || !is_identifier_part(char::from(go_byte_before(position as usize))))
+            && (end_position == source_length
+                || !is_identifier_part(char::from(go_byte_at(end_position as usize))))
+        {
+            // Found a real match.  Keep searching.
+            positions.push(position);
+        }
+        let start_index = position + symbol_name_length + 1;
+        if start_index > source_length {
+            break;
+        }
+        let found_index = finder
+            .find(&text[start_index as usize..])
+            .map_or(-1, |index| index as i32);
+        if found_index != -1 {
+            position = start_index + found_index;
+        } else {
+            break;
+        }
+    }
+
+    if go_search {
+        let offsets = GoOffsets::new(&text_text);
+        for position in &mut positions {
+            *position = offsets.port_offset(*position);
+        }
+    }
+    positions
 }
 
 impl Checker {

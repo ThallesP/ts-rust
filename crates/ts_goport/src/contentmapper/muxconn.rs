@@ -154,7 +154,7 @@ impl MuxConn {
                     match handled {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => conn.record_request_error(err),
-                        Err(payload) => crate::lsp::server::go_crash(payload),
+                        Err(payload) => crate::execute::tsc::go_crash(payload),
                     }
                 });
             } else if msg.is_notification() {
@@ -981,7 +981,7 @@ mod tests {
     //   panic: handler panic [recovered]
     //   \tpanic: write panic [recovered, repanicked]
     // A Go panic ends the port the same way; any other panic is a port gap
-    // and exits `EXIT_UNPORTED` (`lsp::server::go_crash`). Each case runs in
+    // and exits `EXIT_UNPORTED` (`execute::tsc::go_crash`). Each case runs in
     // a child process.
     #[test]
     fn a_panic_in_the_panic_answer_ends_the_process() {

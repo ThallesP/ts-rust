@@ -1159,26 +1159,6 @@ impl MarshalerTo for LanguageServerSnapshotChanges {
     }
 }
 
-// PORT: Go decodes `core.ProjectReference` by reflection (the fields
-// `path`, `originalPath` and `circular`); only the api decodes it.
-impl UnmarshalerFrom for ProjectReference {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        let is_object = unmarshal_struct_fields(dec, "core.ProjectReference", |name, dec| {
-            match name {
-                "path" => json_unmarshal_decode(dec, &mut self.path)?,
-                "originalPath" => json_unmarshal_decode(dec, &mut self.original_path)?,
-                "circular" => json_unmarshal_decode(dec, &mut self.circular)?,
-                _ => return Ok(false),
-            }
-            Ok(true)
-        })?;
-        if !is_object {
-            *self = ProjectReference::default();
-        }
-        Ok(())
-    }
-}
-
 // Go: proto.go CreateProgramOptions (ts#63950, ts#64324)
 // PORT: Go `[]*core.ProjectReference` elements are never nil here.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -3593,42 +3573,6 @@ proto_json!(both GetSourceFileNamesParams {
     snapshot: "snapshot" plain,
     project: "project" plain,
 });
-
-// PORT: Go `core.ModuleKind` (and its alias `core.ResolutionMode`) and
-// `core.ScriptKind` are Go int32 types with no JSON methods, so JSON uses the
-// v2 int arshaler. The params of ts#64247, ts#64292 and ts#64216 decode
-// them. Errors name the Go type.
-macro_rules! core_int_json {
-    ($($ty:ident: $go:literal),* $(,)?) => {$(
-        impl MarshalerTo for $ty {
-            fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
-                self.0.marshal_json_to(enc)
-            }
-        }
-
-        impl UnmarshalerFrom for $ty {
-            fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-                self.0
-                    .unmarshal_json_from(dec)
-                    .map_err(|err| match SemanticError::of(&err) {
-                        Some(mut s) => {
-                            s.go_type = $go.to_string();
-                            s.into_json_error()
-                        }
-                        None => err,
-                    })
-            }
-        }
-
-        impl IsZero for $ty {
-            fn is_zero(&self) -> bool {
-                self.0 == 0
-            }
-        }
-    )*};
-}
-
-core_int_json!(ModuleKind: "core.ModuleKind", ScriptKind: "core.ScriptKind");
 
 // Go: proto.go GetModeForUsageLocationParams (ts#64292)
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -242,6 +242,25 @@ impl ExitStatus {
 /// (internal software error).
 pub const EXIT_UNPORTED: i32 = 70;
 
+/// PORT: a panic on a Go goroutine without `recover` ends the Go process.
+/// A Go panic that the port keeps (`core::go_panic`) ends it as the Go
+/// runtime does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2).
+/// Any other panic is a port gap and ends it the way `bin/goport.rs` ends a
+/// failed run: the unported report on stderr and `EXIT_UNPORTED` (70). The
+/// panic hook already printed such a panic.
+pub fn go_crash(payload: Box<dyn std::any::Any + Send>) -> ! {
+    use std::io::Write as _;
+    if crate::core::print_go_panic(payload.as_ref()) {
+        std::process::exit(crate::core::EXIT_GO_PANIC);
+    }
+    let mut stderr = std::io::stderr().lock();
+    for (name, count) in crate::core::unported_report() {
+        let _ = writeln!(stderr, "unported: {name} {count}");
+    }
+    let _ = stderr.flush();
+    std::process::exit(EXIT_UNPORTED);
+}
+
 // Go: execute/tsc/compile.go:61 Watcher
 pub trait Watcher {
     fn do_cycle(&mut self);
@@ -1386,7 +1405,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_child_process_close_does_not_wait_for_launcher_descendants() {
-        use crate::cmd::tsgo::prelude::is_process_alive;
+        // cmd/tsgo/isprocessalive_unix.rs `is_process_alive` (cmd is in the upper
+        // crate): `kill(pid, 0)`, alive on success or EPERM.
+        fn is_process_alive(pid: i32) -> bool {
+            Pid::from_raw(pid.max(0)).is_some_and(|pid| {
+                matches!(
+                    rustix::process::test_kill_process(pid),
+                    Ok(()) | Err(rustix::io::Errno::PERM)
+                )
+            })
+        }
         use rustix::process::{Pid, Signal, kill_process};
 
         let command: Vec<String> = ["sh", "-c", "nohup sleep 60 & echo $!; wait"]

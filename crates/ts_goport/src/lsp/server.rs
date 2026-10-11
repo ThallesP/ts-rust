@@ -1645,23 +1645,8 @@ fn lsp_any_type_name(v: &LspAny) -> &'static str {
     }
 }
 
-/// PORT: a panic on a Go goroutine without `recover` ends the Go process.
-/// A Go panic that the port keeps (`core::go_panic`) ends it as the Go
-/// runtime does: `panic: <message>` on stderr and `EXIT_GO_PANIC` (2).
-/// Any other panic is a port gap and ends it the way `bin/goport.rs` ends a
-/// failed run: the unported report on stderr and `EXIT_UNPORTED` (70). The
-/// panic hook already printed such a panic.
-pub fn go_crash(payload: Box<dyn Any + Send>) -> ! {
-    if crate::core::print_go_panic(payload.as_ref()) {
-        std::process::exit(crate::core::EXIT_GO_PANIC);
-    }
-    let mut stderr = std::io::stderr().lock();
-    for (name, count) in crate::core::unported_report() {
-        let _ = writeln!(stderr, "unported: {name} {count}");
-    }
-    let _ = stderr.flush();
-    std::process::exit(crate::execute::tsc::EXIT_UNPORTED);
-}
+/// Moved to `execute::tsc` (the lower crate), which contentmapper also calls.
+pub use crate::execute::tsc::go_crash;
 
 /// The text of a panic value (Go `%v` of the recovered value).
 pub fn panic_value_string(r: &(dyn Any + Send)) -> String {

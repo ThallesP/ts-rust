@@ -6,6 +6,8 @@
 //! `ScriptKind`) are defined in `crate::flags` with the Go values. Their Go
 //! methods are added here as inherent impls.
 
+use crate::frontend::json::{JsonDecoder, JsonError, MarshalerTo, UnmarshalerFrom};
+use crate::frontend::json_ext::{IsZero, SemanticError};
 use crate::frontend::tspath;
 use crate::prelude::*;
 
@@ -822,3 +824,40 @@ fn tspath_for_each_ancestor_directory(
         directory = parent_path;
     }
 }
+
+// PORT: Go `core.ModuleKind` (and its alias `core.ResolutionMode`) and
+// `core.ScriptKind` are Go int32 types with no JSON methods, so JSON uses the
+// v2 int arshaler. The params of ts#64247, ts#64292 and ts#64216 decode
+// them. Errors name the Go type. The impls are here, with the types: the api is in
+// the upper crate (orphan rule).
+macro_rules! core_int_json {
+    ($($ty:ident: $go:literal),* $(,)?) => {$(
+        impl MarshalerTo for $ty {
+            fn marshal_json_to(&self, enc: &mut String) -> Result<(), JsonError> {
+                self.0.marshal_json_to(enc)
+            }
+        }
+
+        impl UnmarshalerFrom for $ty {
+            fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+                self.0
+                    .unmarshal_json_from(dec)
+                    .map_err(|err| match SemanticError::of(&err) {
+                        Some(mut s) => {
+                            s.go_type = $go.to_string();
+                            s.into_json_error()
+                        }
+                        None => err,
+                    })
+            }
+        }
+
+        impl IsZero for $ty {
+            fn is_zero(&self) -> bool {
+                self.0 == 0
+            }
+        }
+    )*};
+}
+
+core_int_json!(ModuleKind: "core.ModuleKind", ScriptKind: "core.ScriptKind");

@@ -476,31 +476,3 @@ pub fn remove_min_and_version_numbers(file_name: &str) -> String {
     }
     file_name[0..end].to_string()
 }
-
-// PORT: Go decodes `packagejson.DependencyFields` by reflection with the
-// JSON v2 default struct rules (PORTING "JSON"). Only this file decodes that
-// struct on its own, so its `UnmarshalerFrom` lives here. The four fields
-// are `packagejson.Expected`, which never fails.
-impl UnmarshalerFrom for packagejson::DependencyFields {
-    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
-        let is_object =
-            unmarshal_struct_fields(dec, "packagejson.DependencyFields", |name, dec| {
-                match name {
-                    "dependencies" => json_unmarshal_decode(dec, &mut self.dependencies)?,
-                    "devDependencies" => json_unmarshal_decode(dec, &mut self.dev_dependencies)?,
-                    "peerDependencies" => {
-                        json_unmarshal_decode(dec, &mut self.peer_dependencies)?;
-                    }
-                    "optionalDependencies" => {
-                        json_unmarshal_decode(dec, &mut self.optional_dependencies)?;
-                    }
-                    _ => return Ok(false),
-                }
-                Ok(true)
-            })?;
-        if !is_object {
-            *self = packagejson::DependencyFields::default();
-        }
-        Ok(())
-    }
-}

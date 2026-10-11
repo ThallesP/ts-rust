@@ -968,8 +968,19 @@ mod debug_site_tests {
     use crate::core::go_panic_text;
     use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
     use crate::frontend::tspath::Path;
-    use crate::ls::findallreferences_p2::for_each_descendant_of_kind;
     use crate::pseudochecker::new_pseudo_checker;
+
+    // Go: ls/findallreferences.go:2103 forEachDescendantOfKind (the ls copy is in
+    // the upper crate).
+    fn for_each_descendant_of_kind(node: Node, kind: SyntaxKind, action: &mut dyn FnMut(Node)) {
+        node.for_each_child(|child| {
+            if child.kind() == kind {
+                action(child);
+            }
+            for_each_descendant_of_kind(child, kind, &mut *action);
+            false
+        });
+    }
 
     /// The last node of `kind` in a parse of `text`.
     fn node_of_kind(text: &'static str, kind: SyntaxKind) -> Node {

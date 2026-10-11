@@ -1,5 +1,6 @@
 //! Go `core` and `ast` pieces that only the frontend needs.
 
+use crate::frontend::json_ext::unmarshal_struct_fields;
 use crate::frontend::prelude::*;
 
 // Go: core/typeacquisition.go:5 TypeAcquisition
@@ -121,4 +122,25 @@ pub fn ensure_script_kind_from_file_name(file_name: &str) -> ScriptKind {
         return kind;
     }
     ScriptKind::TS
+}
+
+// PORT: Go decodes `core.ProjectReference` by reflection (the fields
+// `path`, `originalPath` and `circular`); only the api decodes it. The
+// impl is here, with the type: the api is in the upper crate (orphan rule).
+impl UnmarshalerFrom for ProjectReference {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object = unmarshal_struct_fields(dec, "core.ProjectReference", |name, dec| {
+            match name {
+                "path" => json_unmarshal_decode(dec, &mut self.path)?,
+                "originalPath" => json_unmarshal_decode(dec, &mut self.original_path)?,
+                "circular" => json_unmarshal_decode(dec, &mut self.circular)?,
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })?;
+        if !is_object {
+            *self = ProjectReference::default();
+        }
+        Ok(())
+    }
 }

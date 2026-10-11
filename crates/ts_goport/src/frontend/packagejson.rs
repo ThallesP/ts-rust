@@ -1330,3 +1330,32 @@ mod info_cache_tests {
         assert_eq!(entries, 3);
     }
 }
+
+// PORT: Go decodes `packagejson.DependencyFields` by reflection with the
+// JSON v2 default struct rules (PORTING "JSON"). Only this file decodes that
+// struct on its own (project/ata/discovertypings.rs). The impl is here, with the
+// type: project is in the upper crate (orphan rule). The four fields
+// are `packagejson.Expected`, which never fails.
+impl UnmarshalerFrom for DependencyFields {
+    fn unmarshal_json_from(&mut self, dec: &mut JsonDecoder<'_>) -> Result<(), JsonError> {
+        let is_object =
+            unmarshal_struct_fields(dec, "packagejson.DependencyFields", |name, dec| {
+                match name {
+                    "dependencies" => json_unmarshal_decode(dec, &mut self.dependencies)?,
+                    "devDependencies" => json_unmarshal_decode(dec, &mut self.dev_dependencies)?,
+                    "peerDependencies" => {
+                        json_unmarshal_decode(dec, &mut self.peer_dependencies)?;
+                    }
+                    "optionalDependencies" => {
+                        json_unmarshal_decode(dec, &mut self.optional_dependencies)?;
+                    }
+                    _ => return Ok(false),
+                }
+                Ok(true)
+            })?;
+        if !is_object {
+            *self = DependencyFields::default();
+        }
+        Ok(())
+    }
+}
