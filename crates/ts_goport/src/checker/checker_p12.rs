@@ -1636,20 +1636,12 @@ impl Checker {
 }
 
 /// The parent of `node` and the parent's kind: one store lookup for a node of
-/// a published store (`frozen_store_parent_kind`). The kind of a nil parent
-/// is `SyntaxKind::Unknown`.
+/// a published store whose parent is in the same store (`NodeRef`). The
+/// kind of a nil parent is `SyntaxKind::Unknown`.
+// PERF: noderef1 G1. Through the view, so it is the same inline code as a
+// parent step of a `NodeRef` walk.
 #[inline]
 pub fn node_parent_and_kind(node: Node) -> (Node, SyntaxKind) {
-    match crate::ast::store::frozen_store_parent_kind(node) {
-        Some(parent_and_kind) => parent_and_kind,
-        None => {
-            let parent = node.parent();
-            let kind = if parent.is_some() {
-                parent.kind()
-            } else {
-                SyntaxKind::Unknown
-            };
-            (parent, kind)
-        }
-    }
+    let parent = NodeRef::new(node).parent();
+    (parent.node(), parent.kind_or_unknown())
 }

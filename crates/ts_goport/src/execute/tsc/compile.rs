@@ -129,6 +129,14 @@ pub trait System {
     fn emit_writes_through_osvfs(&self) -> bool {
         true
     }
+
+    /// PORT: not in Go. How each emit write reaches the client when it is
+    /// a client call (the API build with `--callbacks writeFile`), else
+    /// None. `tsc -b` writes after a failed write by it
+    /// (`execute::incremental::emit_files::flush_client_writes`).
+    fn client_writes(&self) -> Option<crate::execute::incremental::emit_files::ClientWrites> {
+        None
+    }
 }
 
 // Go: execute/tsc/compile.go:37 newContentMapperLogger

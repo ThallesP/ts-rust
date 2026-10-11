@@ -361,8 +361,13 @@ impl Checker {
             t_symbol,
         );
         if t_object_flags.intersects(ObjectFlags::MAPPED) {
-            let declaration = self.ty(t).as_mapped_type().declaration;
-            self.ty_mut(result).as_mapped_type_mut().declaration = declaration;
+            let (declaration, declaration_name_type) = {
+                let d = self.ty(t).as_mapped_type();
+                (d.declaration, d.declaration_name_type)
+            };
+            let d = self.ty_mut(result).as_mapped_type_mut();
+            d.declaration = declaration;
+            d.declaration_name_type = declaration_name_type;
             // C.f. instantiateSignature
             let orig_type_parameter = self.get_type_parameter_from_mapped_type(t);
             let fresh_type_parameter = self.clone_type_parameter(orig_type_parameter);
@@ -583,8 +588,7 @@ impl Checker {
         {
             return s;
         }
-        let declaration = self.ty(t).as_mapped_type().declaration;
-        if declaration.name_type().is_nil() {
+        if self.ty(t).as_mapped_type().declaration_name_type.is_nil() {
             if self.is_array_type(s)
                 || s_flags.intersects(TypeFlags::ANY)
                     && self.find_resolution_cycle_start_index(
@@ -774,33 +778,41 @@ impl Checker {
     }
 
     // Go: checker/checker.go:23166 getConstraintTypeFromMappedType
+    // PERF: the cached path reads the mapped data once.
     pub fn get_constraint_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
-        if self.ty(t).as_mapped_type().constraint_type.is_nil() {
-            let type_parameter = self.get_type_parameter_from_mapped_type(t);
-            let constraint = self.get_constraint_of_type_parameter(type_parameter);
-            let constraint_type = if constraint.is_some() {
-                constraint
-            } else {
-                self.error_type
-            };
-            self.ty_mut(t).as_mapped_type_mut().constraint_type = constraint_type;
+        let constraint_type = self.ty(t).as_mapped_type().constraint_type;
+        if constraint_type.is_some() {
+            return constraint_type;
         }
-        self.ty(t).as_mapped_type().constraint_type
+        let type_parameter = self.get_type_parameter_from_mapped_type(t);
+        let constraint = self.get_constraint_of_type_parameter(type_parameter);
+        let constraint_type = if constraint.is_some() {
+            constraint
+        } else {
+            self.error_type
+        };
+        self.ty_mut(t).as_mapped_type_mut().constraint_type = constraint_type;
+        constraint_type
     }
 
     // Go: checker/checker.go:23174 getNameTypeFromMappedType
+    // PERF: reads `declaration_name_type` (Go `m.declaration.NameType`), and
+    // the mapped data once on the cached path.
     pub fn get_name_type_from_mapped_type(&mut self, t: TypeId) -> TypeId {
-        let declaration = self.ty(t).as_mapped_type().declaration;
-        if declaration.name_type().is_nil() {
+        let (name_type_node, name_type, mapper) = {
+            let m = self.ty(t).as_mapped_type();
+            (m.declaration_name_type, m.name_type, m.object.mapper)
+        };
+        if name_type_node.is_nil() {
             return TypeId::NIL;
         }
-        if self.ty(t).as_mapped_type().name_type.is_nil() {
-            let type_from_node = self.get_type_from_type_node(declaration.name_type());
-            let mapper = self.ty(t).as_mapped_type().object.mapper;
-            let name_type = self.instantiate_type(type_from_node, mapper);
-            self.ty_mut(t).as_mapped_type_mut().name_type = name_type;
+        if name_type.is_some() {
+            return name_type;
         }
-        self.ty(t).as_mapped_type().name_type
+        let type_from_node = self.get_type_from_type_node(name_type_node);
+        let name_type = self.instantiate_type(type_from_node, mapper);
+        self.ty_mut(t).as_mapped_type_mut().name_type = name_type;
+        name_type
     }
 
     // Go: checker/checker.go:23185 getTemplateTypeFromMappedType

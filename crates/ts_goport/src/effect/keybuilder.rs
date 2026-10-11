@@ -93,7 +93,7 @@ pub fn create_string(
         if let Some(rest) = sub_directory.strip_prefix('/') {
             sub_directory = rest.to_string();
         }
-        for prefix in &key_pattern.skip_leading_path {
+        for prefix in key_pattern.skip_leading_path.iter().flatten() {
             if sub_directory.starts_with(prefix.as_str()) {
                 sub_directory = sub_directory[prefix.len()..].to_string();
                 break;

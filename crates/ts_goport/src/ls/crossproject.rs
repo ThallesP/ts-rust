@@ -428,14 +428,16 @@ pub fn search_item_with_data<P: ProgramView, Req, Resp>(
     Some(to_resp(ls, ctx, params, data, options))
 }
 
+// Go: ls/crossproject.go:94 the deferred recover of the queued function
 /// Go `fmt.Sprintf("panic handling request: %v\n%s", r, debug.Stack())`, the
 /// text that the deferred recover of the queued function keeps (Go
 /// `panicOccurred`). The name keeps the old spelling because
 /// `search_thread.rs` calls it.
+// PORT: the port site of a Go panic takes the place of Go's goroutine trace
+// (`core::go_recovered_stack`), as in the LSP request recover.
 pub fn panic_occured_text(payload: Box<dyn std::any::Any + Send>) -> String {
     let text = panic_payload_text(&*payload);
-    // PORT: Go `debug.Stack()`; the text is only logged.
-    let stack = std::backtrace::Backtrace::force_capture();
+    let stack = crate::core::go_recovered_stack(&*payload);
     format!("panic handling request: {text}\n{stack}")
 }
 
@@ -1089,5 +1091,26 @@ pub fn combine_incoming_calls(
     }
     lsproto::CallHierarchyIncomingCallsOrNull {
         call_hierarchy_incoming_calls: Some(combined),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Go: ls/crossproject.go:96 `panic handling request: %v\n%s` of a
+    // recovered nil dereference. The port site takes the place of Go's
+    // `debug.Stack()` goroutine trace, with no Rust backtrace.
+    #[test]
+    fn panic_occured_text_ends_with_the_port_site() {
+        let line = line!() + 1;
+        let payload = std::panic::catch_unwind(|| crate::core::go_nil_dereference_at(0x10));
+        assert_eq!(
+            panic_occured_text(payload.expect_err("a Go panic")),
+            format!(
+                "panic handling request: runtime error: invalid memory address or nil pointer dereference\n\t{}:{line}\n",
+                file!()
+            )
+        );
     }
 }

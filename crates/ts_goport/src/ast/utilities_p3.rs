@@ -194,6 +194,22 @@ pub fn get_import_type_node_literal(node: Node) -> Node {
 
 // Go: ast/utilities.go:1997 IsExpressionNode
 pub fn is_expression_node(node: Node) -> bool {
+    is_expression_node_ref(NodeRef::new(node))
+}
+
+/// The kind test of Go `IsJSDocLinkLike` (`is_js_doc_link_like`).
+#[inline]
+fn is_js_doc_link_like_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::JsDocLink | SyntaxKind::JsDocLinkCode | SyntaxKind::JsDocLinkPlain
+    )
+}
+
+/// `is_expression_node` on the view of the node.
+// PERF: noderef1 G1. The node and its parents are read through views
+// (`NodeRef`): one registry lookup per node, not one per field read.
+pub fn is_expression_node_ref(node: NodeRef) -> bool {
     match node.kind() {
         SyntaxKind::SuperKeyword
         | SyntaxKind::NullKeyword
@@ -232,47 +248,61 @@ pub fn is_expression_node(node: Node) -> bool {
         | SyntaxKind::AwaitExpression => true,
         SyntaxKind::MetaProperty => {
             // `import.<phase>` in `import.<phase>(...)` is not an expression
-            !is_import_call(node.parent()) || node.parent().expression() != node
+            let parent = node.parent();
+            !is_import_call(parent.node()) || parent.expression() != node.node()
         }
-        SyntaxKind::ExpressionWithTypeArguments => !is_heritage_clause(node.parent()),
+        SyntaxKind::ExpressionWithTypeArguments => {
+            node.parent().kind() != SyntaxKind::HeritageClause
+        }
         SyntaxKind::QualifiedName => {
             let mut node = node;
-            while node.parent().kind() == SyntaxKind::QualifiedName {
-                node = node.parent();
+            let mut parent = node.parent();
+            while parent.kind() == SyntaxKind::QualifiedName {
+                node = parent;
+                parent = node.parent();
             }
-            is_type_query_node(node.parent())
-                || is_js_doc_link_like(node.parent())
-                || is_js_doc_name_reference(node.parent())
-                || is_jsx_tag_name(node)
+            let parent_kind = parent.kind();
+            parent_kind == SyntaxKind::TypeQuery
+                || is_js_doc_link_like_kind(parent_kind)
+                || parent_kind == SyntaxKind::JsDocNameReference
+                || is_jsx_tag_name_of(node.node(), parent)
         }
         SyntaxKind::PrivateIdentifier => {
-            is_binary_expression(node.parent())
-                && node.parent().left() == node
-                && node.parent().operator_token().kind() == SyntaxKind::InKeyword
+            let parent = node.parent();
+            parent.kind() == SyntaxKind::BinaryExpression
+                && parent.node().left() == node.node()
+                && parent.node().operator_token().kind() == SyntaxKind::InKeyword
         }
         SyntaxKind::Identifier => {
-            if is_type_query_node(node.parent())
-                || is_js_doc_link_like(node.parent())
-                || is_js_doc_name_reference(node.parent())
-                || is_jsx_tag_name(node)
+            let parent = node.parent();
+            let parent_kind = parent.kind();
+            if parent_kind == SyntaxKind::TypeQuery
+                || is_js_doc_link_like_kind(parent_kind)
+                || parent_kind == SyntaxKind::JsDocNameReference
+                || is_jsx_tag_name_of(node.node(), parent)
             {
                 return true;
             }
             // Go `fallthrough` into the literal case.
-            is_in_expression_context(node)
+            is_in_expression_context_of(node.node(), parent)
         }
         SyntaxKind::NumericLiteral
         | SyntaxKind::BigIntLiteral
         | SyntaxKind::StringLiteral
         | SyntaxKind::NoSubstitutionTemplateLiteral
-        | SyntaxKind::ThisKeyword => is_in_expression_context(node),
+        | SyntaxKind::ThisKeyword => is_in_expression_context_of(node.node(), node.parent()),
         _ => false,
     }
 }
 
 // Go: ast/utilities.go:2032 IsInExpressionContext
 pub fn is_in_expression_context(node: Node) -> bool {
-    let parent = node.parent();
+    is_in_expression_context_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_in_expression_context(node)`, where `parent` is the view of the
+/// parent of `node`.
+pub fn is_in_expression_context_of(node: Node, parent: NodeRef) -> bool {
     match parent.kind() {
         SyntaxKind::VariableDeclaration
         | SyntaxKind::Parameter
@@ -299,8 +329,8 @@ pub fn is_in_expression_context(node: Node) -> bool {
         SyntaxKind::ForStatement => {
             let initializer = parent.initializer();
             initializer == node && initializer.kind() != SyntaxKind::VariableDeclarationList
-                || parent.condition() == node
-                || parent.incrementor() == node
+                || parent.node().condition() == node
+                || parent.node().incrementor() == node
         }
         SyntaxKind::ForInStatement | SyntaxKind::ForOfStatement => {
             let initializer = parent.initializer();
@@ -312,26 +342,32 @@ pub fn is_in_expression_context(node: Node) -> bool {
         | SyntaxKind::JsxSpreadAttribute
         | SyntaxKind::SpreadAssignment => true,
         SyntaxKind::ExpressionWithTypeArguments => {
-            parent.expression() == node && !is_part_of_type_node(parent)
+            parent.expression() == node && !is_part_of_type_node(parent.node())
         }
-        SyntaxKind::ShorthandPropertyAssignment => parent.object_assignment_initializer() == node,
+        SyntaxKind::ShorthandPropertyAssignment => {
+            parent.node().object_assignment_initializer() == node
+        }
         SyntaxKind::FunctionExpression | SyntaxKind::ClassExpression => {
             // The name of a function or class expression is a declaration name, not an expression.
             parent.name() != node
         }
-        _ => is_expression_node(parent),
+        _ => is_expression_node_ref(parent),
     }
 }
 
 // Go: ast/utilities.go:2058 IsPartOfTypeNode
+// PERF: noderef1 G2. The node and its parents are read through views
+// (`NodeRef`): one registry lookup for the node, none for a parent in its
+// store.
 pub fn is_part_of_type_node(node: Node) -> bool {
+    let node = NodeRef::new(node);
     let kind = node.kind();
     if (kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
         && (kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
         return true;
     }
-    match node.kind() {
+    match kind {
         SyntaxKind::AnyKeyword
         | SyntaxKind::UnknownKeyword
         | SyntaxKind::NumberKeyword
@@ -349,26 +385,31 @@ pub fn is_part_of_type_node(node: Node) -> bool {
             return node.parent().kind() != SyntaxKind::VoidExpression;
         }
         SyntaxKind::ExpressionWithTypeArguments => {
-            return is_part_of_type_expression_with_type_arguments(node);
+            return is_part_of_type_expression_with_type_arguments(node.node());
         }
         SyntaxKind::TypeParameter => {
-            return node.parent().kind() == SyntaxKind::MappedType
-                || node.parent().kind() == SyntaxKind::InferType;
+            return matches!(
+                node.parent().kind(),
+                SyntaxKind::MappedType | SyntaxKind::InferType
+            );
         }
         SyntaxKind::Identifier => {
             let parent = node.parent();
-            if is_qualified_name(parent) && parent.right() == node {
-                return is_part_of_type_node_in_parent(parent);
+            match parent.kind() {
+                SyntaxKind::QualifiedName if parent.node().right() == node.node() => {
+                    return is_part_of_type_node_in_parent_of(parent.node(), parent.parent());
+                }
+                SyntaxKind::PropertyAccessExpression if parent.name() == node.node() => {
+                    return is_part_of_type_node_in_parent_of(parent.node(), parent.parent());
+                }
+                _ => {}
             }
-            if is_property_access_expression(parent) && parent.name() == node {
-                return is_part_of_type_node_in_parent(parent);
-            }
-            return is_part_of_type_node_in_parent(node);
+            return is_part_of_type_node_in_parent_of(node.node(), parent);
         }
         SyntaxKind::QualifiedName
         | SyntaxKind::PropertyAccessExpression
         | SyntaxKind::ThisKeyword => {
-            return is_part_of_type_node_in_parent(node);
+            return is_part_of_type_node_in_parent_of(node.node(), node.parent());
         }
         _ => {}
     }
@@ -377,12 +418,18 @@ pub fn is_part_of_type_node(node: Node) -> bool {
 
 // Go: ast/utilities.go:2089 isPartOfTypeNodeInParent
 pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
-    let parent = node.parent();
-    if parent.kind() == SyntaxKind::TypeQuery {
+    is_part_of_type_node_in_parent_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_part_of_type_node_in_parent(node)`, where `parent` is the view of
+/// the parent of `node`.
+fn is_part_of_type_node_in_parent_of(node: Node, parent: NodeRef) -> bool {
+    let parent_kind = parent.kind();
+    if parent_kind == SyntaxKind::TypeQuery {
         return false;
     }
-    if parent.kind() == SyntaxKind::ImportType {
-        return !parent.is_type_of();
+    if parent_kind == SyntaxKind::ImportType {
+        return !parent.node().is_type_of();
     }
 
     // Do not recursively call isPartOfTypeNode on the parent. In the example:
@@ -391,17 +438,17 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
     //
     // Calling isPartOfTypeNode would consider the qualified name A.B a type node.
     // Only C and A.B.C are type nodes.
-    if (parent.kind() as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
-        && (parent.kind() as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
+    if (parent_kind as u16) >= (SyntaxKind::FIRST_TYPE_NODE as u16)
+        && (parent_kind as u16) <= (SyntaxKind::LAST_TYPE_NODE as u16)
     {
         return true;
     }
-    match parent.kind() {
+    match parent_kind {
         SyntaxKind::ExpressionWithTypeArguments => {
-            return is_part_of_type_expression_with_type_arguments(parent);
+            return is_part_of_type_expression_with_type_arguments(parent.node());
         }
         SyntaxKind::TypeParameter => {
-            return node == parent.constraint();
+            return node == parent.node().constraint();
         }
         SyntaxKind::VariableDeclaration
         | SyntaxKind::Parameter
@@ -424,7 +471,7 @@ pub fn is_part_of_type_node_in_parent(node: Node) -> bool {
         SyntaxKind::CallExpression
         | SyntaxKind::NewExpression
         | SyntaxKind::TaggedTemplateExpression => {
-            return parent.type_arguments().to_vec().contains(&node);
+            return parent.node().type_arguments().to_vec().contains(&node);
         }
         _ => {}
     }

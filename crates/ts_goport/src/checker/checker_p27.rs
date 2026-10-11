@@ -176,7 +176,7 @@ impl Checker {
     pub fn get_type_from_mapped_type_node(&mut self, node: Node) -> TypeId {
         if self.type_node_links.get(node).resolved_type.is_nil() {
             let t = self.new_object_type(ObjectFlags::MAPPED, node.symbol());
-            self.ty_mut(t).as_mapped_type_mut().declaration = node;
+            self.ty_mut(t).as_mapped_type_mut().set_declaration(node);
             let alias = self.get_alias_for_type_node(node);
             self.ty_mut(t).alias = alias;
             self.type_node_links.get(node).resolved_type = t;
@@ -1306,23 +1306,31 @@ impl Checker {
     }
 
     // Go: checker/checker.go:25442 isGenericMappedType
+    // PERF: the `MAPPED` test is inline and the rest out of line, so a type
+    // that is not mapped (most calls) makes no call.
+    #[inline]
     pub fn is_generic_mapped_type(&mut self, t: TypeId) -> bool {
-        if self.ty(t).object_flags.intersects(ObjectFlags::MAPPED) {
-            let constraint = self.get_constraint_type_from_mapped_type(t);
-            if self.is_generic_index_type(constraint) {
+        self.ty(t).object_flags.intersects(ObjectFlags::MAPPED)
+            && self.is_generic_mapped_type_worker(t)
+    }
+
+    /// The body of `is_generic_mapped_type` for a mapped type.
+    #[inline(never)]
+    fn is_generic_mapped_type_worker(&mut self, t: TypeId) -> bool {
+        let constraint = self.get_constraint_type_from_mapped_type(t);
+        if self.is_generic_index_type(constraint) {
+            return true;
+        }
+        // A mapped type is generic if the 'as' clause references generic types other than the iteration type.
+        // To determine this, we substitute the constraint type (that we now know isn't generic) for the iteration
+        // type and check whether the resulting type is generic.
+        let name_type = self.get_name_type_from_mapped_type(t);
+        if name_type.is_some() {
+            let type_parameter = self.get_type_parameter_from_mapped_type(t);
+            let mapper = self.new_simple_type_mapper(type_parameter, constraint);
+            let instantiated = self.instantiate_type(name_type, mapper);
+            if self.is_generic_index_type(instantiated) {
                 return true;
-            }
-            // A mapped type is generic if the 'as' clause references generic types other than the iteration type.
-            // To determine this, we substitute the constraint type (that we now know isn't generic) for the iteration
-            // type and check whether the resulting type is generic.
-            let name_type = self.get_name_type_from_mapped_type(t);
-            if name_type.is_some() {
-                let type_parameter = self.get_type_parameter_from_mapped_type(t);
-                let mapper = self.new_simple_type_mapper(type_parameter, constraint);
-                let instantiated = self.instantiate_type(name_type, mapper);
-                if self.is_generic_index_type(instantiated) {
-                    return true;
-                }
             }
         }
         false
@@ -1387,7 +1395,9 @@ impl Checker {
         // the nil parent of the SourceFile, and `IsParameterDeclaration(nil)`
         // dereferences it. The shortcuts below skip that walk.
         if matches!(node.kind(), SyntaxKind::SourceFile | SyntaxKind::EndOfFile) {
-            crate::core::go_nil_dereference();
+            // Go N' loads `node.Kind` of the nil parent (offset 0): addr=0x0
+            // (ast_generated.go:1888).
+            crate::core::go_nil_dereference_at(0x0);
         }
         if let Some(facts) = frozen_node_store_facts(node) {
             // PERF: hono P7-C7. The loop adds a constraint only under a
@@ -1525,23 +1535,32 @@ pub fn is_unary_tuple_type_node(node: Node) -> bool {
 /// can fire, in walk order. It reads only the AST. The loop body at other
 /// steps adds nothing for any type, and a conditional step never takes the
 /// mapped branch (its parent is not a MappedType).
+// PERF: noderef1 G2. The walk reads each node through a view (`NodeRef`):
+// no registry lookup for a parent in the same store, where the Go reads
+// made about six per step.
 fn for_each_conditional_flow_step(node: Node, mut f: impl FnMut(FlowStep)) {
     let mut covariant = true;
-    let mut node = node;
-    while node.is_some() && !is_statement(node) && node.kind() != SyntaxKind::JsDoc {
+    let mut node = NodeRef::new(node);
+    while node.is_some() && !is_statement_ref(node) && node.kind() != SyntaxKind::JsDoc {
         let parent = node.parent();
+        let parent_kind = parent.kind();
         // only consider variance flipped by parameter locations - `keyof` types would usually be considered variance inverting, but
         // often get used in indexed accesses where they behave sortof invariantly, but our checking is lax
-        if is_parameter_declaration(parent) {
+        if parent_kind == SyntaxKind::Parameter {
             covariant = !covariant;
         }
-        if is_conditional_type_node(parent) && node == parent.true_type() {
-            f(FlowStep::Conditional { parent, covariant });
-        } else if is_mapped_type_node(parent)
-            && parent.name_type().is_nil()
-            && node == parent.type_()
+        if parent_kind == SyntaxKind::ConditionalType && node.node() == parent.node().true_type() {
+            f(FlowStep::Conditional {
+                parent: parent.node(),
+                covariant,
+            });
+        } else if parent_kind == SyntaxKind::MappedType
+            && parent.node().name_type().is_nil()
+            && node.node() == parent.type_()
         {
-            f(FlowStep::Mapped { parent });
+            f(FlowStep::Mapped {
+                parent: parent.node(),
+            });
         }
         node = parent;
     }

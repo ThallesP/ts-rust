@@ -334,11 +334,14 @@ pub fn is_this_in_type_query(node: Node) -> bool {
     if !is_this_identifier(node) {
         return false;
     }
-    let mut node = node;
-    while is_qualified_name(node.parent()) && node.parent().left() == node {
-        node = node.parent();
+    // PERF: noderef1 G1. The parents are read through views (`NodeRef`).
+    let mut node = NodeRef::new(node);
+    let mut parent = node.parent();
+    while parent.kind() == SyntaxKind::QualifiedName && parent.node().left() == node.node() {
+        node = parent;
+        parent = node.parent();
     }
-    node.parent().kind() == SyntaxKind::TypeQuery
+    parent.kind() == SyntaxKind::TypeQuery
 }
 
 // Go: ast/utilities.go:3043 IsLet

@@ -1170,7 +1170,8 @@ impl Checker {
                 .get_by_id(&self.symbols, late_bound)
                 .name_type;
             if t.is_nil() {
-                if self.sym(prop).name == INTERNAL_SYMBOL_NAME_DEFAULT {
+                // PERF: intern1 fix 2. An id compare, with no text read.
+                if self.sym(prop).name.is_default_symbol_name() {
                     t = self.get_string_literal_type("default");
                 } else {
                     let name = get_name_of_declaration(self.sym(prop).value_declaration);

@@ -3310,14 +3310,14 @@ impl Server {
 
     // Go: server.go:1513 recover
     // PORT: Go `defer s.recover(req)`; `recover_guard` runs the guarded code
-    // in `catch_unwind` and calls this with the panic value.
-    // PORT: Go `debug.Stack()` is the stack of the panicking goroutine.
-    // Rust unwinding has left that stack here, so this is the current
-    // backtrace (empty unless RUST_BACKTRACE is set); `sanitize_stack_trace`
-    // finds no Go frames in it and gives "" (log and telemetry text only).
+    // in `core::go_recover` and calls this with the panic value.
+    // PORT: Go `debug.Stack()` is the goroutine trace of the panic; the
+    // port logs `core::go_recovered_stack` in its place.
+    // `sanitize_stack_trace` finds no Go frames in it and gives "" (log and
+    // telemetry text only).
     pub fn recover(&self, req: &lsproto::RequestMessage, r: Box<dyn Any + Send>) {
+        let stack = crate::core::go_recovered_stack(r.as_ref());
         let r = panic_value_string(r.as_ref());
-        let stack = std::backtrace::Backtrace::capture().to_string();
         self.logger.errorf(&format!(
             "panic handling request {}: {}\n{}",
             req.method, r, stack
@@ -3365,14 +3365,18 @@ impl Server {
 
     /// Go `defer s.recover(req)` at the top of a function: runs `f`; when
     /// it panics, recovers the panic with `recover` and returns `zero()`
-    /// (Go returns the zero values of the unnamed results).
+    /// (Go returns the zero values of the unnamed results). It is a Go
+    /// `recover()` (`core::go_recover`): it sees only the request's own
+    /// goroutine, so a Go panic in a work group task of `f` (an emit job:
+    /// `core::go_work_group_task`) ends the process as in Go, and the panic
+    /// hook prints nothing for a panic that it answers.
     pub fn recover_guard<T>(
         &self,
         req: &lsproto::RequestMessage,
         zero: impl FnOnce() -> T,
         f: impl FnOnce() -> T,
     ) -> T {
-        match catch_unwind(AssertUnwindSafe(f)) {
+        match crate::core::go_recover(f) {
             Ok(v) => v,
             Err(r) => {
                 self.recover(req, r);
@@ -3669,7 +3673,13 @@ impl Server {
     ) -> Result<(), GoError> {
         let mut disable_push_diagnostics = false;
         let mut enable_telemetry = false;
-        let initialization_options = self.shared.initialization_options();
+        // Before `initialize` the options are nil: Go faults at its read of
+        // `DisablePushDiagnostics`, offset 0 (server.go:1716).
+        let initialization_options = self
+            .shared
+            .initialization_options
+            .get()
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
         if let Some(v) = initialization_options.disable_push_diagnostics {
             disable_push_diagnostics = v;
         }
@@ -3733,10 +3743,12 @@ impl Server {
         // names, and a root path counts only when it is absolute; each is
         // normalized (server.go:1752-1762).
         if client_capabilities.workspace.workspace_folders && single_workspace_folder.is_some() {
+            // A null folder: Go faults at its read of the length word of
+            // `Uri`, offset 0x8 (server.go:1752).
             let folder = single_workspace_folder
                 .expect("checked above")
                 .as_ref()
-                .unwrap_or_else(|| crate::core::go_nil_dereference());
+                .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x8));
             let file_name = lsproto::DocumentUri(folder.uri.0.clone()).file_name();
             if !file_name.is_empty() {
                 cwd = file_name;
@@ -4236,7 +4248,8 @@ impl Server {
             // Go: file.OldUri (a nil element panics)
             let file = file
                 .as_ref()
-                .unwrap_or_else(|| crate::core::go_nil_dereference());
+                // Go N' loads `file.OldUri` (offset 0): addr=0x0 (server.go:2015).
+                .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
             uris.push(file.old_uri.clone());
         }
 
@@ -4723,7 +4736,8 @@ impl Server {
             &code_lens
                 .data
                 .as_ref()
-                .unwrap_or_else(|| crate::core::go_nil_dereference())
+                // Go N' loads `codeLens.Data.Uri` (offset 0x10): addr=0x10 (server.go:2270).
+                .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x10))
                 .uri,
             req_msg,
         );
@@ -4991,7 +5005,8 @@ impl Server {
         let lsp_panic = Rc::new(RefCell::new(None));
 
         // Run the connection with panic recovery
-        let result = catch_unwind(AssertUnwindSafe(|| {
+        // PORT: a Go `recover()` (`core::go_recover`), as `recover_guard`.
+        let result = crate::core::go_recover(|| {
             let protocol = ApiConnProtocol {
                 inner: ipc::new_jsonrpc_protocol(rwc.clone()),
                 inbox: start_api_reader(&self.shared, rwc.clone()),
@@ -5021,9 +5036,9 @@ impl Server {
                     api_err.error()
                 ));
             }
-        }));
+        });
         if let Err(r) = result {
-            let stack = std::backtrace::Backtrace::capture().to_string();
+            let stack = crate::core::go_recovered_stack(r.as_ref());
             self.logger.errorf(&format!(
                 "API session {}: panic: {}\n{}",
                 api_session.id(),

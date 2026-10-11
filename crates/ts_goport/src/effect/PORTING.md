@@ -68,6 +68,15 @@ and "Types" sections and follow them. This file adds the Effect rules.
   version (one server serves projects with and without the plugin). Only
   build info records `<version>+effect-tsgo.0.51.1`
   (`etscore::EFFECT_VERSION`).
+- Build info `effect` text: without `extends`, Go writes a root `effectFn`,
+  `namespaceImportPackages`, `barrelImportPackages` or `overrides` that the
+  config sets to `[]`, a root `importAliases: {}`, and an override `include`
+  or `exclude` set to `[]`. The port leaves them out, as Go does for the same
+  lists through `extends` (`cloneEffectOptions` makes them nil). Go reads them
+  back as empty, so neither checks a file again: only the text differs. Where
+  nil and `[]` change the compare after a round trip (the override lists and
+  `skipLeadingPath`), the port keeps them apart as Go
+  (`configraw::clone_effect_options`, `etscore::SlicePtr`).
 
 ## Go shim -> Rust
 
@@ -116,7 +125,10 @@ The Go internals are at `~/.explore/repos/microsoft__TypeScript@673a5f17d713/tsc
   Go free functions that take only `c` -> `pub fn foo(c: &mut Checker, ..)`.
 - Go `Cached(&tp.links.Foo, key, func() V { .. })` ->
   `cached!(self, foo, key, { .. })` (the macro is in `mod.rs`; the closure
-  body becomes a block that can use `self`).
+  body becomes a block that can use `self`). The large node caches
+  (`TypeAtLocation`, `ReferenceSymbol`, `ParseEffectFnOpportunity`, the
+  effect context stores) use node link pages instead of hash maps, and
+  their call sites spell out the cache; the `EffectLinks` doc says why.
 - Go struct results: a Go `*T` result -> `Option<Rc<T>>`. A Go `[]*T` ->
   `Vec<Rc<T>>`; a Go `[]T` -> `Vec<T>`. Every Go type and field is `pub`.
   Go field names become snake case. Keep Go type names (an unexported Go
@@ -178,8 +190,12 @@ of the same names. `checker_integration.rs` is the Effect-owned Go shim
   (`scanner_util::compare_go_strings`).
 - `materialized_value_symbol_links` (the only `value_symbol_links` read) reads
   with `try_get_by_id`, which gives the symbol its id, as Go
-  `symbolArenaLinkStore.TryGet` does. Node ids from `nodeLinkStore.TryGet` are not given (the
-  port never gives them on link reads).
+  `materializedValueSymbolLinks` does with `ast.GetSymbolId`
+  (`_tools/gen_shims/providers/typescript/checker/integration.go:340`). The
+  other link reads of the shim (`typeNodeLinks`, `declaredTypeLinks`,
+  `typeAliasLinks`, `sourceFileLinks`, `aliasSymbolLinks`) are `core.LinkStore`
+  maps in Go (TypeScript-Go `internal/checker/checker.go:678-702`), which give
+  no ids. The port gives none there either, as Go.
 - A surface clones its findings map where Go copies a struct that shares
   the map. Go never writes a shared map, so results are the same.
 - The allow lists (`allowedUnstableApis`, `allowedExperimentalApis`, root
@@ -205,3 +221,35 @@ default tsconfig turns the 3 rules off, as Go `effecttest.DefaultTsConfig`),
 the 3 rules on, `--pretty false` and `--pretty true`), and the fixtures
 `unstable-api-usage`, `allowed-unstable-apis`, `experimental-api-usage` and
 `api-stability-leak`.
+
+### TS2790 with the stability rules
+
+With `unstableApiUsage` or `experimentalApiUsage` on (the default), a
+`delete` of a property that an index signature gives, under
+`exactOptionalPropertyTypes`, gets TS2790 ("The operand of a 'delete'
+operator must be optional"). effect-tsgo 0.51.1 prints it too, and plain
+TypeScript-Go does not. On T3 Code `apps/server` these are the 14 TS2790
+lines (`delete process.env.X`). The cause, in rule order:
+
+1. The two usage rules come before `floatingEffect` in Go `rules.All`
+   (`internal/rules/rules.go:11-14`). They call `GetSymbolAtLocation` on each
+   identifier (`stability_api_usage.go:91`).
+2. On the name of `env.X`, TypeScript-Go
+   `getSymbolOfNameOrPropertyAccessExpression` (pinned
+   `internal/checker/checker.go:32422-32431`) stores the synthetic index
+   symbol of `getApplicableIndexSymbol` (`checker.go:32639`: flags
+   `Property`, not `Optional`) as the access's `resolvedSymbol`.
+3. `floatingEffect` calls `GetTypeAtLocation` on the expression of each
+   expression statement (`floating_effect.go:109`). For `delete env.X` this
+   runs `checkExpression` again (`getTypeOfExpression`, `checker.go:7539`).
+   `checkDeleteExpression` (`checker.go:11040`) now finds the index symbol,
+   and `checkDeleteExpressionMustBeOptional` (`checker.go:11061`) reports
+   TS2790: with `exactOptionalPropertyTypes` only the `Optional` flag counts.
+
+The first check of the file found no symbol there, so plain TypeScript-Go and
+a run with the two rules off report nothing. The port makes the same calls in
+the same order (`rules/stability_api_usage.rs`, `rules/floating_effect.rs`),
+so it prints the same lines. A small case: `declare const env: { [key:
+string]: string | undefined }; delete env.FOO;` with `strict`,
+`exactOptionalPropertyTypes` and the plugin. `scripts/effect/t3-rules-off.sh`
+runs T3 Code with the rules on and off against effect-tsgo 0.51.1.

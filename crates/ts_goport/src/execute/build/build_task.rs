@@ -7,7 +7,9 @@ use crate::execute::incremental::build_info::{
     BuildInfoRootInfoReader, build_info_version, content_mapper_identities,
     is_build_info_file_name_default_library, resolve_build_info_file_name,
 };
-use crate::execute::incremental::emit_files::{buffer_early_emit_writes, fs_error_text};
+use crate::execute::incremental::emit_files::{
+    buffer_early_emit_writes, flush_writes_on_this_thread, fs_error_text,
+};
 use crate::execute::incremental::incremental::Host as IncrementalHost;
 use crate::execute::incremental::program::{
     NestedEmitNow, Program as IncrementalProgram, build_info_program,
@@ -1139,18 +1141,29 @@ impl BuildTask {
                     ..EmitOptions::default()
                 });
             }
-            let emitted = emit_and_report_statistics(&EmitInput {
-                sys: &*sys,
-                program_like: &incremental_program,
-                config: Some(&resolved),
-                report_diagnostic,
-                report_error_summary: quiet_diagnostics_reporter(),
-                writer,
-                write_file: Some(write_file),
-                compile_times,
-                testing: orchestrator.testing(),
-                testing_m_times_cache: Some(&*host.m_times),
-            });
+            let emit = || {
+                emit_and_report_statistics(&EmitInput {
+                    sys: &*sys,
+                    program_like: &incremental_program,
+                    config: Some(&resolved),
+                    report_diagnostic,
+                    report_error_summary: quiet_diagnostics_reporter(),
+                    writer,
+                    write_file: Some(write_file),
+                    compile_times,
+                    testing: orchestrator.testing(),
+                    testing_m_times_cache: Some(&*host.m_times),
+                })
+            };
+            // PORT: when only this thread reaches the file system
+            // (`DeferredWrites`), the emit keeps its writes, early or not,
+            // and this thread makes them (`flush_writes_on_this_thread`), so
+            // a failed write is in its file's result, as in Go.
+            let emitted = if deferred_writes.is_some() {
+                flush_writes_on_this_thread(sys.client_writes(), emit)
+            } else {
+                emit()
+            };
             if let Some(deferred_writes) = &deferred_writes {
                 write_deferred(deferred_writes, &*sys.fs());
             }
@@ -1175,7 +1188,8 @@ impl BuildTask {
             task_result.program = Some(incremental_program);
         }
         // PORT: see `DeferredWrites`. Go's emitter reports a failed write as
-        // TS5033; here the waiting writes fail after the emit.
+        // TS5033; here a write that waited fails after the emit. The emit
+        // makes its writes on this thread, so none is known to wait.
         let failed = deferred_writes.map_or_else(Vec::new, |deferred| {
             std::mem::take(
                 &mut deferred
@@ -2221,7 +2235,8 @@ impl BuildTask {
         // upstream task whose config file is gone or cannot be read, so its
         // check never loaded a build info).
         let Some(entry) = self.build_info_entry.as_mut() else {
-            crate::core::go_nil_dereference()
+            // Go N' loads `buildInfoEntry.dtsTime` (offset 0x40): addr=0x40 (buildtask.go:895).
+            crate::core::go_nil_dereference_at(0x40)
         };
         if let Some(dts_time) = entry.dts_time {
             return dts_time;
@@ -2230,7 +2245,9 @@ impl BuildTask {
         // panics on a nil build info (an upstream build info that cannot be
         // read).
         let Some(build_info) = entry.build_info.as_ref() else {
-            crate::core::go_nil_dereference()
+            // Go N' loads `buildInfo.LatestChangedDtsFile` (offset 0x140): addr=0x140
+            // (buildtask.go:900).
+            crate::core::go_nil_dereference_at(0x140)
         };
         // ts#64159: `incremental.ResolveBuildInfoFileName` against the build
         // info file's directory, not its path key's (buildtask.go:898-904).
@@ -2366,12 +2383,14 @@ fn new_task_write_file(
 /// the orchestrator thread can reach (`System::emit_writes_through_osvfs`,
 /// the API build orchestrator). Go's `writeFile` writes through
 /// `orchestrator.host.FS()` from the emit goroutines. Here a write on the
-/// orchestrator thread (the build info, and the early emit's writes that
-/// `finish_emit_files` flushes there) goes to that file system at once, after
-/// the waiting ones. A write on another thread (a checker thread) waits in
-/// `writes`, and the next write on the orchestrator thread, or the end of the
-/// task's emit, makes it. A waiting write that fails is kept in `failed` for
-/// Go's TS5033 after the emit (`compile_and_emit_finish`).
+/// orchestrator thread goes to that file system at once, after the waiting
+/// ones. That is the build info, and every source output: the emit keeps
+/// them and makes them on that thread (`flush_writes_on_this_thread`), so a
+/// failed write gets Go's TS5033 in its file's result. A write on another
+/// thread (a checker thread) waits in `writes`, and the next write on the
+/// orchestrator thread, or the end of the task's emit, makes it. A waiting
+/// write that fails is kept in `failed` for a TS5033 after the emit
+/// (`compile_and_emit_finish`).
 #[derive(Default)]
 struct PendingWrites {
     writes: Vec<(String, String)>,

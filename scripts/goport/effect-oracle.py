@@ -10,7 +10,8 @@ plain file, so a TypeScript line that effect-tsgo gets wrong (the reference TS61
 usage: GOPORT_PIN=<key> scripts/upstream/pin.py exec -- python3 scripts/goport/effect-oracle.py
            --effect-tsc <effect-tsgo tsc> [--out DIR] [label ...]
   --effect-tsc  the tsc of the effect-tsgo package at the Effect pin (run through scripts/tsgo-oracle.sh with
-                TS_GO_ORACLE_BIN, --pretty false, in the same cwd as the plain oracle run).
+                TS_GO_ORACLE_BIN, --pretty false, in the same cwd as the plain oracle run). Its --version must
+                end in +effect-tsgo.<EFFECT_VERSION of crates/ts_goport/src/effect/etscore.rs>, else the run stops.
   --out DIR     write DIR/<project>/oracle/<label>.effect.txt. Default: next to the plain file (in a pin run,
                 the pin's oracle cache).
   label         sweep-wide labels (<project>:<name>). Default: every sweep-wide config.
@@ -31,6 +32,12 @@ REPO = Path(__file__).resolve().parents[2]
 X = Path('/home/theo/Code/sandbox/ts-rust/target/project-inputs-wide')  # as sweep-wide.sh (worktrees too)
 PLUGIN = '@effect/language-service'
 HEAD = re.compile(r'^(.*)\((\d+),(\d+)\): \w+ TS(\d+): ')
+
+
+def effect_pin():
+    """The effect-tsgo release that the port pins: EFFECT_VERSION (etscore.rs, Go version_generated.go)."""
+    text = (REPO / 'crates/ts_goport/src/effect/etscore.rs').read_text()
+    return re.search(r'^pub const EFFECT_VERSION: &str = "([^"]+)";', text, re.M)[1]
 
 
 def entries():
@@ -74,6 +81,8 @@ def main():
     if a.labels and len(rows) != len(a.labels):
         sys.exit(f'unknown labels: {sorted(set(a.labels) - {e[0] for e in rows})}')
     version = subprocess.run([a.effect_tsc, '--version'], capture_output=True, text=True).stdout.strip()
+    if not version.endswith(f'+effect-tsgo.{effect_pin()}'):
+        sys.exit(f'{a.effect_tsc} is {version!r}, not effect-tsgo {effect_pin()} (the Effect pin)')
     print(f'effect-tsc {a.effect_tsc} ({version}); plain oracle {oracle}; pin {os.environ.get("GOPORT_PIN_ACTIVE", "default")}')
     for label, proj, cwd, config, ofile in rows:
         cwd = X / proj / cwd

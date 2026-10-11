@@ -27,11 +27,21 @@ impl Checker {
     }
 
     // Go: checker/checker.go:32333 getSymbolOfNameOrPropertyAccessExpression
+    // PERF: noderef1 G1. `name_ref` is the view (`NodeRef`) of `name`: the
+    // kind and parent reads of the predicates below do one registry lookup
+    // per node, not one per read.
     pub fn get_symbol_of_name_or_property_access_expression(&mut self, mut name: Node) -> SymbolId {
-        if is_declaration_name(name) {
-            return self.get_symbol_of_node(name.parent());
+        let mut name_ref = NodeRef::new(name);
+        if is_declaration_name_ref(name_ref) {
+            return self.get_symbol_of_node(name_ref.parent().node());
         }
-        if name.parent().kind() == SyntaxKind::ExportAssignment && is_entity_name_expression(name) {
+        let is_entity_name_kind = matches!(
+            name_ref.kind(),
+            SyntaxKind::Identifier | SyntaxKind::QualifiedName
+        );
+        if name_ref.parent().kind() == SyntaxKind::ExportAssignment
+            && is_entity_name_expression(name)
+        {
             // Even an entity name expression that doesn't resolve as an entityname may still typecheck as a property access expression
             let success = self.resolve_entity_name(
                 name,
@@ -47,7 +57,9 @@ impl Checker {
             if success.is_some() && success != self.unknown_symbol {
                 return success;
             }
-        } else if is_entity_name(name) && is_in_right_side_of_import_or_export_assignment(name) {
+        } else if is_entity_name_kind
+            && is_in_right_side_of_import_or_export_assignment_ref(name_ref)
+        {
             // Since we already checked for ExportAssignment, this really could only be an Import
             let import_equals_declaration =
                 find_ancestor_kind(name, SyntaxKind::ImportEqualsDeclaration);
@@ -57,8 +69,8 @@ impl Checker {
             return self.get_symbol_of_part_of_right_hand_side_of_import_equals(name);
         }
 
-        if is_entity_name(name) {
-            let possible_import_node = is_import_type_qualifier_part(name);
+        if is_entity_name_kind {
+            let possible_import_node = is_import_type_qualifier_part_ref(name_ref);
             if possible_import_node.is_some() {
                 self.get_type_from_type_node(possible_import_node);
                 let sym = self.get_resolved_symbol_or_nil(name);
@@ -70,15 +82,21 @@ impl Checker {
             }
         }
 
-        while is_right_side_of_qualified_name_or_property_access(name) {
-            name = name.parent();
+        loop {
+            let parent = name_ref.parent();
+            if !is_right_side_of_qualified_name_or_property_access_of(name_ref.node(), parent) {
+                break;
+            }
+            name_ref = parent;
         }
+        name = name_ref.node();
 
-        if is_in_name_of_expression_with_type_arguments_or_heritage_type_reference(name) {
+        if is_in_name_of_expression_with_type_arguments_or_heritage_type_reference_ref(name_ref) {
             let mut meaning: SymbolFlags;
-            if name.parent().kind() == SyntaxKind::ExpressionWithTypeArguments
-                || name.parent().kind() == SyntaxKind::TypeReference
-            {
+            if matches!(
+                name_ref.parent().kind(),
+                SyntaxKind::ExpressionWithTypeArguments | SyntaxKind::TypeReference
+            ) {
                 // A heritage element name may appear in type space, value space, or both;
                 // ensure the meaning matches its context.
                 meaning = if is_part_of_type_node(name) {
@@ -111,14 +129,14 @@ impl Checker {
             }
         }
 
-        if is_expression_node(name) {
+        if is_expression_node_ref(name_ref) {
             if node_is_missing(name) {
                 // Missing entity name.
                 return SymbolId::NIL;
             }
             let is_js_doc = is_js_doc_name_reference_context(name);
-            if is_identifier(name) {
-                if is_jsx_tag_name(name) && is_jsx_intrinsic_tag_name(name) {
+            if name_ref.kind() == SyntaxKind::Identifier {
+                if is_jsx_tag_name_of(name, name_ref.parent()) && is_jsx_intrinsic_tag_name(name) {
                     let symbol = self.get_intrinsic_tag_symbol(name.parent());
                     return if symbol == self.unknown_symbol {
                         SymbolId::NIL

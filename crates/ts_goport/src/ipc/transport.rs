@@ -193,7 +193,9 @@ impl<T> StdioFile<T> {
     // (the text of os.File `wrapErr(op, ErrClosed)`).
     fn file(&mut self, op: &str, name: &str) -> std::io::Result<&mut T> {
         match self {
-            StdioFile::Nil => crate::core::go_nil_dereference(),
+            // Go N' loads `Read` or `Write` from the method table of the nil `io.Reader` or
+            // `io.Writer`: addr=0x18.
+            StdioFile::Nil => crate::core::go_nil_dereference_at(0x18),
             StdioFile::Open(file) => Ok(file),
             StdioFile::Closed => Err(std::io::Error::other(format!(
                 "{op} {name}: file already closed"
@@ -205,7 +207,9 @@ impl<T> StdioFile<T> {
     // or `Stdout` leaves the process stream open and reports no error.
     fn close(&mut self, name: &str) -> Result<(), GoError> {
         match self {
-            StdioFile::Nil => crate::core::go_nil_dereference(),
+            // Go N' loads `Close` from the method table of the nil `io.ReadCloser` or
+            // `io.WriteCloser`: addr=0x18 (transport.go:89, :90).
+            StdioFile::Nil => crate::core::go_nil_dereference_at(0x18),
             StdioFile::Open(_) => {
                 *self = StdioFile::Closed;
                 Ok(())

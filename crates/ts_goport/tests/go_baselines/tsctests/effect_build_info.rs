@@ -200,3 +200,95 @@ fn build_info_of_the_other_kind_is_built_again() {
     );
     assert_eq!(project.build_info_version(), plain);
 }
+
+/// Writes `tsconfig.json` with `plugin` (the Effect plugin entry without its
+/// name) in `base.json` (`extends`) or in the config itself.
+fn set_plugin(project: &Project, plugin: &str, extends: bool) {
+    let plugins = format!(r#""plugins":[{{"name":"@effect/language-service"{plugin}}}]"#);
+    let options = r#""strict":true,"composite":true,"outDir":"out""#;
+    if extends {
+        project.write(
+            "base.json",
+            &format!(r#"{{"compilerOptions":{{{plugins}}}}}"#),
+        );
+        project.write(
+            "tsconfig.json",
+            &format!(
+                r#"{{"extends":"./base.json","compilerOptions":{{{options}}},"files":["src/index.ts"]}}"#
+            ),
+        );
+    } else {
+        project.write(
+            "tsconfig.json",
+            &format!(r#"{{"compilerOptions":{{{options},{plugins}}},"files":["src/index.ts"]}}"#),
+        );
+    }
+}
+
+// R190 reviewer item 5. Through `extends`, Go copies an override list with
+// `cloneStringSlicePtr` or `cloneKeyPatternsPtr` and a `skipLeadingPath` with
+// `cloneKeyPatterns` (effect-tsgo 47cb1ed7
+// internal/effectconfigraw/hooks.go:204-267, 309-316): a `[]` becomes nil. The
+// build info writes nil as `[]` and reads it back as an empty list, so patch
+// 028 `reflect.DeepEqual` sees a change, and Go checks every file again and
+// writes the build info again on each `tsgo -p`. An override `keyPatterns: []`
+// is nil without `extends` too (`parseKeyPatterns`,
+// etscore/options_parser.go:368-373, 468-469). effect-tsgo 0.51.1 writes the
+// build info again in each `again` case and keeps it in each `kept` case.
+#[test]
+fn empty_lists_that_go_reads_back_changed_are_checked_again() {
+    let list_override =
+        |key: &str| format!(r#","overrides":[{{"include":["src/**"],"options":{{"{key}":[]}}}}]"#);
+    let mut cases: Vec<(String, bool, bool)> = [
+        "allowedUnstableApis",
+        "allowedExperimentalApis",
+        "allowedDuplicatedPackages",
+        "effectFn",
+        "keyPatterns",
+    ]
+    .into_iter()
+    .map(|key| (list_override(key), true, true))
+    .collect();
+    cases.extend([
+        (
+            r#","keyPatterns":[{"target":"service","skipLeadingPath":[]}]"#.to_string(),
+            true,
+            true,
+        ),
+        (
+            r#","overrides":[{"include":["src/**"],"options":{"keyPatterns":[{"skipLeadingPath":[]}]}}]"#
+                .to_string(),
+            true,
+            true,
+        ),
+        (list_override("keyPatterns"), false, true),
+        (list_override("allowedUnstableApis"), false, false),
+        (
+            r#","allowedUnstableApis":[],"keyPatterns":[{"skipLeadingPath":[]}]"#.to_string(),
+            false,
+            false,
+        ),
+        (r#","allowedUnstableApis":[],"effectFn":[]"#.to_string(), true, false),
+    ]);
+    for (i, (plugin, extends, again)) in cases.iter().enumerate() {
+        let project = Project::new(&format!("effect-build-info-empty-{i}"), true, CLEAN);
+        set_plugin(&project, plugin, *extends);
+        let case = format!("extends={extends} {plugin}");
+        assert_eq!(
+            project.tsgo(&["-p", "."]),
+            (Some(0), String::new()),
+            "{case}"
+        );
+        project.make_old("out/tsconfig.tsbuildinfo");
+        assert_eq!(
+            project.tsgo(&["-p", "."]),
+            (Some(0), String::new()),
+            "{case}"
+        );
+        assert_eq!(
+            !project.build_info_is_old(),
+            *again,
+            "{case}: the second run wrote the build info again"
+        );
+    }
+}

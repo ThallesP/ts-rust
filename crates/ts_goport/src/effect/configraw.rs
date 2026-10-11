@@ -4,7 +4,7 @@
 //! appends. Override globs are rewritten relative to the config that
 //! declared them.
 
-use crate::effect::etscore::{EFFECT_PLUGIN_NAME, EffectPluginOptions};
+use crate::effect::etscore::{EFFECT_PLUGIN_NAME, EffectPluginOptions, KeyPattern, SlicePtr};
 use crate::frontend::tsoptions::command_line_option::CompilerOptionsValue;
 use crate::frontend::tspath::path::{
     ComparePathsOptions, combine_paths, convert_to_relative_path, get_directory_path,
@@ -99,10 +99,20 @@ fn merge_effect_options(
 }
 
 // Go: effectconfigraw cloneEffectOptions
-/// A copy of the options. Go copies the root lists with
-/// `append([]string(nil), ...)`, which turns `[]` into nil: through
-/// `extends`, a root `[]` is not written to build info. The other fields keep
-/// the plain clone (their empty and nil forms already write the same).
+/// A copy of the options. Go copies each list with `append([]T(nil), ...)`,
+/// which turns `[]` into nil. The port keeps nil apart where Go output or its
+/// build info compare tells them apart:
+/// - the 3 root allow lists: through `extends`, a root `[]` is not written;
+/// - the override lists (`cloneOverrides`, `cloneStringSlicePtr`,
+///   `cloneKeyPatternsPtr`) and each `skipLeadingPath` (`cloneKeyPatterns`):
+///   build info writes nil as `[]` and reads it back as an empty list, so Go
+///   checks every file again (`etscore::SlicePtr`).
+///
+/// Root `effectFn`, `namespaceImportPackages`, `barrelImportPackages`,
+/// `importAliases`, `overrides` and the override `include` and `exclude`
+/// keep the plain clone: their nil is not written, as the port's empty. Go
+/// writes a `[]` (or `{}`) that a config without `extends` sets, and the port
+/// does not (text only; `PORTING.md`, "Where the port differs").
 fn clone_effect_options(source: &EffectPluginOptions) -> EffectPluginOptions {
     let mut cloned = source.clone();
     for list in [
@@ -114,7 +124,43 @@ fn clone_effect_options(source: &EffectPluginOptions) -> EffectPluginOptions {
             *list = None;
         }
     }
+    cloned.key_patterns = clone_key_patterns(&source.key_patterns).unwrap_or_default();
+    for o in &mut cloned.overrides {
+        let options = &mut o.options;
+        options.key_patterns = clone_slice_ptr(&options.key_patterns, clone_key_patterns);
+        for list in [
+            &mut options.allowed_unstable_apis,
+            &mut options.allowed_experimental_apis,
+            &mut options.allowed_duplicated_packages,
+            &mut options.effect_fn,
+        ] {
+            *list = clone_slice_ptr(list, go_copy);
+        }
+    }
     cloned
+}
+
+/// Go `append([]T(nil), s...)`: nil when `s` is empty.
+fn go_copy<T: Clone>(s: &[T]) -> Option<Vec<T>> {
+    (!s.is_empty()).then(|| s.to_vec())
+}
+
+// Go: effectconfigraw cloneStringSlicePtr and cloneKeyPatternsPtr: a nil
+// pointer stays nil, else a pointer to `copy` of the list (nil or not).
+fn clone_slice_ptr<T>(source: &SlicePtr<T>, copy: fn(&[T]) -> Option<Vec<T>>) -> SlicePtr<T> {
+    source
+        .as_ref()
+        .map(|list| copy(list.as_deref().unwrap_or_default()))
+}
+
+// Go: effectconfigraw cloneKeyPatterns
+fn clone_key_patterns(source: &[KeyPattern]) -> Option<Vec<KeyPattern>> {
+    let patterns = source.iter().map(|pattern| KeyPattern {
+        target: pattern.target.clone(),
+        pattern: pattern.pattern.clone(),
+        skip_leading_path: pattern.skip_leading_path.as_deref().and_then(go_copy),
+    });
+    (!source.is_empty()).then(|| patterns.collect())
 }
 
 // Go: mergeSeverityMaps. Go nil stays None only when both are nil.

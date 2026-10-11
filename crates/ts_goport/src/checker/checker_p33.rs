@@ -1064,17 +1064,25 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31100 getTypeOfPropertyOfContextualType
-    pub fn get_type_of_property_of_contextual_type(&mut self, t: TypeId, name: &str) -> TypeId {
+    pub fn get_type_of_property_of_contextual_type<'a>(
+        &mut self,
+        t: TypeId,
+        name: impl Into<TableKey<'a>>,
+    ) -> TypeId {
         self.get_type_of_property_of_contextual_type_ex(t, name, TypeId::NIL)
     }
 
     // Go: checker/checker.go:31104 getTypeOfPropertyOfContextualTypeEx
-    pub fn get_type_of_property_of_contextual_type_ex(
+    // PERF: intern1 fix 7. A `Name` key looks the properties up by id
+    // (`get_type_of_concrete_property_of_contextual_type`); the text is read
+    // only for a mapped type or an index info.
+    pub fn get_type_of_property_of_contextual_type_ex<'a>(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: impl Into<TableKey<'a>>,
         name_type: TypeId,
     ) -> TypeId {
+        let key: TableKey<'a> = name.into();
         self.map_type_ex(
             t,
             &mut |c: &mut Checker, t: TypeId| -> TypeId {
@@ -1094,7 +1102,7 @@ impl Checker {
                             let substituted_type = c
                                 .get_indexed_mapped_type_substituted_type_of_contextual_type(
                                     constituent_type,
-                                    name,
+                                    key.text(),
                                     name_type,
                                 );
                             types = c.append_contextual_property_type_constituent(
@@ -1105,7 +1113,7 @@ impl Checker {
                         }
                         let property_type = c.get_type_of_concrete_property_of_contextual_type(
                             constituent_type,
-                            name,
+                            key,
                         );
                         if property_type.is_nil() {
                             if !ignore_index_infos {
@@ -1119,7 +1127,9 @@ impl Checker {
                     }
                     for candidate in index_info_candidates {
                         let index_info_type = c.get_type_from_index_infos_of_contextual_type(
-                            candidate, name, name_type,
+                            candidate,
+                            key.text(),
+                            name_type,
                         );
                         types =
                             c.append_contextual_property_type_constituent(types, index_info_type);
@@ -1139,14 +1149,16 @@ impl Checker {
                     && c.get_mapped_type_name_type_kind(t) != MappedTypeNameTypeKind::REMAPPING
                 {
                     return c.get_indexed_mapped_type_substituted_type_of_contextual_type(
-                        t, name, name_type,
+                        t,
+                        key.text(),
+                        name_type,
                     );
                 }
-                let result = c.get_type_of_concrete_property_of_contextual_type(t, name);
+                let result = c.get_type_of_concrete_property_of_contextual_type(t, key);
                 if result.is_some() {
                     return result;
                 }
-                c.get_type_from_index_infos_of_contextual_type(t, name, name_type)
+                c.get_type_from_index_infos_of_contextual_type(t, key.text(), name_type)
             },
             true, /*noReductions*/
         )
@@ -1221,9 +1233,12 @@ impl Checker {
     pub fn get_type_of_concrete_property_of_contextual_type(
         &mut self,
         t: TypeId,
-        name: &str,
+        name: TableKey<'_>,
     ) -> TypeId {
-        let prop = self.get_property_of_type(t, name);
+        let prop = self.get_property_of_type_ex(
+            t, name, false, /*skipObjectFunctionPropertyAugment*/
+            false, /*includeTypeOnlyMembers*/
+        );
         if prop.is_nil() || self.is_circular_mapped_property(prop) {
             return TypeId::NIL;
         }

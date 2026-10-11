@@ -362,10 +362,7 @@ pub const EFFECT_CODE_START: u32 = 377_000;
 #[must_use]
 pub fn message_by_key(key: &str) -> Option<&'static Message> {
     #[cfg(not(target_family = "wasm"))]
-    return CATALOG
-        .iter()
-        .chain(EFFECT_CATALOG)
-        .find(|message| message.key() == key);
+    return MESSAGES_BY_KEY.get(key).copied();
     // wasm makes keys on demand, so it finds the message by the code that
     // ends every key.
     #[cfg(target_family = "wasm")]
@@ -373,6 +370,24 @@ pub fn message_by_key(key: &str) -> Option<&'static Message> {
         .and_then(|(_, code)| message_by_code(code.parse().ok()?))
         .filter(|message| message.key() == key)
 }
+
+// Go: diagnostics/diagnostics.go messagesByKey
+/// Every catalog message by its key, built on the first key lookup. Most
+/// diagnostics carry a message reference, so only key lookups (Effect
+/// diagnostics, build info) need it.
+// PORT: Go fills the map from `allMessages` and a later entry replaces an
+// earlier one. The keys are unique (test `catalog_keys_are_unique`), so
+// keeping the first entry gives the same map.
+#[cfg(not(target_family = "wasm"))]
+static MESSAGES_BY_KEY: std::sync::LazyLock<rustc_hash::FxHashMap<&'static str, &'static Message>> =
+    std::sync::LazyLock::new(|| {
+        let mut messages = rustc_hash::FxHashMap::default();
+        messages.reserve(CATALOG.len() + EFFECT_CATALOG.len());
+        for message in CATALOG.iter().chain(EFFECT_CATALOG) {
+            messages.entry(message.key()).or_insert(message);
+        }
+        messages
+    });
 
 /// The key of a message with `text` and `code`: Go's
 /// `internal/diagnostics/generate.go` `convertPropertyName`. Each `*`,
@@ -423,7 +438,9 @@ mod catalog_texts;
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOG, Category, Diagnostic, message_by_code, message_by_key, message_key};
+    use super::{
+        CATALOG, Category, Diagnostic, EFFECT_CATALOG, message_by_code, message_by_key, message_key,
+    };
 
     /// The wasm build packs the texts that `catalog_texts` reads from the
     /// catalog source; they must be the texts of the catalog.
@@ -639,5 +656,31 @@ mod tests {
             1003
         );
         assert!(message_by_code(u32::MAX).is_none());
+    }
+
+    /// `message_by_key` keeps the first message of a key; with unique keys
+    /// that is the message Go's `messagesByKey` gives.
+    #[test]
+    fn catalog_keys_are_unique() {
+        let mut seen = rustc_hash::FxHashSet::default();
+        for message in CATALOG.iter().chain(EFFECT_CATALOG) {
+            assert!(
+                seen.insert(message.key()),
+                "duplicate key {}",
+                message.key()
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_by_key_finds_every_message() {
+        for message in CATALOG.iter().chain(EFFECT_CATALOG) {
+            assert!(std::ptr::eq(
+                message_by_key(message.key()).unwrap(),
+                message
+            ));
+        }
+        assert!(message_by_key("").is_none());
+        assert!(message_by_key("Not_a_message_0").is_none());
     }
 }

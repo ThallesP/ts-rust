@@ -4441,7 +4441,10 @@ export const a: T | Dep | number = x + (h as never);
         };
         assert_eq!(codes("a.ts"), [1006]);
         assert_eq!(codes("b.ts"), [1006]);
-        assert_eq!(codes("c.ts"), [6053]);
+        // On a case-insensitive file system (macOS, Windows) "./C.ts" is c.ts
+        // itself, so Go reports TS1006 there too.
+        let c_is_self = std::path::Path::new(&format!("{cwd}/C.ts")).exists();
+        assert_eq!(codes("c.ts"), [if c_is_self { 1006 } else { 6053 }]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -546,10 +546,11 @@ mod tests {
         let output = generate_syntax_kind(UPSTREAM_AST).unwrap();
         assert!(output.contains("    Unknown = 0,"));
         assert!(output.contains("    DeferKeyword = 166,"));
-        assert!(output.contains("    QualifiedName = 167,"));
-        assert!(output.contains("    SourceFile = 307,"));
-        assert!(output.contains("    NotEmittedTypeElement = 350,"));
-        assert!(output.contains("pub const COUNT: usize = 351;"));
+        assert!(output.contains("    SourceKeyword = 167,"));
+        assert!(output.contains("    QualifiedName = 168,"));
+        assert!(output.contains("    SourceFile = 308,"));
+        assert!(output.contains("    NotEmittedTypeElement = 351,"));
+        assert!(output.contains("pub const COUNT: usize = 352;"));
     }
 
     #[test]

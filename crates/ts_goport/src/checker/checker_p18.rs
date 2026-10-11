@@ -95,15 +95,17 @@ impl Checker {
                 }
             }
         }
-        let text = right.text();
+        // PERF: intern1 fix 9. The export lookups by the identifier's `Name`
+        // compare ids; the text is read only for a diagnostic.
+        let right_name = right.text_name();
         let exports = self.get_exports_of_symbol(namespace);
-        let s = self.get_symbol(exports, text, meaning);
+        let s = self.get_symbol_key(exports, TableKey::Name(&right_name), meaning);
         let mut symbol = self.get_merged_symbol(s);
         if symbol.is_nil() && self.sym(namespace).flags.intersects(SymbolFlags::ALIAS) {
             // `namespace` can be resolved further if there was a symbol merge with a re-export
             let resolved = self.resolve_alias(namespace);
             let exports = self.get_exports_of_symbol(resolved);
-            let s = self.get_symbol(exports, text, meaning);
+            let s = self.get_symbol_key(exports, TableKey::Name(&right_name), meaning);
             symbol = self.get_merged_symbol(s);
         }
         if symbol.is_nil() {
@@ -144,7 +146,11 @@ impl Checker {
                 if meaning.intersects(SymbolFlags::NAMESPACE) {
                     if is_qualified_name(name.parent()) {
                         let exports = self.get_exports_of_symbol(namespace);
-                        let s = self.get_symbol(exports, text, SymbolFlags::TYPE);
+                        let s = self.get_symbol_key(
+                            exports,
+                            TableKey::Name(&right_name),
+                            SymbolFlags::TYPE,
+                        );
                         let exported_type_symbol = self.get_merged_symbol(s);
                         if exported_type_symbol.is_some() {
                             let qualified_right = name.parent().right();
@@ -992,7 +998,8 @@ impl Checker {
         if parent.is_nil() {
             // Go reads `deferred.parent.flags`: a symbol of another checker
             // has no links here.
-            go_nil_dereference();
+            // Go N' loads `parent.flags` (offset 0): addr=0x0 (checker.go:16791).
+            crate::core::go_nil_dereference_at(0x0);
         }
         let constituents = deferred.constituents.clone();
         let resolved_type = if self.ty(parent).flags.intersects(TypeFlags::UNION) {
@@ -1044,7 +1051,8 @@ impl Checker {
             // Go reads `symbol.CheckFlags` and panics on nil, for example
             // on the target of an instantiated symbol of another checker,
             // which has no links here.
-            go_nil_dereference();
+            // Go N' loads `symbol.CheckFlags` (offset 4): addr=0x4 (checker.go:16821).
+            crate::core::go_nil_dereference_at(0x4);
         }
         let check_flags = self.sym(symbol).check_flags;
         let flags = self.sym(symbol).flags;
@@ -1136,7 +1144,8 @@ impl Checker {
             // Go reads `symbol.CheckFlags` and panics on nil, for example
             // on the target of an instantiated symbol of another checker,
             // which has no links here.
-            go_nil_dereference();
+            // Go N' loads `symbol.CheckFlags` (offset 4): addr=0x4 (checker.go:16880).
+            crate::core::go_nil_dereference_at(0x4);
         }
         let s = self.sym(symbol);
         let (check_flags, flags) = (s.check_flags, s.flags);

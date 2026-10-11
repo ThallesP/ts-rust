@@ -759,7 +759,8 @@ impl Checker {
             // Go reads `symbol.Flags` of a nil symbol: `getTypeOfNode` on a
             // type parameter that the binder skips (a JSDoc `@template` in
             // a TS file) passes nil here.
-            go_nil_dereference();
+            // Go N' loads `symbol.Flags` (offset 0): addr=0x0 (checker.go:24204).
+            crate::core::go_nil_dereference_at(0x0);
         }
         let flags = self.sym(symbol).flags;
         if flags.intersects(SymbolFlags::CLASS | SymbolFlags::INTERFACE) {

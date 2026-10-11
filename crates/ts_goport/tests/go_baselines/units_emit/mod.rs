@@ -3,7 +3,8 @@
 //! modulespecifiers, outputpaths, compiler, checker, execute/build,
 //! execute/incremental, execute/tsc, printer, transformers/tstransforms, ls,
 //! ls/lsconv and ls/lsutil, with the Go test helpers testutil/parsetestutil
-//! and testutil/emittestutil.
+//! and testutil/emittestutil. `effect_api_stability_tests` ports small
+//! Effect-TS/tsgo `internal/typeparser` tests.
 //!
 //! Expected values are the Go test literals. A test that shows a port bug
 //! has `#[ignore = "bug: S3-NNN ..."]`; the bug is in
@@ -26,6 +27,7 @@ mod checker_tests;
 mod checkerpool_tests;
 mod childprog;
 mod clean_tests;
+mod effect_api_stability_tests;
 mod emittestutil;
 mod execute_tests;
 mod ls_tests;

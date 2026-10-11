@@ -118,6 +118,13 @@ fn main() -> MainResult {
     set_malloc_tunables(&budget);
     budget.install();
     // After the exec in `set_malloc_tunables` and before the work thread.
+    // Also before `go_runtime_start`: keep this order. jemalloc gives a new
+    // thread the arena with the fewest threads, and the holder thread of
+    // the layout moves to arena 3 only when it first runs. The time of
+    // `go_runtime_start` lets it move before the work thread starts. Else
+    // the work thread can take arena 3 too, and two checkers then share an
+    // arena: about 40,000 more pages per multi-threaded zod run (int59 r4;
+    // jemarena1: 27 of 30 zod runs with the other order, 1 of 30 with this).
     #[cfg(all(feature = "jemalloc", target_os = "linux"))]
     ts_goport::jemalloc_layout::jemalloc_layout();
     // After the exec in `set_malloc_tunables`: an exec resets the handlers,

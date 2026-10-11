@@ -6,9 +6,9 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 ## Ready
 
-- **Now (2026-10-11):** R191 = bump D accepted (main at microsoft/TypeScript fed0bf24149f; note r191 accept). Next revision R192 = goport-int60p f0d8c2df8 (note int60p-r2-2026-10-11): merge main (R191 accepted head), perfP2 d620bef7d (item 2), then the side run. Before the R192 verdicts (R191 reviewer item 9): record N prime goldens for the 5 extra LSP batteries and run them on the R191 bins. Then R193 = int61 goport-effint1 b38ba8de8 (merge main at N prime first). Running lanes: astshrink1, jsdocstr1, effperf3 (on int60p plus perfP2), invokeonce1 and chk4split (R191 reviewer item 3: also time Go N and N prime; likely cause Go checkerpool.go:437). Queued: apicb follow-ups (R191 reviewer item 7), the tree-wide Go line reference refresh (ruling 18), T3 web +1.38 to measure again.
+- **Now (2026-10-11):** R193 accepted (int60 without effperf1 F3; main 3323eeb9f; notes r193-side, timing-r193). Running after the accept: extrabatR193 and followups42 (workflow after-r193). Next: int61 = R194 on main: effint1 b38ba8de8 (Effect editor features, D1 stays out), effperf3 bc6cd8b72, invokeonce1 75866d18c, jsdocstr1 e9c2aff12, astshrink1 b5611fa68, apicbfu1 1b7532c48, i50 (PR #54); then main's light-path PRs #55 (CI fix) and #53 (#49).
 
-- **Public issues 2026-10-11 (workflow issues52, before perf):** #52 TS2790 on `delete` with the Effect plugin (i52: diagnosis against effect-tsgo 0.51.1 and the T3 Code v0.0.45 pin, reply draft; effect051 summary lines 119-125 say effect-tsgo 0.51.1 prints the same lines), #49 JSDoc comment directive panic (i49, goport-i49jsdocdir), #50 macOS realpath case (i50, goport-i50realpath). Each with a skeptic. Fixes go into the next integration after their skeptic passes; root posts the replies.
+- **Public issues 2026-10-11 (note issues52-result-2026-10-11):** #52 replied (effect-tsgo 0.51.1 parity, workaround, upstream Effect-TS/tsgo#820, labeled; port the upstream fix when it lands). #49: PR #53 (light path; root merges after the R193 accept, then lib blobs once). #50: PR #54 (loader: into int61; macOS CI runs realpath_case.rs).
 
 - **R192 withdrawn (reviewer B1: effperf1 F3 changed Effect plugin-on counts; note effperf1-f3-dropped-2026-10-11). R193 = goport-int60p 24a676449 (int60 without F3): side running, then np-suite, timing-r193 (running), extrabatNp, verdict request.** Follow-ups: a count-preserving F3 lane; plugin-on counts in the gate's Effect items (tool path in a batch).
 
@@ -16,9 +16,19 @@ Each item: one line of goal, the files or worktree it owns, and what it waits fo
 
 - **effperf3 bc6cd8b72 (not the head 91ad83a5e): skeptic PASS, into int61 (note effperf3-result-2026-10-11).** Effect st instructions -2.0%, tests -2.0%, T3 server -1.4%; output equal. Items 9 and 10 dropped as below the bar. Base is int60p f0d8c2df8 + perfP2: merge after R192.
 
-- **Running: effperf4 (effperf2 item 1: one pre-order node list per file for the Effect rule walks; study estimate effect -4.5%, T3 -4.5%), on effperf3 bc6cd8b72, goport-effperf4.**
+- **effperf4 b553fc3d5: skeptic PASS, g4 reverted (note effperf4-result-2026-10-11): effect st -6.4 percent, T3 server -6.8, output equal. Into int62.**
 
 - **astshrink1 f56430d3b skeptic PASS (note astshrink1-result-2026-10-11): default peak RSS -2.2 to -6.7 percent, output equal. Running: astshrink2 (round 2: the 2 latent list-owner and print-pack defects). Then into int61 with its 2 protected expectation changes for the reviewer.**
+
+- **apicbfu1 1b7532c48 (R191 reviewer item 7): done, root comment fix after the skeptic (note apicbfu1-result-2026-10-11). Into int61.**
+
+- **jsdocstr1 e9c2aff12: skeptic PASS, kept below the bar (note jsdocstr1-result-2026-10-11; parse mallocs -9 to -30 percent, Go substring model). Into int61.**
+
+- **Running: sweepgap1 (compat study: LSP sweep battery diffs against Go N prime, svelte 289 and effect 14, mostly completions; Go selfcheck first).**
+
+- **invokeonce1 75866d18c: skeptic PASS (T3 server st -5.1 percent, T3 web -1.5 to -2; output and counts equal). Into int61. chk4split: the 4-checker split is Go's (lib updates moved it); hono 4-checker wall is a named Go-parity cost (note invokeonce1-result-2026-10-11).**
+
+- **Running: gatecounts1 (tool lane, protected paths, needs Theo's approval to list in a batch): gate Effect items also compare plugin-on counts with effect-tsgo 0.51.1 (would have caught R192 B1); candidate.sh clippy target per checkout.**
 
 - **int61 (R194) = goport-effint1 b38ba8de8 (all Effect editor features of effect-tsgo 0.51.1; note effint3-result-2026-10-11).** After bump D and int60: merge the accepted head, then a revision. D1 (refactor.rewrite in initialize codeActionKinds) needs Theo.
 

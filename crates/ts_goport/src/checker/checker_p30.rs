@@ -765,6 +765,15 @@ impl Checker {
     // Go: checker/checker.go:27899 isStringIndexSignatureOnlyTypeWorker
     pub fn is_string_index_signature_only_type_worker(&mut self, t: TypeId) -> bool {
         let flags = self.ty(t).flags;
+        // With the switch on, the Go body of #64475 (lazy_members.rs) for
+        // every object type: Go drops the apparent type here.
+        if self.lazy_members && flags.intersects(TypeFlags::OBJECT) {
+            let lazy = crate::checker::lazy_members::opaque(
+                Self::is_string_index_signature_only_object_type_lazy
+                    as fn(&mut Self, TypeId) -> bool,
+            );
+            return lazy(self, t);
+        }
         (flags.intersects(TypeFlags::OBJECT)
             && !self.is_generic_mapped_type(t)
             && self.get_properties_of_type_count(t) == 0

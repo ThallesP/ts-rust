@@ -264,7 +264,12 @@ impl EsDecoratorTransformer {
     // Go: transformers/estransforms/esdecorator.go:200 esDecoratorTransformer.exitClass
     pub(super) fn exit_class(&mut self) {
         // Go evaluates the message args first: a nil `tx.top` is a nil dereference.
-        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+        // (esdecorator.go:201).
+        let top = self
+            .top
+            .take()
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
         go_assert!(
             top.kind == LexicalEntryKind::Class,
             "Incorrect value for top.kind. Expected top.kind to be 'class' but got '{}' instead.",
@@ -281,7 +286,9 @@ impl EsDecoratorTransformer {
         let top_kind = self
             .top
             .as_ref()
-            .unwrap_or_else(|| go_nil_dereference())
+            // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+            // (esdecorator.go:208).
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0))
             .kind;
         go_assert!(
             top_kind == LexicalEntryKind::Class,
@@ -304,7 +311,12 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:222 esDecoratorTransformer.exitClassElement
     pub(super) fn exit_class_element(&mut self) {
-        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+        // (esdecorator.go:223).
+        let top = self
+            .top
+            .take()
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
         go_assert!(
             top.kind == LexicalEntryKind::ClassElement,
             "Incorrect value for top.kind. Expected top.kind to be 'class-element' but got '{}' instead.",
@@ -313,7 +325,9 @@ impl EsDecoratorTransformer {
         let next_kind = top
             .next
             .as_ref()
-            .unwrap_or_else(|| go_nil_dereference())
+            // Go N' loads `tx.top.next.kind` (offset 0) for the assert message: addr=0x0
+            // (esdecorator.go:224).
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0))
             .kind;
         go_assert!(
             next_kind == LexicalEntryKind::Class,
@@ -329,7 +343,9 @@ impl EsDecoratorTransformer {
         let top_kind = self
             .top
             .as_ref()
-            .unwrap_or_else(|| go_nil_dereference())
+            // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+            // (esdecorator.go:230).
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0))
             .kind;
         go_assert!(
             top_kind == LexicalEntryKind::ClassElement,
@@ -343,7 +359,12 @@ impl EsDecoratorTransformer {
 
     // Go: transformers/estransforms/esdecorator.go:238 esDecoratorTransformer.exitName
     pub(super) fn exit_name(&mut self) {
-        let top = self.top.take().unwrap_or_else(|| go_nil_dereference());
+        // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+        // (esdecorator.go:239).
+        let top = self
+            .top
+            .take()
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
         go_assert!(
             top.kind == LexicalEntryKind::Name,
             "Incorrect value for top.kind. Expected top.kind to be 'name' but got '{}' instead.",
@@ -373,7 +394,9 @@ impl EsDecoratorTransformer {
         let top_kind = self
             .top
             .as_ref()
-            .unwrap_or_else(|| go_nil_dereference())
+            // Go N' loads `tx.top.kind` (offset 0) for the assert message: addr=0x0
+            // (esdecorator.go:260).
+            .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0))
             .kind;
         go_assert!(
             top_kind == LexicalEntryKind::Other,

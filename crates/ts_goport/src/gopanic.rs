@@ -63,6 +63,12 @@ pub struct GoPanic {
     /// runtime prints a line `panic: <value> [recovered]` for each, before
     /// the line of this panic (Go `printpanics`).
     pub recovered_before: Vec<String>,
+    /// The fault address of the SIGSEGV that the Go runtime turned into
+    /// this panic, or of an earlier one that its goroutine still holds:
+    /// Go clears it only when a recovery completes (`go_after_recover`).
+    /// The runtime prints it in the signal line (`print_go_panic`).
+    /// `go_nil_dereference_at` sets it.
+    pub fault_address: Option<u64>,
     /// The port site, for the stderr report.
     pub location: &'static std::panic::Location<'static>,
 }
@@ -94,6 +100,7 @@ pub fn go_panic(message: String) -> ! {
         go_type: None,
         repanicked: false,
         recovered_before: Vec::new(),
+        fault_address: None,
         location: std::panic::Location::caller(),
     })
 }
@@ -109,6 +116,7 @@ pub fn go_panic_typed(go_type: &'static str, message: String) -> ! {
         go_type: Some(go_type),
         repanicked: false,
         recovered_before: Vec::new(),
+        fault_address: None,
         location: std::panic::Location::caller(),
     })
 }
@@ -128,7 +136,11 @@ pub fn go_repanic(mut payload: Box<dyn std::any::Any + Send>) -> ! {
 /// again (the panic answer of an IPC request). A Go panic in `f` keeps the
 /// recovered value first in its chain (`GoPanic::recovered_before`), so
 /// the runtime prints `panic: <recovered> [recovered]` before its own line,
-/// as Go `printpanics` does. Any other payload continues as it is.
+/// as Go `printpanics` does. The recovery has not completed, so the
+/// goroutine still holds the signal of a recovered nil dereference: a
+/// panic in `f` without its own keeps that fault address (Go
+/// runtime/panic.go:1355 clears `gp.sig` only at the end of a recovery).
+/// Any other payload continues as it is.
 pub fn go_after_recover<R>(recovered: &(dyn std::any::Any + Send), f: impl FnOnce() -> R) -> R {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
         Ok(value) => value,
@@ -144,6 +156,11 @@ pub fn go_after_recover<R>(recovered: &(dyn std::any::Any + Send), f: impl FnOnc
                     String::new()
                 };
                 panic.recovered_before.insert(0, value);
+                if panic.fault_address.is_none() {
+                    panic.fault_address = recovered
+                        .downcast_ref::<GoPanic>()
+                        .and_then(|earlier| earlier.fault_address);
+                }
             }
             std::panic::resume_unwind(payload)
         }
@@ -427,12 +444,38 @@ fn retry_on_eagain<H>(
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a
 /// site where the pinned Go dereferences nil on the same input. It is cold
 /// and out of line, so the nil check at a hot site is one compare.
+/// PORT: Go also prints a signal line with the fault address of the site.
+/// Use `go_nil_dereference_at` where that address is known; here the line
+/// is left out.
 #[cold]
 #[inline(never)]
 #[track_caller]
 pub fn go_nil_dereference() -> ! {
-    go_panic("runtime error: invalid memory address or nil pointer dereference".to_string())
+    go_panic(NIL_DEREFERENCE.to_string())
 }
+
+/// `go_nil_dereference` at a site where the pinned Go faults at `address`
+/// (`code=0x1 addr=<address>` in its signal line, Linux amd64). The
+/// address is the first load that Go's compiled code makes through the nil
+/// pointer: a field offset, and for a string field maybe its length word.
+/// Take it from the pinned Go's own output, and check it again at a pin
+/// bump.
+#[cold]
+#[inline(never)]
+#[track_caller]
+pub fn go_nil_dereference_at(address: u64) -> ! {
+    std::panic::panic_any(GoPanic {
+        message: NIL_DEREFERENCE.to_string(),
+        go_type: None,
+        repanicked: false,
+        recovered_before: Vec::new(),
+        fault_address: Some(address),
+        location: std::panic::Location::caller(),
+    })
+}
+
+/// The Go `runtime.Error` text of a nil pointer dereference.
+const NIL_DEREFERENCE: &str = "runtime error: invalid memory address or nil pointer dereference";
 
 /// The Go runtime exit code after a panic that nothing recovers.
 pub const EXIT_GO_PANIC: i32 = 2;
@@ -450,14 +493,16 @@ pub fn resume_go_panic(payload: Box<dyn std::any::Any + Send>) -> Box<dyn std::a
 /// for each earlier panic in `recovered_before`, each next line after a
 /// tab, then `panic: <value>` (`GoPanic::value_text`), which ends with
 /// ` [recovered, repanicked]` for a value raised again after a recover.
-/// The port site takes the place of the goroutine trace. False for any
-/// other payload.
+/// With a `fault_address`, the signal line of Go `dopanic_m` follows
+/// (`go_signal_line`). The port site takes the place of the goroutine
+/// trace. False for any other payload.
 pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     let Some(panic) = payload.downcast_ref::<GoPanic>() else {
         return false;
     };
+    let signal = panic.fault_address.map(go_signal_line).unwrap_or_default();
     let text = format!(
-        "{}\n\n\t{}:{}\n",
+        "{}\n{signal}\n\t{}:{}\n",
         go_panic_lines(panic),
         panic.location.file(),
         panic.location.line()
@@ -465,6 +510,33 @@ pub fn print_go_panic(payload: &(dyn std::any::Any + Send)) -> bool {
     use std::io::Write;
     let _ = std::io::stderr().write_all(&crate::scanner_util::go_string_bytes(&text));
     true
+}
+
+/// The port's text for Go `debug.Stack()` after a `recover()` of `r`: the
+/// port site of a Go panic, which takes the place of the goroutine trace as
+/// in `print_go_panic` (`\t<file>:<line>` and a newline). For any other
+/// payload, the Rust backtrace when `RUST_BACKTRACE` enables it, else "".
+pub fn go_recovered_stack(r: &(dyn std::any::Any + Send)) -> String {
+    if let Some(panic) = r.downcast_ref::<GoPanic>() {
+        return format!("\t{}:{}\n", panic.location.file(), panic.location.line());
+    }
+    let backtrace = std::backtrace::Backtrace::capture();
+    if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
+        backtrace.to_string()
+    } else {
+        String::new()
+    }
+}
+
+// Go: runtime/panic.go:1581 dopanic_m (go1.27.1), Linux: the line for a
+// panic of a SIGSEGV (`gp.sig`), with its newline. `code=0x1` is
+// SEGV_MAPERR, the code of a nil page access.
+// PORT: Go prints the address of the faulting instruction of its own
+// binary as `pc` (0xc5efe9 in tsgo-oracle-fed0bf24149f); the port has no
+// such instruction and prints 0x0. Go on other systems prints other
+// signal names and codes; the port prints the Linux line everywhere.
+fn go_signal_line(fault_address: u64) -> String {
+    format!("[signal SIGSEGV: segmentation violation code=0x1 addr={fault_address:#x} pc=0x0]\n")
 }
 
 /// The `printpanics` lines of `panic`, without the last newline.
@@ -535,6 +607,43 @@ mod tests {
         assert_eq!(go_after_recover(&"handler panic", || 7), 7);
         let payload = panic_of(|| go_after_recover(&"handler panic", || panic!("write panic")));
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"write panic"));
+    }
+
+    // Go stderr (go1.27.1, linux/amd64) of a nil dereference that a
+    // deferred function recovers, then a panic in that function
+    // (gopanicout1 gort `recover-panic-other` and
+    // `recover-then-deref-again`), up to the goroutine trace, without the
+    // `pc`: the recovery has not completed, so the signal line stays, with
+    // the fault address of the last nil dereference.
+    #[test]
+    fn go_after_recover_keeps_the_signal_of_the_recovered_nil_dereference() {
+        let lines = |payload: Box<dyn std::any::Any + Send>| {
+            let panic = payload.downcast_ref::<GoPanic>().expect("a GoPanic");
+            let signal = panic.fault_address.map(go_signal_line).unwrap_or_default();
+            format!("{}\n{signal}", go_panic_lines(panic))
+        };
+        let nil = panic_of(|| go_nil_dereference_at(0x68));
+        let payload =
+            panic_of(|| go_after_recover(nil.as_ref(), || go_panic("write panic".into())));
+        assert_eq!(
+            lines(payload),
+            "panic: runtime error: invalid memory address or nil pointer dereference [recovered]\n\
+             \tpanic: write panic\n\
+             [signal SIGSEGV: segmentation violation code=0x1 addr=0x68 pc=0x0]\n"
+        );
+        let payload = panic_of(|| go_after_recover(&"first", || go_nil_dereference_at(0x18)));
+        assert_eq!(
+            lines(payload),
+            "panic: first [recovered]\n\
+             \tpanic: runtime error: invalid memory address or nil pointer dereference\n\
+             [signal SIGSEGV: segmentation violation code=0x1 addr=0x18 pc=0x0]\n"
+        );
+        // A panic without a signal, after a recovered one without a signal.
+        let payload = panic_of(|| go_after_recover(&"first", || go_panic("second".into())));
+        assert_eq!(
+            lines(payload),
+            "panic: first [recovered]\n\tpanic: second\n"
+        );
     }
 
     // Go: runtime/retry.go:14 retryOnEAGAIN: 20 calls while the error is
@@ -633,5 +742,42 @@ mod tests {
         assert_eq!(value, 1);
         assert_eq!(tries, 20);
         assert_eq!(sleeps, ms(1..=19));
+    }
+
+    // A plain Rust panic is a Go string panic: Go `printpanicval` puts a
+    // tab after each newline of a recovered string too. The Rust payload is
+    // a `&str` for `panic!("text")` and a `String` for a formatted one.
+    #[test]
+    fn go_after_recover_prints_a_rust_panic_text_as_a_go_string() {
+        let write_panic = || {
+            go_panic("write panic".to_string());
+        };
+        let lines =
+            "panic: handler\n\tpanic [recovered]\n\tpanic: write panic [recovered, repanicked]";
+        let payload = panic_of(|| go_after_recover(&"handler\npanic", write_panic));
+        assert_eq!(repanicked_lines(payload), lines);
+        let handler = panic_of(|| std::panic::panic_any("handler\npanic".to_string()));
+        let payload = panic_of(|| go_after_recover(handler.as_ref(), write_panic));
+        assert_eq!(repanicked_lines(payload), lines);
+    }
+
+    // Go `printpanics` prints the oldest panic first. The text is Go's
+    // stderr (go1.27.1, followups41) for a deferred function that recovers
+    // "first" and calls a function whose deferred function recovers
+    // "second" and panics again.
+    #[test]
+    fn go_after_recover_keeps_the_oldest_recovered_panic_first() {
+        let payload = panic_of(|| {
+            go_after_recover(&"first", || {
+                go_after_recover(&"second", || {
+                    go_panic("write panic".to_string());
+                })
+            })
+        });
+        let panic = payload.downcast_ref::<GoPanic>().expect("a GoPanic");
+        assert_eq!(
+            go_panic_lines(panic),
+            "panic: first [recovered]\n\tpanic: second [recovered]\n\tpanic: write panic"
+        );
     }
 }

@@ -93,23 +93,25 @@ fn apply_override(target: &mut ResolvedEffectPluginOptions, o: &Override) {
     if let Some(n) = o.options.pipeable_min_arg_count {
         target.pipeable_min_arg_count = n;
     }
+    // Go copies the list (`cloneKeyPatterns`, `append([]string(nil), ...)`);
+    // a nil one sets an empty list.
     if let Some(patterns) = &o.options.key_patterns {
-        target.key_patterns = patterns.clone();
+        target.key_patterns = patterns.clone().unwrap_or_default();
     }
     if let Some(b) = o.options.extended_key_detection {
         target.extended_key_detection = b;
     }
     if let Some(apis) = &o.options.allowed_unstable_apis {
-        target.allowed_unstable_apis = apis.clone();
+        target.allowed_unstable_apis = apis.clone().unwrap_or_default();
     }
     if let Some(apis) = &o.options.allowed_experimental_apis {
-        target.allowed_experimental_apis = apis.clone();
+        target.allowed_experimental_apis = apis.clone().unwrap_or_default();
     }
     if let Some(pkgs) = &o.options.allowed_duplicated_packages {
-        target.allowed_duplicated_packages = pkgs.clone();
+        target.allowed_duplicated_packages = pkgs.clone().unwrap_or_default();
     }
     if let Some(variants) = &o.options.effect_fn {
-        target.effect_fn = variants.clone();
+        target.effect_fn = variants.clone().unwrap_or_default();
     }
 }
 

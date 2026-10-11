@@ -561,7 +561,8 @@ impl Fs for CallbackFS {
                     // Go reads the fields of the nil pointer that `null`
                     // gives.
                     let raw_entries =
-                        raw_entries.unwrap_or_else(|| crate::core::go_nil_dereference());
+                        // Go N' loads `rawEntries.Files` (offset 0): addr=0x0 (callbackfs.go:264).
+                        raw_entries.unwrap_or_else(|| crate::core::go_nil_dereference_at(0x0));
                     return Entries {
                         files: raw_entries.files,
                         directories: raw_entries.directories,
@@ -623,7 +624,15 @@ impl Fs for CallbackFS {
             let response = decode_callback_response(CALLBACK_WRITE_FILE, &result);
             match response.kind.as_str() {
                 "value" | "noop" => return Ok(()),
-                "useOS" => return self.base.write_file(path, data),
+                // PORT: the API build's flush can hold the OS write back
+                // (`emit_files::os_write_or_defer`).
+                "useOS" => {
+                    let base = self.base.clone();
+                    let (path, data) = (path.to_string(), data.to_string());
+                    return crate::execute::incremental::emit_files::os_write_or_defer(move || {
+                        base.write_file(&path, &data)
+                    });
+                }
                 _ => invalid_callback_response(CALLBACK_WRITE_FILE, &response),
             }
         }

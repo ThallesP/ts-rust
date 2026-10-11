@@ -44,6 +44,7 @@ use crate::api::proto;
 use crate::api::requestfilesystem;
 use crate::astnav;
 use crate::emitter::emitter::EmitOnly;
+use crate::execute::incremental::emit_files::ClientWrites;
 use crate::frontend::compiler;
 use crate::frontend::core_context::{self, CheckerLifetime};
 use crate::frontend::json_ext::{AnyValue, JsonValue};
@@ -1169,6 +1170,11 @@ pub struct Session {
     pub next_source_file_lease_id: Cell<u64>,
 
     pub cpu_profiler: crate::pprof::CpuProfiler,
+
+    /// PORT: not in Go. How the build's writes reach the client
+    /// (`System::client_writes`): the server sets it when the client
+    /// answers the `writeFile` callback.
+    pub client_writes: Cell<Option<ClientWrites>>,
 }
 
 // Go: api/session.go batchResponsePage (ts#64061)
@@ -1265,6 +1271,7 @@ pub fn new_session(
         source_file_leases: RefCell::new(FxHashMap::default()),
         next_source_file_lease_id: Cell::new(0),
         cpu_profiler: crate::pprof::CpuProfiler::default(),
+        client_writes: Cell::new(None),
     };
     if let Some(options) = options {
         s.use_binary_responses = options.use_binary_responses;
@@ -3314,6 +3321,7 @@ impl Session {
             project_session: self.project_session.clone(),
             current_directory,
             start: std::time::Instant::now(),
+            client_writes: self.client_writes.get(),
         })
     }
 
@@ -3828,6 +3836,8 @@ pub struct ApiBuildSystem {
     project_session: Option<Rc<project::Session>>,
     current_directory: String,
     start: std::time::Instant,
+    /// PORT: not in Go. `Session::client_writes`.
+    client_writes: Option<ClientWrites>,
 }
 
 impl crate::execute::tsc::System for ApiBuildSystem {
@@ -3879,6 +3889,9 @@ impl crate::execute::tsc::System for ApiBuildSystem {
     // belongs to this thread, so the build writes through it here.
     fn emit_writes_through_osvfs(&self) -> bool {
         false
+    }
+    fn client_writes(&self) -> Option<ClientWrites> {
+        self.client_writes
     }
 }
 

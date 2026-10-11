@@ -531,7 +531,9 @@ impl Checker {
         // signature. Nothing before Go's first read has a side effect.
         let parameter_list = declaration.parameter_list();
         if parameter_list.is_nil() {
-            crate::core::go_nil_dereference();
+            // Go N' loads `FunctionLikeData().Parameters` of the nil data (offset 0x18): addr=0x18
+            // (ast.go:217).
+            crate::core::go_nil_dereference_at(0x18);
         }
         // PERF: chkport1 item 5. Go reads `declaration.Parameters()`,
         // `declaration.Kind` and `param.Symbol()` as plain fields. Here each

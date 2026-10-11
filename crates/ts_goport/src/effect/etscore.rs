@@ -108,8 +108,21 @@ pub fn is_command_line_mode() -> bool {
 pub struct KeyPattern {
     pub target: String,
     pub pattern: String,
-    pub skip_leading_path: Vec<String>,
+    /// Go `[]string`; `None` is nil. Build info writes nil as `[]` (no
+    /// `omitzero`) and reads it back as `Some([])`, so a nil list from
+    /// `extends` (`cloneKeyPatterns`) makes Go check every file again.
+    pub skip_leading_path: Option<Vec<String>>,
 }
+
+/// Go `*[]T` of an override option. `None` is a nil pointer, `Some(None)` a
+/// pointer to a nil slice: a `[]` list cloned through `extends`
+/// (`cloneStringSlicePtr`, `cloneKeyPatternsPtr`), or an override
+/// `keyPatterns` with no pattern (`parseKeyPatterns` gives nil). Build info
+/// writes both `Some` forms as `[]` (the TypeScript-Go json v2 writes a nil
+/// slice as `[]`) and reads `[]` back as `Some(Some([]))`. So `Some(None)` is
+/// not equal after a round trip, and Go checks every file again (patch 028
+/// `reflect.DeepEqual`).
+pub type SlicePtr<T> = Option<Option<Vec<T>>>;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TopLevelNamedReexportsMode {
@@ -184,12 +197,12 @@ pub struct Override {
 pub struct OverrideOptions {
     pub diagnostic_severity: Option<IndexMap<String, Severity>>,
     pub pipeable_min_arg_count: Option<i64>,
-    pub key_patterns: Option<Vec<KeyPattern>>,
+    pub key_patterns: SlicePtr<KeyPattern>,
     pub extended_key_detection: Option<bool>,
-    pub allowed_unstable_apis: Option<Vec<String>>,
-    pub allowed_experimental_apis: Option<Vec<String>>,
-    pub allowed_duplicated_packages: Option<Vec<String>>,
-    pub effect_fn: Option<Vec<String>>,
+    pub allowed_unstable_apis: SlicePtr<String>,
+    pub allowed_experimental_apis: SlicePtr<String>,
+    pub allowed_duplicated_packages: SlicePtr<String>,
+    pub effect_fn: SlicePtr<String>,
 }
 
 pub const EFFECT_FN_SPAN: &str = "span";
@@ -277,12 +290,12 @@ pub fn default_key_patterns() -> Vec<KeyPattern> {
         KeyPattern {
             target: "service".into(),
             pattern: "default".into(),
-            skip_leading_path: vec!["src/".into()],
+            skip_leading_path: Some(vec!["src/".into()]),
         },
         KeyPattern {
             target: "custom".into(),
             pattern: "default".into(),
-            skip_leading_path: vec!["src/".into()],
+            skip_leading_path: Some(vec!["src/".into()]),
         },
     ]
 }
@@ -543,7 +556,9 @@ fn parse_override_options(value: &CompilerOptionsValue) -> OverrideOptions {
         result.pipeable_min_arg_count = Some(n);
     }
     if let Some(arr) = options.get("keyPatterns").and_then(as_list) {
-        result.key_patterns = Some(parse_key_patterns(arr));
+        // Go `parseKeyPatterns` gives nil when no item is a pattern.
+        let parsed = parse_key_patterns(arr);
+        result.key_patterns = Some((!parsed.is_empty()).then_some(parsed));
     }
     if let Some(b) = options.get("extendedKeyDetection").and_then(as_bool) {
         result.extended_key_detection = Some(b);
@@ -552,22 +567,22 @@ fn parse_override_options(value: &CompilerOptionsValue) -> OverrideOptions {
         .get("allowedUnstableApis")
         .and_then(parse_string_array_strict)
     {
-        result.allowed_unstable_apis = Some(apis);
+        result.allowed_unstable_apis = Some(Some(apis));
     }
     if let Some(apis) = options
         .get("allowedExperimentalApis")
         .and_then(parse_string_array_strict)
     {
-        result.allowed_experimental_apis = Some(apis);
+        result.allowed_experimental_apis = Some(Some(apis));
     }
     if let Some(pkgs) = options
         .get("allowedDuplicatedPackages")
         .and_then(parse_string_array_strict)
     {
-        result.allowed_duplicated_packages = Some(pkgs);
+        result.allowed_duplicated_packages = Some(Some(pkgs));
     }
     if let Some(variants) = options.get("effectFn").and_then(parse_string_array_strict) {
-        result.effect_fn = Some(variants);
+        result.effect_fn = Some(Some(variants));
     }
     result
 }
@@ -604,7 +619,7 @@ fn parse_key_patterns(arr: &[CompilerOptionsValue]) -> Vec<KeyPattern> {
         let mut kp = KeyPattern {
             target: "service".into(),
             pattern: "default".into(),
-            skip_leading_path: vec!["src/".into()],
+            skip_leading_path: Some(vec!["src/".into()]),
         };
         if let Some(s) = m.get("target").and_then(as_str) {
             kp.target = s.to_string();
@@ -613,7 +628,7 @@ fn parse_key_patterns(arr: &[CompilerOptionsValue]) -> Vec<KeyPattern> {
             kp.pattern = s.to_string();
         }
         if let Some(arr) = m.get("skipLeadingPath").and_then(as_list) {
-            kp.skip_leading_path = string_items(arr);
+            kp.skip_leading_path = Some(string_items(arr));
         }
         patterns.push(kp);
     }
@@ -771,8 +786,12 @@ impl EffectPluginOptions {
                             CompilerOptionsValue::Int(n),
                         );
                     }
+                    // A nil slice is written as `[]` (json v2), as a non-nil one.
                     if let Some(kp) = &o.options.key_patterns {
-                        opts.insert("keyPatterns".to_string(), key_patterns_value(kp));
+                        opts.insert(
+                            "keyPatterns".to_string(),
+                            key_patterns_value(kp.as_deref().unwrap_or_default()),
+                        );
                     }
                     if let Some(b) = o.options.extended_key_detection {
                         opts.insert(
@@ -781,16 +800,28 @@ impl EffectPluginOptions {
                         );
                     }
                     if let Some(p) = &o.options.allowed_unstable_apis {
-                        opts.insert("allowedUnstableApis".to_string(), list(p));
+                        opts.insert(
+                            "allowedUnstableApis".to_string(),
+                            list(p.as_deref().unwrap_or_default()),
+                        );
                     }
                     if let Some(p) = &o.options.allowed_experimental_apis {
-                        opts.insert("allowedExperimentalApis".to_string(), list(p));
+                        opts.insert(
+                            "allowedExperimentalApis".to_string(),
+                            list(p.as_deref().unwrap_or_default()),
+                        );
                     }
                     if let Some(p) = &o.options.allowed_duplicated_packages {
-                        opts.insert("allowedDuplicatedPackages".to_string(), list(p));
+                        opts.insert(
+                            "allowedDuplicatedPackages".to_string(),
+                            list(p.as_deref().unwrap_or_default()),
+                        );
                     }
                     if let Some(v) = &o.options.effect_fn {
-                        opts.insert("effectFn".to_string(), list(v));
+                        opts.insert(
+                            "effectFn".to_string(),
+                            list(v.as_deref().unwrap_or_default()),
+                        );
                     }
                     if !opts.is_empty() {
                         om.insert("options".to_string(), CompilerOptionsValue::Map(opts));
@@ -871,6 +902,14 @@ impl EffectPluginOptions {
         };
         if let Some(overrides) = m.get("overrides") {
             result.overrides = parse_overrides(overrides).unwrap_or_default();
+            // Go `json.Unmarshal` reads an override `"keyPatterns": []` as a
+            // pointer to an empty, non-nil slice (`parseKeyPatterns` of a
+            // config gives nil).
+            for o in &mut result.overrides {
+                if o.options.key_patterns == Some(None) {
+                    o.options.key_patterns = Some(Some(Vec::new()));
+                }
+            }
         }
         Some(result)
     }
@@ -904,11 +943,13 @@ fn key_patterns_value(patterns: &[KeyPattern]) -> CompilerOptionsValue {
                     "pattern".to_string(),
                     CompilerOptionsValue::String(kp.pattern.clone()),
                 );
+                // No `omitzero`: a nil list is written as `[]` (json v2).
                 m.insert(
                     "skipLeadingPath".to_string(),
                     CompilerOptionsValue::List(
                         kp.skip_leading_path
                             .iter()
+                            .flatten()
                             .cloned()
                             .map(CompilerOptionsValue::String)
                             .collect(),
@@ -1073,7 +1114,7 @@ mod tests {
             Some(vec!["x".to_string()])
         );
         let o = &options.overrides[0].options;
-        assert_eq!(o.allowed_unstable_apis, Some(Vec::new()));
+        assert_eq!(o.allowed_unstable_apis, Some(Some(Vec::new())));
         // A strict parse drops the whole list for a non-string item.
         assert_eq!(o.allowed_experimental_apis, None);
 
@@ -1088,5 +1129,92 @@ mod tests {
         assert!(at("allowedExperimentalApis") < at("allowedDuplicatedPackages"));
         assert!(at("allowedDuplicatedPackages") < at("diagnosticSeverity"));
         assert_eq!(EffectPluginOptions::from_value(&value), Some(options));
+    }
+
+    /// R190 reviewer item 5. A pointer to a nil list (an override `[]` cloned
+    /// through `extends`, or an override `keyPatterns` with no pattern) is
+    /// written as `[]` and read back as a pointer to an empty list, so it is
+    /// not equal after the build info round trip (Go `reflect.DeepEqual`, patch
+    /// 028), and Go checks every file again. A nil `skipLeadingPath` is the same.
+    #[test]
+    fn nil_lists_differ_after_the_build_info_round_trip() {
+        let round_trip = |options: &EffectPluginOptions| {
+            EffectPluginOptions::from_value(&options.to_value()).expect("options")
+        };
+        let mut empty = EffectPluginOptions {
+            key_patterns: vec![KeyPattern {
+                target: "service".into(),
+                pattern: "default".into(),
+                skip_leading_path: Some(Vec::new()),
+            }],
+            overrides: vec![Override::default()],
+            ..Default::default()
+        };
+        let o = &mut empty.overrides[0].options;
+        o.key_patterns = Some(Some(Vec::new()));
+        o.allowed_unstable_apis = Some(Some(Vec::new()));
+        o.allowed_experimental_apis = Some(Some(Vec::new()));
+        o.allowed_duplicated_packages = Some(Some(Vec::new()));
+        o.effect_fn = Some(Some(Vec::new()));
+        assert_eq!(round_trip(&empty), empty);
+
+        let nil_cases: [fn(&mut EffectPluginOptions); 6] = [
+            |c| c.key_patterns[0].skip_leading_path = None,
+            |c| c.overrides[0].options.key_patterns = Some(None),
+            |c| c.overrides[0].options.allowed_unstable_apis = Some(None),
+            |c| c.overrides[0].options.allowed_experimental_apis = Some(None),
+            |c| c.overrides[0].options.allowed_duplicated_packages = Some(None),
+            |c| c.overrides[0].options.effect_fn = Some(None),
+        ];
+        for (i, set_nil) in nil_cases.into_iter().enumerate() {
+            let mut nil = empty.clone();
+            set_nil(&mut nil);
+            assert_eq!(nil.to_value(), empty.to_value(), "case {i}: the same text");
+            assert_ne!(round_trip(&nil), nil, "case {i}");
+            assert_eq!(round_trip(&nil), empty, "case {i}");
+        }
+
+        // The config parse: an override `keyPatterns: []` is a pointer to nil
+        // (Go `parseKeyPatterns`), a strict list `[]` a pointer to an empty one.
+        let plugin = CompilerOptionsValue::List(vec![CompilerOptionsValue::Map(
+            [
+                (
+                    "name".to_string(),
+                    CompilerOptionsValue::String(EFFECT_PLUGIN_NAME.into()),
+                ),
+                (
+                    "overrides".to_string(),
+                    CompilerOptionsValue::List(vec![CompilerOptionsValue::Map(
+                        [(
+                            "options".to_string(),
+                            CompilerOptionsValue::Map(
+                                [
+                                    (
+                                        "keyPatterns".to_string(),
+                                        CompilerOptionsValue::List(Vec::new()),
+                                    ),
+                                    (
+                                        "effectFn".to_string(),
+                                        CompilerOptionsValue::List(Vec::new()),
+                                    ),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        )]);
+        let parsed = parse_from_plugins(&plugin).expect("plugin");
+        assert_eq!(parsed.overrides[0].options.key_patterns, Some(None));
+        assert_eq!(
+            parsed.overrides[0].options.effect_fn,
+            Some(Some(Vec::new()))
+        );
     }
 }

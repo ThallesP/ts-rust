@@ -261,9 +261,11 @@ impl Checker {
             }
             let skip_object_function_property_augment =
                 self.is_const_enum_object_type(apparent_type);
+            // PERF: intern1 fix 6. The lookup by the identifier's `Name`
+            // compares ids, with no text read.
             prop = self.get_property_of_type_ex(
                 apparent_type,
-                right.text(),
+                &right.text_name(),
                 skip_object_function_property_augment, /*skipObjectFunctionPropertyAugment*/
                 node.kind() == SyntaxKind::QualifiedName, /*includeTypeOnlyMembers*/
             );

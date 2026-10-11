@@ -179,9 +179,12 @@ Go `t.id` equals the arena index, so Go's per-checker `TypeId` counter order
 is kept. Link stores: `mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>`
 etc. with the Go field names (`value_symbol_links` is a
 `ValueSymbolLinkStore`, whose reads give symbol ids; see Threads). A store
-keeps its values in 64-key pages, so a value over 32 bytes (a compile-time
-check in `LinkStore`), or one that few keys have, goes in a `Box`
-(`type_node_links: LinkStore<Node, Box<TypeNodeLinks>>`).
+keeps its values in 64-key pages. A `LinkStore` page holds a value for each
+key, used or not, so a value over 32 bytes (a compile-time check in
+`LinkStore`) goes in a `Box`. A `SparseLinkStore` page holds only the
+values that its keys have, of any size, so a store whose values few keys
+have uses it (lspage1: `type_node_links: SparseLinkStore<Node,
+TypeNodeLinks>`).
 
 `checker/mapper.rs` defines `TypeMapper` (an enum over the Go mapper kinds)
 and its constructors. Go `m.Map(t)` -> `self.mapper_map(m, t)`,
@@ -305,6 +308,20 @@ methods reach the AST through it.
   files published outside a program) opens `enter_base_synthetic_owner()`
   so they belong to the thread. `GOPORT_SYNTHETIC_OWNERS=0` turns owners
   off.
+- Print scopes (n1free): Go `getNodeBuilder` returns `release`
+  (`Factory.ReleaseArenas`), which the to-string entries of
+  `checker/printer.go` defer. Here those entries open a `PrintScope`
+  (`checker/printer_impl.rs`): the checker's to-string factory
+  (`NodeFactory::set_print_owned`) puts its nodes and lists in the print
+  owner of the thread, and the end of the outermost scope frees them in
+  place (a later read panics), with their emit records, idToSymbol
+  entries, fake scope records and the nil-key serialized types. A store
+  in the serialized type cache under an enclosing declaration pins the
+  call: its nodes go to the current owner. `GOPORT_N1=0` turns print
+  scopes off. Go N' also releases the arenas of the emitter's per-file
+  emit context and of the hover and signature help display builders; the
+  port keeps those nodes with their thread or program version (PORT notes
+  at each site).
 - Store columns and the other registry tables of a published file are read
   through one file lookup, `file_block` in `ast/store.rs` (AST node records
   step 3). Each published file id has one block (`FileBlock`: kinds,
@@ -626,7 +643,25 @@ The batch that adds it is not accepted until Theo approves.
   started projects work at the same time, like Go's goroutines. A
   project's emit starts behind its check when `Program::start_emit`
   allows it, and its writes wait in a buffer
-  (`buffer_early_emit_writes`) until the task finishes. A task finishes
+  (`buffer_early_emit_writes`) until the task finishes. The flush makes
+  each write once, as Go's emit goroutines do, also after a failed write.
+  When one failed, the files emit again from the start state and each
+  write gives the flush's result with no write (`emit_files::Writes`), so
+  the TS5033s, the emitted files, the d.ts signatures and the build info
+  are Go's. The API build flushes on its orchestrator thread only
+  (`flush_writes_on_this_thread`). Only that thread reaches its file
+  system, so an API build emit with no early emit (noEmitOnError, F1 to
+  F4, `GOPORT_EARLY_EMIT=0`, or no incremental state) also keeps its
+  writes, and that thread flushes them when the emit ends, with the same
+  replay (`EmitFilesHandler::emit_with_writes_here`). So a TS5033 is in
+  its file's result, sorted and in `emitDiagnosticsPerFile`, as in Go.
+  `tsc -b` and `tsc -p` write at once there. When each API write is a
+  client `writeFile` call (`System::client_writes`), and the build is not
+  single-threaded, the flush writes in rounds (each file's outputs before
+  its declarations first), and after a failed write whose file's d.ts
+  signature then panics it makes only the writes that Go's race mostly
+  makes before that panic (`emit_files::flush_client_writes`, see Exit
+  codes). A task finishes
   when its check and its early emit (when it has one) have ended (the
   barrier jobs behind them also
   wait for the d.ts twins and the emit pool,
@@ -748,7 +783,70 @@ runs `f` under `core::go_wait_group_task`. Where the port runs it inline
 inside work that a Go `recover()` guards (the auto-import registry build
 under a request), it runs `f` under `core::go_wait_group_goroutine`: a Go
 panic ends the process there, because Go's recover sees only its own
-goroutine.
+goroutine. Go's `Program.Emit` emits each file on a work group goroutine
+unless the program is single-threaded. The port waits for its emit jobs
+under `core::go_work_group_task` (`program_emit::wait_emit_jobs`), so a Go
+panic in an emit (an `es_decorator` nil dereference, or the d.ts signature
+of a file after a failed write, incremental/snapshot.go:411) gets the
+suffix in `tsc -p`, `tsc -w`, `tsc -b` (also with `--builders 1`) and the
+API build, and in the API build it ends the process with no answer and
+exit 2, as Go does. With `--singleThreaded` Go emits on the caller's
+goroutine: no suffix, and the API answers the request with the panic.
+`tsc -b` also adds the suffix for its builder goroutine
+(`BuildTask::keep_go_panic`).
+
+A Go nil dereference is a SIGSEGV that the runtime turns into a panic,
+so Go prints a second line, `[signal SIGSEGV: segmentation violation
+code=0x1 addr=<fault address> pc=<pc>]` (runtime `dopanic_m`), before the
+goroutine trace. A site that knows Go's fault address uses
+`core::go_nil_dereference_at(address)`, and the port prints the line with
+`pc=0x0`: Go's `pc` is an instruction of its own binary (0xc5efe9 in
+tsgo-oracle-fed0bf24149f). The d.ts signature site
+(`diagnostic_to_string_builder`) has it (0x68). gopanicout2 gave 39 more
+sites their address: the CLI, build, checker, transformer, API and IPC
+sites, and the LSP sites that a client message reaches (a nil element in
+`changes` or `files`, a code lens without `data`). gopanicout3 gave the 2
+sites of `initialized` theirs: before `initialize`, and a null workspace
+folder (server.go:1716 and 1752). Each address is the
+first load through the nil pointer in Go's compiled code, read from
+`go tool objdump` of the pinned oracle; 6 of them are checked against
+Go's own output (tests/go_nil_signal.rs). The other `go_nil_dereference()`
+sites print no signal line: the `checker::types` accessors (Go returns a
+nil pointer there, and the fault address is the field that each caller
+reads) and LSP and project sites that no known input reaches (Go N'
+answers a request or notification whose `params` is null with
+InvalidParams, so the `params` sites are not reached). The signal stays with the goroutine
+until a recovery completes, so a panic in the deferred function that
+recovered a nil dereference keeps the line (`core::go_after_recover`).
+
+In that panic case Go's other emit goroutines go on until the process
+ends, so which of their outputs exist varies by timing (a file can also be
+cut to 0 bytes). The port's written files are one of the sets that Go N'
+gave in repeated runs (gopanicout1 `go-model.md`): in the CLI modes, and
+in the API build without the `writeFile` callback or single-threaded,
+every other file in full (the flush leaves out only the panicking d.ts).
+In the API build with the callback each write waits for a client answer,
+so the panic mostly wins. Both the client's calls and the written files
+are one of Go's results (gopanicout2 `go-model.md`). After the failed
+write, `flush_client_writes` makes the other outputs before the
+declarations and, for a failed declaration output, the rest of its round,
+and no other declaration (`--async`). With sync msgpack, whose calls go
+one at a time, every file's first output is called; a failure there
+writes the next file's first output too, and a later failure calls and
+writes the next file's output of its round, and the round's earlier
+writes are lost (`flush_serialized_client_writes`). A failed OS write
+after a `useOS` answer dooms its file one round later, because Go tries
+that write again after it makes the directory: in the next round the
+file's output is called and written, and the next file's output is called
+without its write (gopanicout3 `go-model.md`).
+
+The LSP request recover (`Server::recover_guard`) and the API session
+recover are `core::go_recover`: a Go `recover()` sees only its own
+goroutine, so a Go panic in a work group task under a request ends the
+process. The recover logs the port site of a Go panic in place of Go's
+`debug.Stack()` text (`core::go_recovered_stack`), and so does the
+recover of a cross-project queued function
+(`ls::crossproject::panic_occured_text`).
 
 ## Process start
 
@@ -1612,35 +1710,98 @@ each message and after each wake-up. Go `WaitForBackgroundTasks` runs
   - `--api --async` and the API sessions run requests one at a time
     (`ipc/conn_async.rs`). A pipelined request sees the result of the one
     before it. Go runs them at the same time.
-  - The async connection reads its next message only after the running
+  - The API sessions read their next message only after the running
     request. So the end of the input during a request does not cancel the
     request's context: Go's read loop sees the end at once and returns
     (`ipc/conn_async.go:89-91`), and its deferred `cancelHandlers` (`:73`)
     cancels it, so a long check answers early with what it has. The port
-    answers in full and then ends, with Go's exit code.
-  - The end on SIGINT or SIGTERM in `--api --async` is an open Go
-    difference (state note `r187-repair-withdraw-2026-10-09`, lane
-    apisig4). Go's read loop checks the context at the top of each turn
-    (`ipc/conn_async.go:83`) and then waits in the read while a request
-    runs on its own goroutine (`:98`). The port runs the request inline
-    and checks the context after it (`run_loop`). The cases:
-    - A signal during a request: Go answers it, then ends after the next
-      message (it answers that message too) or at the end of the input.
-      The port ends right after the answer and reads no more.
-    - Pipelined requests: a signal during request 1 while request 2 is
-      already sent. Go answers both (2 first) and then waits for the next
-      message. The port answers request 1 and ends: request 2 gets no
-      answer.
-    - A signal while a request waits for a client callback: Go's `Call`
-      returns the context error at once (`:290`), so request 1 is answered
-      at the signal. The port's `call` waits in its read, so it answers
-      request 1 after the next message. Both end after that message.
-  - apisig2 (R187) moved the run's check before an inline request to
-    match the first case. The run then read until the end of the input in
-    the callback case. Its repair apisig3 closed the pending calls at the
-    signal, so the callbacks that a handler makes after the signal
-    (writeFile, removeFile) lost their requests. Both are withdrawn, and
-    `ipc/conn_async.rs` is R186's code.
+    answers in full and then ends, with Go's exit code. `--api --async`
+    reads on a thread of its own (`read_on_thread`) and cancels it as Go.
+  - SIGINT and SIGTERM in `--api --async` end the run as in Go (lane
+    apisig4, tests in `tests/tsgo_stdio_end.rs`). The read thread checks
+    the context before each read (`ipc/conn_async.go:83`), and a `call`
+    waits on the inbox and the context, as Go's `select` (`:289-303`).
+    Equal to Go:
+    - Phase A, until the next client message: a callback that waits
+      returns `context canceled` at once, and a later one writes its
+      request and returns it too. So a request answers at the signal
+      (readFile, fileExists, getAccessibleEntries, realpath,
+      resolveModuleName, writeFile, removeFile), and a callback that
+      panics on a worker goroutine (directoryExists, readFile of a source
+      file) ends the process with exit code 2 at the signal.
+    - Exactly 1 message is read after the signal, also after a request
+      that makes no callback.
+    - Phase B: that message runs after Go's deferred `closePendingCalls`
+      (a Go race that the deferred function wins in practice), so its
+      callbacks write nothing and fail with `ipc: connection closed` and
+      `context canceled`. The run ends with exit code 0.
+    - The end of the input after the signal; a second signal does
+      nothing.
+    - A request that the port holds keeps Go's phase for each callback,
+      except in the window under "Still different". The port holds a
+      request that waits in a callback while a nested request runs
+      (until that one returns), and a request read while another one
+      runs (until that one returns). Go's goroutines go on at once. So
+      each request has a Go clock: the port time less the time that the
+      port held it (`ipc/conn_async.rs`, file header). A callback that
+      Go made before the read loop ended writes its request and returns
+      Go's error (`context canceled` after a signal, else
+      `ipc: connection closed`), also when the port makes it after the
+      end. A callback that Go made after the end writes nothing (Phase
+      B). A reply that the port read before the end goes to its call,
+      also when a nested request holds that call at the end (Go's `Run`
+      gives each reply to its call when it reads it).
+  - Still different in `--api --async` (the requests run one at a time):
+    - A held request answers, writes its later callback requests and
+      crashes (a worker callback) only after the request that held it
+      answers. Go does it at once: at the signal, or at the reply to its
+      callback. So:
+      - The answers come in another order (Go answers request 2 of a
+        pipelined pair first, and a held request before the nested one).
+      - When Go's held worker callback panics (at the signal, or at the
+        end of the read loop), Go ends at once with exit code 2, and the
+        nested request never goes on. The port runs the nested request to
+        its answer (with its callbacks), then the worker panics and the
+        port ends with exit code 2.
+      - A callback request that the port writes after the end of the
+        read loop gets no reply (the read loop has ended). Go wrote it
+        earlier, and its client could answer it before the end.
+    - Go's races give more outcomes than the port: a reply that comes
+      just before the signal, and a signal less than about 0.5 ms before
+      the end of the read loop. There the port mostly gives one of Go's
+      outcomes. Not for a held cleanBuild with SIGINT and EOF 0.25 ms
+      apart (mini-743d): Go wrote only the removeFile of a.js (10 of 10
+      runs), the port also that of b.js (9 of 10; R188 10 of 10).
+    - A held build in a window of about 0.25 to 1.5 ms gives an outcome
+      that Go and R188 mostly do not give. The build waits in its first
+      writeFile, a nested request holds it, and SIGINT or SIGTERM and
+      then the end of the read loop (EOF or a read error) come 0.25 to
+      1.5 ms apart. Go and R188 fail both writes with `context canceled`.
+      The port fails them with `ipc: connection closed`: Go wrote the
+      later writeFile requests before the signal, from concurrent emit
+      workers, but the port's held worker hands over its writes one at a
+      time after the hold, and the Go clock adds that work, so the later
+      writes come after the end (Phase B). Runs outside Go's outcomes of
+      10 per cell (the apisig4 skeptics' `heldbuild.py` and
+      `heldwin.py`): SIGINT and EOF: 0.5 ms: 10 on alvin, 10 on cup2, 4
+      to 5 on mini-743d; 0.75 ms: 10 on alvin, 5 on cup2, 0 on
+      mini-743d; 1 ms: 2 to 3 on alvin, 0 on mini-743d; 1.5 ms: 1 on
+      cup2. SIGINT and a read error (mini-743d): 0.25 ms: 10; 0.5 ms: 3.
+      SIGTERM and EOF (mini-743d), 0.5 ms: 4. Go itself gave
+      `ipc: connection closed` in a few cup2 runs (2 of 10 at 1 ms, 1 of
+      10 at 2 ms), and in 2 runs the port gave a mixed outcome that Go
+      did not give (b.js `context canceled`, a.js
+      `ipc: connection closed`). At 0.25 ms (SIGINT and EOF) Go gives
+      both outcomes and the port only `ipc: connection closed`.
+    - A worker makes one callback at a time, so fewer directoryExists or
+      writeFile requests are out at the signal (Go: 2 or more). The
+      answers are the same. The apisig4 probes K14 and K17 found a build
+      that wrote its outputs again after a failed write (with no signal
+      too, and in R188); since emitretry1 the build makes each write
+      once (see the flush in the build emit notes).
+    - On wasm, which has no threads, the reads stay on the dispatch
+      thread: a waiting callback wakes only at the next message, and
+      there is no Phase B.
 - Go runtime profiles (pprof) have no samples: the port writes Go's file
   names, errors and log lines and valid empty profiles. `runtime.GC` is a
   no-op. `runtime/metrics` reads as `KindBad`, so the Go runtime fields of

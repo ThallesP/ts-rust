@@ -258,7 +258,9 @@ impl ToSnapshot<'_> {
                 // `diagnostic.Diagnostics.FileId`. A plain file id 0 has no
                 // diagnostics, and Go dereferences nil.
                 let Some(diagnostics) = diagnostic.diagnostics.as_ref() else {
-                    go_nil_dereference();
+                    // Go N' loads `Diagnostics.FileId` (offset 0): addr=0x0
+                    // (buildinfotosnapshot.go:163).
+                    crate::core::go_nil_dereference_at(0x0);
                 };
                 let file_path = self.to_file_path(diagnostics.file_id);
                 let value =

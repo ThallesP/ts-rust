@@ -5,6 +5,7 @@ use crate::api::prelude::*;
 use crate::api::callbackfs::{CallbackFS, new_callback_fs};
 use crate::api::protocol_msgpack::new_message_pack_protocol;
 use crate::contentmapper;
+use crate::execute::incremental::emit_files::ClientWrites;
 use crate::frontend::bundled;
 use crate::frontend::json_ext::{AnyValue, JsonValue};
 use crate::frontend::vfs::{self, Fs};
@@ -246,7 +247,9 @@ impl StdioServer {
         let conn: Rc<dyn Conn>;
         if self.options.async_ {
             let protocol = new_jsonrpc_protocol(rwc.clone());
-            let async_conn = new_async_conn_with_protocol(rwc, Box::new(protocol), handler);
+            let async_conn = new_async_conn_with_protocol(rwc.clone(), Box::new(protocol), handler);
+            // PORT: Go's `Run` reads on its own goroutine (`read_on_thread`).
+            async_conn.read_on_thread(Box::new(new_jsonrpc_protocol(rwc)));
             async_conn.set_collect_timing(self.options.collect_timing);
             conn = async_conn;
         } else {
@@ -262,6 +265,20 @@ impl StdioServer {
         }
         // ts#64299
         session.set_connection(conn.clone());
+        // PORT: not in Go. Each build write is a client call with the
+        // `writeFile` callback (`Session::client_writes`).
+        if self
+            .options
+            .callbacks
+            .iter()
+            .any(|name| name == "writeFile")
+        {
+            session.client_writes.set(Some(if self.options.async_ {
+                ClientWrites::Concurrent
+            } else {
+                ClientWrites::Serialized
+            }));
+        }
 
         // ts#64276
         server_run_error(ctx, conn.run(ctx))

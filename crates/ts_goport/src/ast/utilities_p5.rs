@@ -113,10 +113,18 @@ pub fn is_callee_worker(
 }
 
 // Go: ast/utilities.go:3735 IsRightSideOfQualifiedNameOrPropertyAccess
+// PERF: noderef1 G1. The parent and its kind and name are read through
+// one view (`NodeRef`).
 pub fn is_right_side_of_qualified_name_or_property_access(node: Node) -> bool {
-    let parent = node.parent();
+    is_right_side_of_qualified_name_or_property_access_of(node, NodeRef::new(node).parent())
+}
+
+/// `is_right_side_of_qualified_name_or_property_access(node)`, where
+/// `parent` is the view of the parent of `node`.
+#[inline]
+pub fn is_right_side_of_qualified_name_or_property_access_of(node: Node, parent: NodeRef) -> bool {
     match parent.kind() {
-        SyntaxKind::QualifiedName => return parent.right() == node,
+        SyntaxKind::QualifiedName => return parent.node().right() == node,
         SyntaxKind::PropertyAccessExpression => return parent.name() == node,
         SyntaxKind::MetaProperty => return parent.name() == node,
         _ => {}

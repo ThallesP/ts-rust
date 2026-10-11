@@ -23,7 +23,13 @@ Dependent requests use fixed indexes ("resolve lens i", "quick fix for
 diagnostic i", up to a cap); the harness marks an index with no value not_run.
 
 Position math (UTF-8 byte offsets to LSP line and character) is a literal port
-of internal/ls/lsconv/linemap.go and converters.go at dc37b5249.
+of internal/ls/lsconv/linemap.go and converters.go at dc37b5249. The Go line
+references are at fed0bf24149f (N prime, Go code under tsc/). There the
+position math is the same code (lineAndCharacterToPosition and
+positionToLineAndCharacter are no longer exported), and the converters also
+map through a span map (content-mapped files) and take rooted paths. For a
+script with no span map and a plain file path, the result is the same.
+Dynamic file names and FromLSPTextChange follow dc37b5249.
 """
 
 import argparse
@@ -124,12 +130,12 @@ def path_escape(s: str) -> str:
     return "".join(f"%{c:02X}" if should_escape_path_segment(c) else chr(c) for c in s.encode("utf-8"))
 
 
-# Go: bundled/embed.go:25 IsBundled
+# Go: bundled/embed.go:26 IsBundled
 def bundled_is_bundled(path: str) -> bool:
     return path.startswith("bundled:///")
 
 
-# Go: tspath/path.go:49 IsDynamicFileName
+# Go: tspath/path.go:42 IsDynamicFileName
 def tspath_is_dynamic_file_name(file_name: str) -> bool:
     return file_name.startswith("^/")
 
@@ -139,7 +145,7 @@ def tspath_is_volume_character(char: str) -> bool:
     return "a" <= char <= "z" or "A" <= char <= "Z"
 
 
-# Go: tspath/path.go:1093 SplitVolumePath
+# Go: tspath/path.go:1184 SplitVolumePath
 def tspath_split_volume_path(path: str) -> tuple[str, str, bool]:
     if len(path) >= 2 and tspath_is_volume_character(path[0]) and path[1] == ":":
         return path[0:2].lower(), path[2:], True
@@ -215,12 +221,12 @@ def compute_lsp_line_starts(text: bytes) -> LSPLineMap:
 POSITION_ENCODING_KIND_UTF8 = "utf-8"
 POSITION_ENCODING_KIND_UTF16 = "utf-16"
 
-# Go: core/scriptkind.go ScriptKind values
+# Go: core/scriptkind.go ScriptKind values (at N prime, 5 is reserved: formerly External)
 SCRIPT_KIND_UNKNOWN, SCRIPT_KIND_JS, SCRIPT_KIND_JSX, SCRIPT_KIND_TS, SCRIPT_KIND_TSX = 0, 1, 2, 3, 4
 SCRIPT_KIND_EXTERNAL, SCRIPT_KIND_JSON = 5, 6
 
 
-# Go: converters.go:28 Script
+# Go: converters.go:44 Script
 class Script:
     __slots__ = ("_file_name", "_text")
 
@@ -235,7 +241,7 @@ class Script:
         return self._text
 
 
-# Go: converters.go:23 Converters
+# Go: converters.go:25 Converters
 class Converters:
     __slots__ = ("get_line_map", "position_encoding")
 
@@ -243,29 +249,29 @@ class Converters:
         self.get_line_map = get_line_map
         self.position_encoding = position_encoding
 
-    # Go: converters.go:40 ToLSPRange
+    # Go: converters.go:66 ToLSPRange
     def to_lsp_range(self, script: Script, text_range: tuple[int, int]) -> dict:
         return {
             "start": self.position_to_line_and_character(script, text_range[0]),
             "end": self.position_to_line_and_character(script, text_range[1]),
         }
 
-    # Go: converters.go:47 FromLSPRange
+    # Go: converters.go:127 FromLSPRange
     def from_lsp_range(self, script: Script, text_range: dict) -> tuple[int, int]:
         return (
             self.line_and_character_to_position(script, text_range["start"]),
             self.line_and_character_to_position(script, text_range["end"]),
         )
 
-    # Go: converters.go:54 FromLSPTextChange (core.TextChange is (TextRange, NewText))
+    # Go dc37b5249: converters.go:54 FromLSPTextChange (core.TextChange is (TextRange, NewText); not at N prime)
     def from_lsp_text_change(self, script: Script, change: dict) -> tuple[tuple[int, int], str]:
         return self.from_lsp_range(script, change["range"]), change["text"]
 
-    # Go: converters.go:61 ToLSPLocation
+    # Go: converters.go:107 ToLSPLocation
     def to_lsp_location(self, script: Script, rng: tuple[int, int]) -> dict:
         return {"uri": file_name_to_document_uri(script.file_name()), "range": self.to_lsp_range(script, rng)}
 
-    # Go: converters.go:144 LineAndCharacterToPosition
+    # Go: converters.go:360 lineAndCharacterToPosition
     def line_and_character_to_position(self, script: Script, line_and_character: dict) -> int:
         # UTF-8/16 0-indexed line and character to UTF-8 offset
 
@@ -309,7 +315,7 @@ class Converters:
 
         return pos
 
-    # Go: converters.go:194 PositionToLineAndCharacter
+    # Go: converters.go:411 positionToLineAndCharacter
     def position_to_line_and_character(self, script: Script, position: int) -> dict:
         # UTF-8 offset to UTF-8/16 0-indexed line and character
 
@@ -342,12 +348,12 @@ class Converters:
         return {"line": line, "character": character}
 
 
-# Go: converters.go:33 NewConverters
+# Go: converters.go:52 NewConverters
 def new_converters(position_encoding: str, get_line_map) -> Converters:
     return Converters(get_line_map, position_encoding)
 
 
-# Go: converters.go:68 LanguageKindToScriptKind
+# Go: converters.go:290 LanguageKindToScriptKind
 def language_kind_to_script_kind(language_id: str) -> int:
     return {
         "typescript": SCRIPT_KIND_TS,
@@ -358,7 +364,7 @@ def language_kind_to_script_kind(language_id: str) -> int:
     }.get(language_id, SCRIPT_KIND_UNKNOWN)
 
 
-# Go: converters.go:86 extraEscapeReplacer
+# Go: converters.go:308 extraEscapeReplacer
 # https://github.com/microsoft/vscode-uri/blob/edfdccd976efaf4bb8fdeca87e97c47257721729/src/uri.ts#L455
 EXTRA_ESCAPE_REPLACER = {
     ":": "%3A", "/": "%2F", "?": "%3F", "#": "%23", "[": "%5B", "]": "%5D", "@": "%40",
@@ -373,7 +379,7 @@ def extra_escape_replace(s: str) -> str:
     return "".join(EXTRA_ESCAPE_REPLACER.get(ch, ch) for ch in s)
 
 
-# Go: converters.go:110 FileNameToDocumentURI
+# Go: converters.go:332 FileNameToDocumentURI and :336 PathToDocumentURI
 def file_name_to_document_uri(file_name: str) -> str:
     if bundled_is_bundled(file_name):
         return file_name
@@ -401,29 +407,29 @@ def file_name_to_document_uri(file_name: str) -> str:
     return "file://" + volume + "/".join(parts)
 
 
-# Go: converters.go:235 DiagnosticToLSPPull. The battery never converts diagnostics;
+# Go: converters.go:453 DiagnosticToLSPPull. The battery never converts diagnostics;
 # the server-side conversion needs ast.Diagnostic, locale and diagnosticwriter.
 def diagnostic_to_lsp_pull(ctx, converters, diagnostic, report_style_checks_as_warnings):
     unported("DiagnosticToLSPPull")
 
 
-# Go: converters.go:247 DiagnosticToLSPPush
+# Go: converters.go:465 DiagnosticToLSPPush
 def diagnostic_to_lsp_push(ctx, converters, diagnostic):
     unported("DiagnosticToLSPPush")
 
 
-# Go: converters.go:258 styleCheckDiagnostics (needs the diagnostics table) and
-# converters.go:269 diagnosticToLSP
+# Go: converters.go:476 styleCheckDiagnostics (needs the diagnostics table) and
+# converters.go:487 diagnosticToLSP
 def diagnostic_to_lsp(ctx, converters, diagnostic, opts):
     unported("diagnosticToLSP")
 
 
-# Go: converters.go:342 messageChainToString
+# Go: converters.go:615 messageChainToString
 def message_chain_to_string(diagnostic, locale):
     unported("messageChainToString")
 
 
-# Go: converters.go:351 ptrToSliceIfNonEmpty
+# Go: converters.go:624 ptrToSliceIfNonEmpty
 def ptr_to_slice_if_non_empty(s: list):
     if len(s) == 0:
         return None
@@ -717,7 +723,7 @@ SEMANTIC_TOKEN_MODIFIERS = ["declaration", "definition", "readonly", "static", "
 
 
 def get_capabilities_with_defaults(position_encoding: str) -> dict:
-    """internal/fourslash/fourslash.go:566 getCapabilitiesWithDefaults(nil), with our position encoding."""
+    """internal/fourslash/fourslash.go:674 getCapabilitiesWithDefaults(nil), with our position encoding."""
     doc_formats = ["markdown", "plaintext"]
     diagnostic_caps = {"relatedInformation": True, "tagSupport": {"valueSet": [1, 2]}}
     return {

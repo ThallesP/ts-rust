@@ -903,38 +903,50 @@ pub struct Checker {
     // Go N' checker.go:673 mergedExportsChecked (ts#64566)
     pub merged_exports_checked: FxHashSet<SymbolId>,
     pub factory: NodeFactory,
-    pub node_links: LinkStore<Node, NodeLinks>,
-    pub signature_links: LinkStore<Node, Box<SignatureLinks>>,
+    // Link stores (lspage1). Sparse pages where few keys of a page have a
+    // record (2% to 30% on VS Code). Dense pages for `value_symbol_links`
+    // (80% to 98%), for the symbols made in runs (`mapped_symbol_links`,
+    // `reverse_mapped_symbol_links`: up to 63% and 40%), and for small
+    // stores with hot reads (`alias_symbol_links`, `variance_links`), as a
+    // sparse read or new record costs a few more instructions.
+    pub node_links: SparseLinkStore<Node, NodeLinks>,
+    pub signature_links: SparseLinkStore<Node, SignatureLinks>,
     pub symbol_node_links: NodeLinkStore<SymbolNodeLinks>,
-    pub type_node_links: LinkStore<Node, Box<TypeNodeLinks>>,
-    pub enum_member_links: LinkStore<Node, Box<EnumMemberLinks>>,
-    pub assertion_links: LinkStore<Node, AssertionLinks>,
-    pub array_literal_links: LinkStore<Node, ArrayLiteralLinks>,
-    pub switch_statement_links: LinkStore<Node, Box<SwitchStatementLinks>>,
-    pub jsx_element_links: LinkStore<Node, Box<JsxElementLinks>>,
-    pub computed_name_links: LinkStore<Node, Box<ComputedNameNodeLinks>>,
-    pub symbol_reference_links: LinkStore<SymbolId, SymbolReferenceLinks>,
+    pub type_node_links: SparseLinkStore<Node, TypeNodeLinks>,
+    pub enum_member_links: SparseLinkStore<Node, Box<EnumMemberLinks>>,
+    pub assertion_links: SparseLinkStore<Node, AssertionLinks>,
+    pub array_literal_links: SparseLinkStore<Node, ArrayLiteralLinks>,
+    pub switch_statement_links: SparseLinkStore<Node, Box<SwitchStatementLinks>>,
+    pub jsx_element_links: SparseLinkStore<Node, Box<JsxElementLinks>>,
+    pub computed_name_links: SparseLinkStore<Node, Box<ComputedNameNodeLinks>>,
+    pub symbol_reference_links: SparseLinkStore<SymbolId, SymbolReferenceLinks>,
     pub value_symbol_links: ValueSymbolLinkStore,
     pub mapped_symbol_links: LinkStore<SymbolId, MappedSymbolLinks>,
-    pub deferred_symbol_links: LinkStore<SymbolId, Box<DeferredSymbolLinks>>,
+    pub deferred_symbol_links: SparseLinkStore<SymbolId, Box<DeferredSymbolLinks>>,
     pub alias_symbol_links: LinkStore<SymbolId, Box<AliasSymbolLinks>>,
-    pub module_symbol_links: LinkStore<SymbolId, Box<ModuleSymbolLinks>>,
-    pub late_bound_links: LinkStore<SymbolId, LateBoundLinks>,
-    pub export_type_links: LinkStore<SymbolId, Box<ExportTypeLinks>>,
-    pub members_and_exports_links: LinkStore<SymbolId, MembersAndExportsLinks>,
-    pub type_alias_links: LinkStore<SymbolId, Box<TypeAliasLinks>>,
-    pub declared_type_links: LinkStore<SymbolId, DeclaredTypeLinks>,
-    pub spread_links: LinkStore<SymbolId, SpreadLinks>,
+    pub module_symbol_links: SparseLinkStore<SymbolId, Box<ModuleSymbolLinks>>,
+    pub late_bound_links: SparseLinkStore<SymbolId, LateBoundLinks>,
+    pub export_type_links: SparseLinkStore<SymbolId, Box<ExportTypeLinks>>,
+    pub members_and_exports_links: SparseLinkStore<SymbolId, MembersAndExportsLinks>,
+    pub type_alias_links: SparseLinkStore<SymbolId, Box<TypeAliasLinks>>,
+    pub declared_type_links: SparseLinkStore<SymbolId, DeclaredTypeLinks>,
+    pub spread_links: SparseLinkStore<SymbolId, SpreadLinks>,
     pub variance_links: LinkStore<SymbolId, Box<VarianceLinks>>,
     /// Go `ReverseMappedSymbolLinks` (exported field name).
     pub reverse_mapped_symbol_links: LinkStore<SymbolId, ReverseMappedSymbolLinks>,
-    pub marked_assignment_symbol_links: LinkStore<SymbolId, MarkedAssignmentSymbolLinks>,
-    pub symbol_container_links: LinkStore<SymbolId, Box<ContainingSymbolLinks>>,
+    pub marked_assignment_symbol_links: SparseLinkStore<SymbolId, MarkedAssignmentSymbolLinks>,
+    pub symbol_container_links: SparseLinkStore<SymbolId, Box<ContainingSymbolLinks>>,
     // ts#64469, Go N' checker.go:701. Go nil is `None`.
     pub external_module_containers:
         Option<Box<crate::checker::symbol_accessibility::ExternalModuleContainerIndex>>,
-    pub source_file_links: LinkStore<Node, Box<SourceFileLinks>>,
+    pub source_file_links: SparseLinkStore<Node, Box<SourceFileLinks>>,
     pub pattern_for_type: FxHashMap<TypeId, Node>,
+    /// Go `lazyMemberTables` (microsoft/TypeScript#64475, not in the pin;
+    /// lazy_members.rs). Empty unless `lazy_members` is on.
+    pub(crate) lazy_member_tables: crate::checker::lazy_members::LazyMemberTables,
+    /// lazymem1: `GOPORT_LAZY_MEMBERS=1` (lazy_members.rs). Not in Go. Set
+    /// once at creation; off, no lazy member table is made.
+    pub lazy_members: bool,
     pub context_free_types: FxHashMap<Node, TypeId>,
     pub any_type: TypeId,
     pub auto_type: TypeId,
@@ -1174,6 +1186,10 @@ pub struct Checker {
     pub(crate) merge_version: u64,
     /// PERF: not in Go. See `is_type_subset_of_union`.
     pub(crate) union_subset_answers: FxHashMap<(TypeId, TypeId), bool>,
+    /// nevfast1: `GOPORT_FAST_NEVER_ORDER=1` (`fast_never_order_from_env`).
+    /// Not in Go. Set once at creation; on, `some_property_reduces_to_never`
+    /// tests the names in the port's faster order.
+    pub(crate) fast_never_order: bool,
 
     // Arenas (PORTING.md "Checker data"). Index 0 of each is a dummy entry
     // so handle value 0 stays nil.
@@ -1457,6 +1473,8 @@ impl Checker {
             external_module_containers: None,
             source_file_links: LinkStore::default(),
             pattern_for_type: FxHashMap::default(),
+            lazy_member_tables: Default::default(),
+            lazy_members: crate::checker::lazy_members::lazy_members_from_env(),
             context_free_types: FxHashMap::default(),
             any_type: TypeId::NIL,
             auto_type: TypeId::NIL,
@@ -1669,6 +1687,7 @@ impl Checker {
             flow_skip: Default::default(),
             merge_version: 0,
             union_subset_answers: FxHashMap::default(),
+            fast_never_order: crate::checker::checker_p24::fast_never_order_from_env(),
             symbols,
             types: ChunkedArena::with_nil(Type::default()),
             object_type_instantiations: vec![InstantiationMap::default()],

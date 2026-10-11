@@ -782,7 +782,8 @@ pub fn parse_json_config_file_content_worker(
                     for_each_tsconfig_prop_array(source_file.source_file, "files", |property| {
                         Some(property.initializer())
                     })
-                    .unwrap_or_else(|| crate::core::go_nil_dereference());
+                    // Go N' loads `node.Loc.Pos()` (offset 8): addr=0x8 (errors.go:93).
+                    .unwrap_or_else(|| crate::core::go_nil_dereference_at(0x8));
                 errors.push(create_diagnostic_for_node_in_source_file(
                     source_file.source_file,
                     node_value,

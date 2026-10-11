@@ -21,7 +21,8 @@ use crate::prelude::*;
 
 /// An immutable list. It works like a Go slice over an array that is never
 /// written again: a clone or a sub-slice copies no elements (a sub-slice of
-/// an `Owned` list is a copy). An empty list does not allocate.
+/// an `Owned` list is a copy). An empty list does not allocate. An empty
+/// list is Go nil (`is_nil`) unless `empty_non_nil` made it.
 ///
 /// PORT: Go returns resolved member, signature, index info and type argument
 /// slices without a copy. Callers read the list through `Deref<[T]>`.
@@ -89,9 +90,44 @@ impl<T> SharedList<T> {
             repr: std::mem::ManuallyDrop::new(repr),
         }
     }
+
+    /// Go's empty non-nil slice: an empty list for which `is_nil` is false.
+    /// Its clones keep this state.
+    ///
+    /// PORT: a Go cache that tests `== nil` for "not resolved" stores this
+    /// for an empty result, so that the result is resolved once.
+    pub const fn empty_non_nil() -> Self {
+        Self {
+            repr: std::mem::ManuallyDrop::new(SharedListRepr::Arena(&[])),
+        }
+    }
+
+    /// Go `list == nil`: the list is empty and is not `empty_non_nil`.
+    ///
+    /// PORT: an empty list from `default` or `From` reads as nil. Use this
+    /// only on a field whose resolver stores `non_nil` lists.
+    #[inline]
+    pub fn is_nil(&self) -> bool {
+        matches!(
+            &*self.repr,
+            SharedListRepr::Inline {
+                len: InlineLen::Zero,
+                ..
+            }
+        )
+    }
 }
 
 impl<T: Copy + Default> SharedList<T> {
+    /// Go's non-nil slice of `items`: as `From`, but empty `items` give
+    /// `empty_non_nil`.
+    pub fn non_nil(items: &[T]) -> Self {
+        if items.is_empty() {
+            return Self::empty_non_nil();
+        }
+        Self::from(items)
+    }
+
     /// An inline list of `items`, which has at most `SHARED_LIST_INLINE`
     /// elements.
     #[inline]
@@ -2242,10 +2278,17 @@ pub struct InstantiationExpressionType {
 // MappedType
 
 // Go: checker/types.go:1110 MappedType
+// PORT: write `declaration` with `set_declaration`, which also keeps
+// `declaration_name_type`.
 #[derive(Clone, Default)]
 pub struct MappedType {
     pub object: ObjectType,
     pub declaration: Node, // *ast.MappedTypeNode
+    // PERF: no Go field. Go `declaration.NameType`, kept when the declaration
+    // is set (the node never changes). The mapped-type checks read it on hot
+    // paths (`is_generic_mapped_type`), and a node field read goes through
+    // the file's node store. `MappedType` is boxed, so `Type` does not grow.
+    pub declaration_name_type: Node,
     pub type_parameter: TypeId,
     pub constraint_type: TypeId,
     pub name_type: TypeId,
@@ -2256,6 +2299,13 @@ pub struct MappedType {
 }
 
 impl MappedType {
+    /// Sets Go `m.declaration` and keeps its `NameType`.
+    #[inline]
+    pub fn set_declaration(&mut self, declaration: Node) {
+        self.declaration = declaration;
+        self.declaration_name_type = declaration.name_type();
+    }
+
     // Go: checker/types.go:1122 MappedType.TypeParameter
     pub fn type_parameter(&self) -> TypeId {
         self.type_parameter

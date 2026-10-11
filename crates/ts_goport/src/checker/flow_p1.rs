@@ -430,8 +430,10 @@ impl Checker {
             (fb.reference, fb.declared_type, fb.reference_is_access)
         };
         // PERF: chkA. The kind of `node` is read once, for the match and the
-        // `for ... in` test below.
-        let node_kind = node.kind();
+        // `for ... in` test below. noderef1 G2: through a view (`NodeRef`),
+        // which the `for ... in` test reads the grandparent with.
+        let node_ref = NodeRef::new(node);
+        let node_kind = node_ref.kind();
         // Assignments only narrow the computed type if the declared type is a union type. Thus, we
         // only need to evaluate the assigned type if the declared type is a union type.
         if !self.matching_reference_memo_says_no(reference, node, node_kind)
@@ -512,14 +514,12 @@ impl Checker {
             };
         }
         // for (const _ in ref) acts as a nonnull on ref
-        if node_kind == SyntaxKind::VariableDeclaration
-            && is_for_in_statement(node.parent().parent())
-            && (self.is_matching_reference(reference, node.parent().parent().expression())
-                || self.optional_chain_contains_reference(
-                    node.parent().parent().expression(),
-                    reference,
-                ))
-        {
+        if node_kind == SyntaxKind::VariableDeclaration && {
+            let grand_parent = node_ref.parent().parent();
+            grand_parent.kind() == SyntaxKind::ForInStatement
+                && (self.is_matching_reference(reference, grand_parent.expression())
+                    || self.optional_chain_contains_reference(grand_parent.expression(), reference))
+        } {
             let antecedent_type = self.get_type_at_flow_node(f, flow_data.antecedent).t;
             let finalized = self.finalize_evolving_array_type(antecedent_type);
             return FlowType {

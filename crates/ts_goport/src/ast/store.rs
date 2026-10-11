@@ -344,10 +344,17 @@ impl StoreFacts {
 // PERF: 12 bytes of the `NodeKids` of the slot. A read is one kids word
 // and the per-store record of `Node::new`, not the chain kind table, node
 // pointer, node tag, data box, field.
+// PERF: perfP2 item 2. Two words, `name` and `other` in one: a struct of two
+// scalars comes back from `store_node_children` in two registers. Three
+// `u32` fields came back through memory, three 4-byte stores, and the caller
+// read `name` and `other` with one 8-byte load right after the call. That
+// load cannot take its value from two stores still in the store buffer, so
+// it waited for them: two thirds of the cycles of `alloc_store_slot_node`
+// and of the lib snapshot load.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SlotChildren {
-    name: u32,
-    other: u32,
+    /// `name` in the low half, `other` in the high half.
+    name_other: u64,
     typed: u32,
 }
 
@@ -377,12 +384,34 @@ impl SlotChildren {
     /// `NO_TYPE_ARGUMENTS` bit is clear.
     const TYPED_UNKNOWN_VALUE: u32 = Self::TYPED_UNKNOWN << Self::TYPED_TAG_SHIFT;
 
+    /// The entry of a slot whose data has none of the fields
+    /// (`store_node_children`), such as an Identifier: no name,
+    /// none of the `other` fields (tag 0, id 0), no type or initializer
+    /// (`TYPED_TYPE`, id 0) and no type argument list.
+    pub(crate) const NO_FIELDS: Self = Self {
+        name_other: 0,
+        typed: Self::NO_TYPE_ARGUMENTS,
+    };
     /// Every read takes the node data.
     pub(crate) const UNKNOWN: Self = Self {
-        name: Self::UNKNOWN_ID,
-        other: Self::UNKNOWN_ID,
+        name_other: Self::name_other_of(Self::UNKNOWN_ID, Self::UNKNOWN_ID),
         typed: Self::TYPED_UNKNOWN_VALUE,
     };
+    /// The `name_other` word of field values `name` and `other`.
+    #[inline]
+    const fn name_other_of(name: u32, other: u32) -> u64 {
+        (name as u64) | ((other as u64) << 32)
+    }
+    /// The `name` field value.
+    #[inline]
+    fn name(self) -> u32 {
+        self.name_other as u32
+    }
+    /// The `other` field value.
+    #[inline]
+    fn other(self) -> u32 {
+        (self.name_other >> 32) as u32
+    }
 
     /// `name` is the name child id (0 for nil or no field, `None` for
     /// unknown); `other` is `(tag, id)` (`None` for unknown). The `typed`
@@ -398,8 +427,7 @@ impl SlotChildren {
         Self {
             // `UNKNOWN_ID` itself is not a slot id a store can reach, and
             // it reads as unknown, which is always exact.
-            name: name.unwrap_or(Self::UNKNOWN_ID),
-            other,
+            name_other: Self::name_other_of(name.unwrap_or(Self::UNKNOWN_ID), other),
             typed: Self::TYPED_UNKNOWN_VALUE,
         }
     }
@@ -446,7 +474,7 @@ impl SlotChildren {
     /// The tag and id of `other`.
     #[cfg(test)]
     fn other_parts(self) -> (u32, u32) {
-        Self::other_parts_of(self.other)
+        Self::other_parts_of(self.other())
     }
 
     /// C2: the tag and id of `typed`.
@@ -867,8 +895,8 @@ impl NodeKids {
     #[inline]
     fn new(children: SlotChildren, word: u32) -> Self {
         Self {
-            name: AtomicU32::new(children.name),
-            other: AtomicU32::new(children.other),
+            name: AtomicU32::new(children.name()),
+            other: AtomicU32::new(children.other()),
             typed: AtomicU32::new(children.typed),
             word: AtomicU32::new(word),
         }
@@ -890,8 +918,10 @@ impl NodeKids {
     #[inline]
     fn children(&self) -> SlotChildren {
         SlotChildren {
-            name: self.name.load(Ordering::Relaxed),
-            other: self.other.load(Ordering::Relaxed),
+            name_other: SlotChildren::name_other_of(
+                self.name.load(Ordering::Relaxed),
+                self.other.load(Ordering::Relaxed),
+            ),
             typed: self.typed.load(Ordering::Relaxed),
         }
     }
@@ -936,8 +966,8 @@ impl NodeKids {
 
     #[inline]
     fn set_children(&mut self, children: SlotChildren) {
-        *self.name.get_mut() = children.name;
-        *self.other.get_mut() = children.other;
+        *self.name.get_mut() = children.name();
+        *self.other.get_mut() = children.other();
         *self.typed.get_mut() = children.typed;
     }
 
@@ -4654,6 +4684,378 @@ pub fn frozen_store_ast_node(n: Node) -> Option<&'static NodeData> {
         .map(|nodes| nodes[slot_index(n)].expect("store handle does not name a node slot"))
 }
 
+/// A published store node with its registry block, read once: the node
+/// shell of a freeable file version included (`frozen_store_kind`). Its
+/// reads are plain loads from the block's columns, so a caller that reads
+/// several fields of one node does one registry lookup, not one per field.
+/// Lives no longer than a node read: the block of a freeable file version
+/// is valid only while the version is.
+// PERF: noderef1 (getsym1 report, W1). Go reads `n.Kind` and `n.data` from
+// one struct. Each `Node` read here goes through `file_block`, whose
+// `OnceLock` acquire load stops LLVM from merging repeated lookups.
+#[derive(Clone, Copy)]
+pub struct FrozenNode {
+    block: &'static FileBlock,
+    file: usize,
+    index: usize,
+}
+
+impl FrozenNode {
+    /// Go `node.Kind` (`frozen_store_kind`).
+    #[inline]
+    #[must_use]
+    pub fn kind(self) -> SyntaxKind {
+        self.block.kinds[self.index]
+    }
+
+    /// The node data (`frozen_store_ast_node`). `None` in the node shell of
+    /// a freeable file version whose store owns its astdata nodes
+    /// (lsshells M3c): read those with `with_scoped_ast_node`.
+    #[inline]
+    #[must_use]
+    pub fn data(self) -> Option<&'static NodeData> {
+        self.block
+            .node_column()
+            .map(|nodes| slot_node(nodes[self.index]))
+    }
+
+    /// How `Node::new(file, id)` maps the child ids in the data of this
+    /// node (`frozen_store_ids`).
+    // PERF: noderef1 W2. A child id becomes its handle with no call and no
+    // second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn ids(self) -> FrozenIds {
+        block_ids(self.block, self.file)
+    }
+
+    /// `frozen_store_children` of this node: its children in Go
+    /// `ForEachChild` order from the link column of its block, or `None`
+    /// when its chain is not known or the block has no link column (a
+    /// node shell).
+    // PERF: perfP1 item 1. No second registry lookup.
+    #[inline]
+    #[must_use]
+    pub fn children(self) -> Option<StoreChildren<'static>> {
+        let links = self.block.file.links;
+        let first = links.get(self.index)?.first_child;
+        (first != LINK_NONE).then_some(StoreChildren {
+            file: self.file,
+            links,
+            next: first,
+        })
+    }
+}
+
+/// The `FrozenNode` of `n`. `None` as for `frozen_store_kind`: nil,
+/// synthetic and unpublished store nodes.
+#[inline]
+#[must_use]
+pub fn frozen_store_node(n: Node) -> Option<FrozenNode> {
+    if n.is_nil() {
+        return None;
+    }
+    let file = n.file_index();
+    Some(FrozenNode {
+        block: file_block(file)?,
+        file,
+        index: slot_index(n),
+    })
+}
+
+/// A node with the registry block of its file, read once (`file_block`):
+/// Go `*ast.Node` as a predicate reads it. Its reads of the kind, parent,
+/// flags, loc and the column children are plain loads from the block's
+/// columns, and `parent` of a node whose parent is in the same store keeps
+/// the block. Any other node (nil, synthetic, unpublished; a parent in
+/// another store makes its own lookup) reads through the `Node` methods,
+/// which give the same values. Lives no longer than a node read: the block
+/// of a freeable file version is valid only while the version is.
+// PERF: noderef1 G1 (getsym1 report). Each `Node` read goes through
+// `file_block`, whose `OnceLock` acquire load stops LLVM from merging
+// repeated lookups: `node.parent().kind()` three times in one predicate was
+// six lookups. Go reads struct fields.
+#[derive(Clone, Copy)]
+pub struct NodeRef {
+    node: Node,
+    /// The block of `node`'s file, `None` for a node that is not a
+    /// published store node.
+    block: Option<&'static FileBlock>,
+}
+
+impl std::fmt::Debug for NodeRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NodeRef({:?})", self.node)
+    }
+}
+
+impl NodeRef {
+    /// The nil node.
+    pub const NIL: NodeRef = NodeRef {
+        node: Node::NIL,
+        block: None,
+    };
+
+    /// The view of `n`: one registry lookup for a published store node.
+    #[inline]
+    #[must_use]
+    pub fn new(n: Node) -> Self {
+        if n.is_nil() {
+            return Self::NIL;
+        }
+        NodeRef {
+            node: n,
+            block: file_block(n.file_index()),
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn node(self) -> Node {
+        self.node
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_nil(self) -> bool {
+        self.node.is_nil()
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_some(self) -> bool {
+        self.node.is_some()
+    }
+
+    /// Go `node.Kind` (`Node::kind`).
+    #[inline]
+    #[must_use]
+    pub fn kind(self) -> SyntaxKind {
+        match self.block {
+            Some(b) => b.kinds[slot_index(self.node)],
+            None => node_ref_kind(self.node),
+        }
+    }
+
+    /// Go `node.Kind` of a node that may be nil: `SyntaxKind::Unknown` for
+    /// nil (`node_parent_and_kind`).
+    #[inline]
+    #[must_use]
+    pub fn kind_or_unknown(self) -> SyntaxKind {
+        match self.block {
+            Some(b) => b.kinds[slot_index(self.node)],
+            None if self.node.is_nil() => SyntaxKind::Unknown,
+            None => node_ref_kind(self.node),
+        }
+    }
+
+    /// Go `node.Parent` (`Node::parent`). A parent in the same store keeps
+    /// the block; a parent in another store makes its own lookup.
+    #[inline]
+    #[must_use]
+    pub fn parent(self) -> NodeRef {
+        let Some(b) = self.block else {
+            return NodeRef::new(node_ref_parent(self.node));
+        };
+        let r = &b.records[slot_index(self.node)];
+        debug_assert!(r.is_node(), "store handle does not name a node slot");
+        let code = r.parent_code();
+        let file = self.node.file_index();
+        if code & FOREIGN_PARENT != 0 {
+            return NodeRef::new(frozen_foreign_parent(
+                file,
+                (code & !FOREIGN_PARENT) as usize,
+            ));
+        }
+        NodeRef {
+            node: local_parent_of_code(code, file),
+            block: if code == 0 { None } else { Some(b) },
+        }
+    }
+
+    /// Go `node.Flags` (`Node::flags`), with the owner check of the binder
+    /// field reads (`frozen_owned_record`).
+    #[inline]
+    #[must_use]
+    pub fn flags(self) -> NodeFlags {
+        match self.block {
+            Some(b) => {
+                let r = &b.records[slot_index(self.node)];
+                check_block_owner(b, self.node.file_index());
+                r.flags()
+            }
+            None => node_ref_flags(self.node),
+        }
+    }
+
+    /// Go `node.Flags & mask` for a `mask` without a binder-added bit
+    /// (`Node::parser_flags`).
+    #[inline]
+    #[must_use]
+    pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
+        debug_assert!(
+            !mask.intersects(super::node::BINDER_ADDED_FLAGS),
+            "parser_flags mask {:#x} has binder bits",
+            mask.bits()
+        );
+        self.flags() & mask
+    }
+
+    /// Go `node.Loc` (`Node::loc`).
+    #[inline]
+    #[must_use]
+    pub fn loc(self) -> TextRange {
+        match self.block {
+            Some(b) => b.records[slot_index(self.node)].loc(),
+            None => node_ref_loc(self.node),
+        }
+    }
+
+    /// Go `GetSourceFileOfNode(node)` when the node's parent walk ends at
+    /// its store root (`frozen_source_file_of_node`), else `None`.
+    #[inline]
+    #[must_use]
+    pub fn source_file_root(self) -> Option<Node> {
+        let b = self.block?;
+        b.records[slot_index(self.node)]
+            .has_bit(NodeRecord::SOURCE_FILE_ROOT)
+            .then(|| b.file.root)
+    }
+
+    /// The node data (`static_ast_node`), or `None` for a node with no
+    /// node column read: nil, synthetic, unpublished, or the node shell of
+    /// a freeable file version whose store owns its astdata nodes. The
+    /// caller then reads the data through the `Node` (`with_data!`).
+    #[inline]
+    #[must_use]
+    pub fn data(self) -> Option<&'static NodeData> {
+        let nodes = self.block?.node_column()?;
+        Some(slot_node(nodes[slot_index(self.node)]))
+    }
+
+    /// The column child `which` (`frozen_store_child`), else `None`.
+    #[inline]
+    fn column_child(self, which: StoreChild) -> Option<Node> {
+        column_store_child(self.block?, self.node, which)
+    }
+
+    /// Go `node.Name()` (`Node::name`).
+    #[inline]
+    #[must_use]
+    pub fn name(self) -> Node {
+        match self.column_child(StoreChild::Name) {
+            Some(name) => {
+                debug_assert_eq!(name, self.node.name(), "NodeRef name column");
+                name
+            }
+            None => node_ref_name(self.node),
+        }
+    }
+
+    /// Go `node.Expression()` (`Node::expression`).
+    #[inline]
+    #[must_use]
+    pub fn expression(self) -> Node {
+        match self.column_child(StoreChild::Expression) {
+            Some(expression) => {
+                debug_assert_eq!(expression, self.node.expression(), "NodeRef expression");
+                expression
+            }
+            None => node_ref_expression(self.node),
+        }
+    }
+
+    /// Go `node.Initializer()` (`Node::initializer`).
+    #[inline]
+    #[must_use]
+    pub fn initializer(self) -> Node {
+        match self.column_child(StoreChild::Initializer) {
+            Some(initializer) => {
+                debug_assert_eq!(initializer, self.node.initializer(), "NodeRef initializer");
+                initializer
+            }
+            None => node_ref_initializer(self.node),
+        }
+    }
+
+    /// Go `node.Type()` (`Node::type_`).
+    #[inline]
+    #[must_use]
+    pub fn type_(self) -> Node {
+        match self.column_child(StoreChild::Type) {
+            Some(type_) => {
+                debug_assert_eq!(type_, self.node.type_(), "NodeRef type");
+                type_
+            }
+            None => node_ref_type(self.node),
+        }
+    }
+
+    /// Go `node.AsTypeReference().TypeName` (`Node::type_name`).
+    #[inline]
+    #[must_use]
+    pub fn type_name(self) -> Node {
+        match self.column_child(StoreChild::TypeName) {
+            Some(type_name) => {
+                debug_assert_eq!(type_name, self.node.type_name(), "NodeRef type name");
+                type_name
+            }
+            None => node_ref_type_name(self.node),
+        }
+    }
+}
+
+// The `NodeRef` reads of a node that is not a published store node. Out of
+// line, so the view's hot reads stay small.
+#[cold]
+#[inline(never)]
+fn node_ref_kind(n: Node) -> SyntaxKind {
+    n.kind()
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_parent(n: Node) -> Node {
+    n.parent()
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_flags(n: Node) -> NodeFlags {
+    n.flags()
+}
+
+#[cold]
+#[inline(never)]
+fn node_ref_loc(n: Node) -> TextRange {
+    n.loc()
+}
+
+#[inline(never)]
+fn node_ref_name(n: Node) -> Node {
+    n.name()
+}
+
+#[inline(never)]
+fn node_ref_expression(n: Node) -> Node {
+    n.expression()
+}
+
+#[inline(never)]
+fn node_ref_initializer(n: Node) -> Node {
+    n.initializer()
+}
+
+#[inline(never)]
+fn node_ref_type_name(n: Node) -> Node {
+    n.type_name()
+}
+
+#[inline(never)]
+fn node_ref_type(n: Node) -> Node {
+    n.type_()
+}
+
 /// `store_ast_node(n)` when `n` is a store node, in one lookup (see
 /// `try_store_header`). `None` for nil and synthetic nodes, and for a node
 /// with no `'static` data (a node that a freeable parse owns, lsshells M3c;
@@ -5233,16 +5635,21 @@ impl FrozenIds {
 #[inline]
 #[must_use]
 pub fn frozen_store_ids(file: usize) -> Option<FrozenIds> {
-    let b = file_block(file)?;
+    file_block(file).map(|b| block_ids(b, file))
+}
+
+/// The `FrozenIds` of published store `file`, whose block is `b`.
+#[inline]
+fn block_ids(b: &FileBlock, file: usize) -> FrozenIds {
     let base = (file as u64) << 32;
-    Some(if b.file.facts.alias_free {
+    if b.file.facts.alias_free {
         FrozenIds::Direct { base }
     } else {
         FrozenIds::Records {
             base,
             records: b.records,
         }
-    })
+    }
 }
 
 /// U1 (e): capacity hints for binding published store file `file`
@@ -5301,15 +5708,51 @@ fn try_with_build_slot(n: Node, f: impl FnOnce(&mut FileStore, usize)) -> bool {
     true
 }
 
-/// Go `finishNode` writes `node.Loc = loc` and `node.Flags |= flags` on a
-/// node of an unfinished store, in one store access. False (nothing
-/// written) when `n` is not a store node of this thread.
-pub fn finish_store_node(n: Node, loc: TextRange, flags: NodeFlags) -> bool {
-    try_with_build_slot(n, |s, index| {
-        s.set_slot_loc(index, loc);
-        let flags = s.records[index].flags() | flags;
-        s.set_slot_flags(index, flags);
-    })
+/// What `finish_store_node_and_parents` wrote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishedStoreNode {
+    /// Nothing: the node is not a node of an unfinished store of this
+    /// thread.
+    NotStore,
+    /// The loc and the flags. The parents of the children are not all set
+    /// (an alias child, a nil list entry): the caller runs the generic walk,
+    /// as after `set_parent_in_store_children` gave false.
+    LocAndFlags,
+    /// The loc, the flags, and the parents and the R2-5 chain of the
+    /// children (`set_parent_in_store_children`).
+    All,
+}
+
+/// parser.go `finishNodeWithEnd` on a node of an unfinished store of this
+/// thread, in one store access: `node.Loc = loc`, `node.Flags |= flags`, and
+/// then `overrideParentInImmediateChildren` as `set_parent_in_store_children`
+/// does it. Panics on a finished store, like `with_slot_mut`.
+// PERF: perfP2 item 2. One thread-local lookup, `RefCell` borrow and slot
+// check per finished node, not one for the loc and flags and one more for
+// the parents.
+pub fn finish_store_node_and_parents(
+    n: Node,
+    loc: TextRange,
+    flags: NodeFlags,
+) -> FinishedStoreNode {
+    let Some(store) = thread_build_cell(n) else {
+        return FinishedStoreNode::NotStore;
+    };
+    let mut guard = store.borrow_mut();
+    let s = &mut *guard;
+    assert!(!s.frozen, "cannot mutate a node of a finished file");
+    let index = slot_index(n);
+    let Some(node) = s.nodes[index] else {
+        panic!("store handle does not name a node slot");
+    };
+    s.set_slot_loc(index, loc);
+    let flags = s.records[index].flags() | flags;
+    s.set_slot_flags(index, flags);
+    if s.set_slot_child_parents(index, node) {
+        FinishedStoreNode::All
+    } else {
+        FinishedStoreNode::LocAndFlags
+    }
 }
 
 /// Go `node.Parent = parent` on a node of an unfinished store, in one store
@@ -5412,32 +5855,43 @@ pub fn set_parent_in_store_children(parent: Node) -> bool {
     let Some(node) = s.nodes[index] else {
         return false;
     };
-    // lsshells M3c: a node that the store owns (a freeable parse).
-    if s.cell_of(index) != NO_CELL {
-        return set_parent_in_owned_store_children(s, index);
+    s.set_slot_child_parents(index, node)
+}
+
+impl FileStore {
+    /// `set_parent_in_store_children` for node slot `index` of this
+    /// unfinished store, whose node column entry is `node`.
+    #[inline]
+    fn set_slot_child_parents(&mut self, index: usize, node: &'static NodeData) -> bool {
+        // lsshells M3c: a node that the store owns (a freeable parse).
+        if self.cell_of(index) != NO_CELL {
+            return set_parent_in_owned_store_children(self, index);
+        }
+        let kind = self.kinds[index];
+        // `NodeHeader::stored_parent` of a child in the store of `parent`.
+        let stored = handle(LOCAL_STORE, index as u32);
+        // `StoreChildLinks::new`.
+        self.unlink_children(index);
+        self.build_links[index].first_child = LINK_END;
+        let mut last = LINK_END;
+        let mut linking = true;
+        let stopped = super::node::for_each_store_child_id(kind, node, |child| {
+            let child = child as usize;
+            // PERF: perfP2 item 2. The record bit, not the node column: the
+            // parent write below reads and writes the same record.
+            if !self.records[child].is_node() {
+                return true;
+            }
+            // `StoreChildLinks::set_parent`.
+            self.set_slot_parent(child, stored);
+            if linking && !self.link_child(index, &mut last, child) {
+                linking = false;
+                self.unlink_children(index);
+            }
+            false
+        });
+        !stopped
     }
-    let kind = s.kinds[index];
-    // `NodeHeader::stored_parent` of a child in the store of `parent`.
-    let stored = handle(LOCAL_STORE, index as u32);
-    // `StoreChildLinks::new`.
-    s.unlink_children(index);
-    s.build_links[index].first_child = LINK_END;
-    let mut last = LINK_END;
-    let mut linking = true;
-    let stopped = super::node::for_each_store_child_id(kind, node, |child| {
-        let child = child as usize;
-        if s.nodes[child].is_none() {
-            return true;
-        }
-        // `StoreChildLinks::set_parent`.
-        s.set_slot_parent(child, stored);
-        if linking && !s.link_child(index, &mut last, child) {
-            linking = false;
-            s.unlink_children(index);
-        }
-        false
-    });
-    !stopped
 }
 
 /// `set_parent_in_store_children` for slot `index` of `s`, whose node the
@@ -5682,8 +6136,7 @@ impl FileStore {
             .push(NodeRecord::new(bits, flags, loc, u64::from(parent)));
         self.kinds.push(kind);
         self.nodes.push(Some(node));
-        let modifier_bits = super::node::store_node_modifier_bits(kind, node);
-        let children = super::node::store_node_children(kind, node);
+        let (modifier_bits, children) = slot_kids_parts(kind, node);
         self.kids.push(NodeKids::new(
             children,
             NodeKids::word_of(kind, &name, modifier_bits),
@@ -6013,8 +6466,7 @@ fn alloc_store_slot_node(
         "a name node keeps its text in the name column"
     );
     // PERF: U1 (b), U4. Read while the new data is hot, not at freeze.
-    let modifier_bits = super::node::store_node_modifier_bits(kind, node);
-    let children = super::node::store_node_children(kind, node);
+    let (modifier_bits, children) = slot_kids_parts(kind, node);
     with_store_mut(file, |s| {
         assert!(!s.frozen, "cannot create a node in a finished file");
         let index = s.records.len() as u32;
@@ -6025,6 +6477,29 @@ fn alloc_store_slot_node(
         s.push_build_columns(kind, name, modifier_bits, children);
         handle(file, index)
     })
+}
+
+/// The U1 (b) modifier bits and the U4 child entry of a new node slot of
+/// kind `kind` with data `node` (`store_node_modifier_bits`,
+/// `store_node_children`).
+// PERF: perfP2 item 2. About a third of the slots are identifiers, whose
+// entries are fixed (no modifier list, none of the child fields): no call.
+// A test for the other kinds with fixed entries (tokens, keyword types,
+// string and numeric literals) took fewer instructions but more cycles.
+#[inline]
+fn slot_kids_parts(kind: SyntaxKind, node: &NodeData) -> (u32, SlotChildren) {
+    if kind == SyntaxKind::Identifier {
+        debug_assert_eq!(super::node::store_node_modifier_bits(kind, node), 0);
+        debug_assert_eq!(
+            super::node::store_node_children(kind, node),
+            SlotChildren::NO_FIELDS
+        );
+        return (0, SlotChildren::NO_FIELDS);
+    }
+    (
+        super::node::store_node_modifier_bits(kind, node),
+        super::node::store_node_children(kind, node),
+    )
 }
 
 /// `alloc_store_slot` inside a freeable parse (lsshells M3c): a store that
@@ -6764,13 +7239,18 @@ mod tests {
     #[test]
     fn slot_children_tags_round_trip() {
         let entry = SlotChildren::new(Some(7), Some((SlotChildren::TAG_QUESTION, 9)));
-        assert_eq!(entry.name, 7);
+        assert_eq!(entry.name(), 7);
         assert_eq!(entry.other_parts(), (SlotChildren::TAG_QUESTION, 9));
         // An id that does not fit next to the tag is unknown.
         let big = SlotChildren::new(Some(1), Some((SlotChildren::TAG_POSTFIX, 1 << 30)));
-        assert_eq!(big.other, SlotChildren::UNKNOWN_ID);
+        assert_eq!(big.other(), SlotChildren::UNKNOWN_ID);
         assert_eq!(big.other_parts().0, SlotChildren::TAG_UNKNOWN);
         assert_eq!(SlotChildren::new(None, None), SlotChildren::UNKNOWN);
+        assert_eq!(
+            SlotChildren::new(Some(0), Some((SlotChildren::TAG_EXPRESSION, 0)))
+                .with_typed(Some((SlotChildren::TYPED_TYPE, 0)), true),
+            SlotChildren::NO_FIELDS
+        );
         // C2: the tag, the id and the type arguments bit round trip, and an
         // id that does not fit is unknown.
         let typed = entry.with_typed(Some((SlotChildren::TYPED_TYPE_NAME, 11)), true);
@@ -6778,7 +7258,10 @@ mod tests {
         assert!(typed.has_no_type_arguments());
         let big = entry.with_typed(Some((SlotChildren::TYPED_TYPE, 1 << 28)), false);
         assert_eq!(big.typed_parts().0, SlotChildren::TYPED_UNKNOWN);
-        assert_eq!(std::mem::size_of::<SlotChildren>(), 12);
+        // perfP2 item 2: two words, so `store_node_children` returns it in
+        // two registers. The kids column keeps its 12 bytes in `NodeKids`.
+        assert_eq!(std::mem::size_of::<SlotChildren>(), 16);
+        assert_eq!(std::mem::size_of::<NodeKids>(), 16);
     }
 
     #[test]
@@ -7120,6 +7603,30 @@ mod tests {
             assert_eq!(z.parent(), w, "{when}");
             assert_eq!(v.parent(), x, "{when}");
             assert_eq!(y.parent(), Node::NIL, "{when}");
+            // noderef1 G1: the view reads what the node reads read, before
+            // the publish (no block), in a static block and in a node shell,
+            // with local, foreign and nil parents.
+            for n in [x, statement, z, y, w, v] {
+                let r = NodeRef::new(n);
+                assert_eq!(r.node(), n, "{when}");
+                assert_eq!(r.kind(), n.kind(), "{when}");
+                assert_eq!(r.loc(), n.loc(), "{when}");
+                assert_eq!(r.flags(), n.flags(), "{when}");
+                assert_eq!(r.parent().node(), n.parent(), "{when}");
+                let parent_kind = if n.parent().is_some() {
+                    n.parent().kind()
+                } else {
+                    SyntaxKind::Unknown
+                };
+                assert_eq!(r.parent().kind_or_unknown(), parent_kind, "{when}");
+            }
+            assert_eq!(NodeRef::new(statement).expression(), x, "{when}");
+            assert_eq!(
+                NodeRef::new(v).parent().parent().node(),
+                statement,
+                "{when}"
+            );
+            assert!(NodeRef::new(y).parent().is_nil(), "{when}");
             assert_eq!(store_header(statement).parent, y, "{when}");
             assert_eq!(store_header(v).parent, x, "{when}");
         };
@@ -7142,6 +7649,13 @@ mod tests {
             && block.file.go_file.is_none()
             && *block.file.foreign == [x]));
         check("published");
+        // A parent in the same store keeps the block of the view; a foreign
+        // parent takes the block of its own file.
+        let block_of = |r: NodeRef| r.block.map(|b| b as *const FileBlock);
+        let block_of_file = |file: usize| file_block(file).map(|b| b as *const FileBlock);
+        assert_eq!(block_of(NodeRef::new(x).parent()), block_of_file(a));
+        assert_eq!(block_of(NodeRef::new(statement).parent()), block_of_file(b));
+        assert_eq!(block_of(NodeRef::new(v).parent()), block_of_file(a));
         assert_eq!(frozen_store_parent(x), Some(statement));
         assert_eq!(frozen_store_parent(statement), None, "the header has it");
         assert_eq!(frozen_store_parent(v), None, "the header has it");

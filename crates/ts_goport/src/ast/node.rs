@@ -2343,7 +2343,8 @@ impl Node {
         }
         // Go reads the kind of a nil node.
         if self.is_nil() {
-            crate::core::go_nil_dereference();
+            // Go N' loads `node.Kind` (offset 0): addr=0x0.
+            crate::core::go_nil_dereference_at(0x0);
         }
         unreachable!("node {self:?} is not synthetic and has no store")
     }
@@ -3737,7 +3738,66 @@ impl Node {
 // PORT: the per-struct Go methods are merged into one match. The order of
 // each arm follows the generated Go code.
 fn for_each_child_dyn(n: Node, v: &mut dyn FnMut(Node) -> bool) -> bool {
+    // Go `switch n.Kind`: a kind with no case returns false and never reads
+    // `n.data`.
+    // PERF: noderef1 W1. 35 to 48% of the walk entries are tokens and
+    // identifiers (getsym1 report). Their kind is one load from the block
+    // that the node data read needs anyway.
+    if let Some(f) = frozen_store_node(n) {
+        let kind = f.kind();
+        if has_no_child_fields(kind) {
+            debug_assert!(
+                f.data().is_none_or(|d| {
+                    let mut fields = 0;
+                    for_each_child_field(kind, n.file_index(), d, |_| fields += 1);
+                    fields == 0
+                }),
+                "{kind:?} has child fields"
+            );
+            return false;
+        }
+        // PERF: perfP1 item 1 (perfscan2). A node whose child chain is
+        // known (R2-5 `SlotLinks`, Go `ForEachChild` order; the binder walks
+        // it) walks the chain: two loads per child from one column, no
+        // node data match. Debug builds compare it with the data walk.
+        if let Some(children) = f.children() {
+            debug_assert!(
+                children.eq(children_by_data(n)),
+                "child links differ from the data walk of {kind:?}"
+            );
+            for child in children {
+                if v(child) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if let Some(data) = f.data() {
+            let mut visit = FrozenChildVisit {
+                kind,
+                id_map: f.ids(),
+                file: n.file_index(),
+                v,
+            };
+            return walk_children(data, &mut visit);
+        }
+    }
     for_each_child_impl(n, v, None)
+}
+
+/// The children of `n` from its node data (`for_each_child_impl`), not
+/// from its child chain: the debug check of the chain walk.
+fn children_by_data(n: Node) -> std::vec::IntoIter<Node> {
+    let mut out = Vec::new();
+    for_each_child_impl(
+        n,
+        &mut |c| {
+            out.push(c);
+            false
+        },
+        None,
+    );
+    out.into_iter()
 }
 
 /// A list slot seen by `for_each_child_and_lists`: the list and whether it
@@ -3757,6 +3817,8 @@ impl Node {
     }
 }
 
+/// The walk of `for_each_child_dyn` for a node that is not a published
+/// store node with node data, and the walk of `for_each_child_and_lists`.
 fn for_each_child_impl(n: Node, v: &mut dyn FnMut(Node) -> bool, lists: Option<ListHook>) -> bool {
     let Some(data) = static_ast_node(n) else {
         return for_each_scoped_child(n, v, lists);
@@ -3844,7 +3906,8 @@ trait ChildVisit<'d> {
     }
 }
 
-/// The generic walk of `for_each_child_impl`.
+/// The generic walk of `for_each_child_impl`: the nodes that are not
+/// published store nodes, and the list hook of `for_each_child_and_lists`.
 // PERF: the methods are always inlined, so each arm of `walk_children`
 // compiles to the same code as the macros of the old single match.
 struct NodeChildVisit<'a, 'b> {
@@ -3907,6 +3970,79 @@ impl ChildVisit<'static> for NodeChildVisit<'_, '_> {
     #[inline(always)]
     fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
         visit(self.v, case_expression(self.n, self.file, id))
+    }
+}
+
+/// The walk of `for_each_child_dyn` over the data of a published store
+/// node (`FrozenNode`). It visits like `NodeChildVisit`, and makes each
+/// child handle from the id map of the store (`FrozenIds`) that the node
+/// lookup read. It has no list hook: `for_each_child_and_lists` walks with
+/// `NodeChildVisit`.
+// PERF: noderef1 W2. `NodeChildVisit` makes each child with an out-of-line
+// `req` or `opt` call, a registry lookup each (about 25 instructions per
+// field, Go 7, getsym1 report), and each list with a third lookup
+// (`NodeSlice::iter`).
+// PERF: noderef1 W3. Without the hook, the walk has no run-time hook test
+// and no `NodeList` handles on the stack (Go: one `ForEachChild`, no hook).
+struct FrozenChildVisit<'a> {
+    /// Go `n.Kind` (`case_expression`).
+    kind: SyntaxKind,
+    id_map: FrozenIds,
+    file: usize,
+    v: &'a mut dyn FnMut(Node) -> bool,
+}
+
+impl FrozenChildVisit<'_> {
+    /// Go `visitNodeList` of a list field.
+    #[inline(always)]
+    fn visit_list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        !is_nil_list_marker(l) && self.ids(&l.nodes)
+    }
+}
+
+impl ChildVisit<'static> for FrozenChildVisit<'_> {
+    #[inline(always)]
+    fn node(&mut self, id: crate::astdata::NodeId) -> bool {
+        let child = self.id_map.node(id);
+        debug_assert_eq!(child, Node::new(self.file, id));
+        visit(self.v, child)
+    }
+
+    #[inline(always)]
+    fn opt(&mut self, id: Option<crate::astdata::NodeId>) -> bool {
+        id.is_some_and(|id| self.node(id))
+    }
+
+    #[inline(always)]
+    fn list(&mut self, l: &'static crate::astdata::NodeList) -> bool {
+        self.visit_list(l)
+    }
+
+    #[inline(always)]
+    fn opt_list(&mut self, l: &'static Option<crate::astdata::NodeList>) -> bool {
+        l.as_ref().is_some_and(|l| self.visit_list(l))
+    }
+
+    // Go `visitModifiers`: `ModifierList::is_some` has no nil marker.
+    #[inline(always)]
+    fn mods(&mut self, m: &'static Option<crate::astdata::ModifierList>) -> bool {
+        m.as_ref().is_some_and(|m| self.ids(&m.list.nodes))
+    }
+
+    /// Go `visitNodes`: no nil test.
+    #[inline(always)]
+    fn ids(&mut self, ids: &'static [crate::astdata::NodeId]) -> bool {
+        let (map, file) = (self.id_map, self.file);
+        ids.iter().any(|&id| {
+            let child = map.node(id);
+            debug_assert_eq!(child, Node::new(file, id));
+            (self.v)(child)
+        })
+    }
+
+    #[inline(always)]
+    fn case_expression(&mut self, id: crate::astdata::NodeId) -> bool {
+        self.kind == SyntaxKind::CaseClause && self.node(id)
     }
 }
 
@@ -4543,8 +4679,58 @@ fn walk_children<'d>(data: &'d NodeData, w: &mut impl ChildVisit<'d>) -> bool {
             None => false,
         },
         NodeData::SourceFile(d) => l!(d.statements) || n!(d.end_of_file_token),
-        _ => false,
+        // The data of the kinds of `has_no_child_fields`. Every variant is
+        // listed, so a new variant must pick an arm.
+        NodeData::Token(_)
+        | NodeData::Identifier(_)
+        | NodeData::PrivateIdentifier(_)
+        | NodeData::KeywordExpression(_)
+        | NodeData::KeywordTypeNode(_)
+        | NodeData::NumericLiteral(_)
+        | NodeData::BigIntLiteral(_)
+        | NodeData::StringLiteral(_)
+        | NodeData::RegularExpressionLiteral(_)
+        | NodeData::NoSubstitutionTemplateLiteral(_)
+        | NodeData::TemplateHead(_)
+        | NodeData::TemplateMiddle(_)
+        | NodeData::TemplateTail(_)
+        | NodeData::JsxText(_)
+        | NodeData::ThisTypeNode(_)
+        | NodeData::OmittedExpression(_)
+        | NodeData::SemicolonClassElement(_)
+        | NodeData::EmptyStatement(_)
+        | NodeData::DebuggerStatement(_)
+        | NodeData::JsxOpeningFragment(_)
+        | NodeData::JsxClosingFragment(_)
+        | NodeData::JsDocAllType(_)
+        | NodeData::JsDocText(_)
+        | NodeData::NotEmittedStatement(_)
+        | NodeData::NotEmittedTypeElement(_) => false,
     }
+}
+
+/// Go `(*Node).ForEachChild` (ast_generated.go:8693) has no case for these
+/// kinds and returns false: every token kind (identifiers, literals,
+/// punctuation, keywords) and the node kinds with no child field. Their
+/// data is a variant of the last arm of `walk_children`, which visits
+/// nothing.
+#[inline]
+const fn has_no_child_fields(kind: SyntaxKind) -> bool {
+    kind.is_token()
+        || matches!(
+            kind,
+            SyntaxKind::ThisType
+                | SyntaxKind::OmittedExpression
+                | SyntaxKind::SemicolonClassElement
+                | SyntaxKind::EmptyStatement
+                | SyntaxKind::DebuggerStatement
+                | SyntaxKind::JsxOpeningFragment
+                | SyntaxKind::JsxClosingFragment
+                | SyntaxKind::JsDocAllType
+                | SyntaxKind::JsDocText
+                | SyntaxKind::NotEmittedStatement
+                | SyntaxKind::NotEmittedTypeElement
+        )
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -5738,7 +5924,23 @@ fn reverse_access_kind(a: AccessKind) -> AccessKind {
 /// `DeclarationBase`.
 #[must_use]
 pub fn is_declaration_node(node: Node) -> bool {
-    with_data!(node, |d| matches!(
+    with_data!(node, |d| is_declaration_data(d))
+}
+
+/// `is_declaration_node` on the view of a node (`NodeRef`): a published
+/// store node reads its data with no second registry lookup.
+#[inline]
+#[must_use]
+pub fn is_declaration_node_ref(node: NodeRef) -> bool {
+    match node.data() {
+        Some(d) => is_declaration_data(d),
+        None => is_declaration_node(node.node()),
+    }
+}
+
+/// `is_declaration_node` on the data of the node.
+fn is_declaration_data(d: &NodeData) -> bool {
+    matches!(
         d,
         NodeData::ArrowFunction(_)
             | NodeData::BinaryExpression(_)
@@ -5796,7 +5998,7 @@ pub fn is_declaration_node(node: Node) -> bool {
             | NodeData::TypeLiteralNode(_)
             | NodeData::TypeParameterDeclaration(_)
             | NodeData::VariableDeclaration(_)
-    ))
+    )
 }
 
 // Go: ast.go:1532 IsLocalsContainer
@@ -6760,5 +6962,155 @@ mod tests {
             }
         }
         assert!(cached > 10 && computed > 10, "{cached} {computed}");
+    }
+
+    /// noderef1 W1: `has_no_child_fields` holds for exactly the kinds of the
+    /// variants of the last arm of `walk_children`, and that arm visits no
+    /// field. In parsed code, a node has a child field exactly when its kind
+    /// is not one of them.
+    #[test]
+    fn no_child_kinds_are_the_kinds_of_the_leaf_arm() {
+        use crate::astdata as a;
+        use crate::frontend::parser::{SourceFileParseOptions, parse_source_file};
+        let (s, f) = (String::new, a::TokenFlags(0));
+        let leaves = [
+            NodeData::Token(Box::new(a::TokenData)),
+            NodeData::Identifier(Box::new(a::IdentifierData {
+                flow_node: None,
+                text: s(),
+            })),
+            NodeData::PrivateIdentifier(Box::new(a::PrivateIdentifierData { text: s() })),
+            NodeData::KeywordExpression(Box::new(a::KeywordExpressionData { flow_node: None })),
+            NodeData::KeywordTypeNode(Box::new(a::KeywordTypeNodeData)),
+            NodeData::NumericLiteral(Box::new(a::NumericLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::BigIntLiteral(Box::new(a::BigIntLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::StringLiteral(Box::new(a::StringLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::RegularExpressionLiteral(Box::new(a::RegularExpressionLiteralData {
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::NoSubstitutionTemplateLiteral(Box::new(
+                a::NoSubstitutionTemplateLiteralData {
+                    raw_text: s(),
+                    symbol: None,
+                    template_flags: f,
+                    text: s(),
+                    token_flags: f,
+                },
+            )),
+            NodeData::TemplateHead(Box::new(a::TemplateHeadData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::TemplateMiddle(Box::new(a::TemplateMiddleData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::TemplateTail(Box::new(a::TemplateTailData {
+                raw_text: s(),
+                template_flags: f,
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::JsxText(Box::new(a::JsxTextData {
+                contains_only_trivia_white_spaces: false,
+                text: s(),
+                token_flags: f,
+            })),
+            NodeData::ThisTypeNode(Box::new(a::ThisTypeNodeData)),
+            NodeData::OmittedExpression(Box::new(a::OmittedExpressionData)),
+            NodeData::SemicolonClassElement(Box::new(a::SemicolonClassElementData {
+                symbol: None,
+            })),
+            NodeData::EmptyStatement(Box::new(a::EmptyStatementData { flow_node: None })),
+            NodeData::DebuggerStatement(Box::new(a::DebuggerStatementData { flow_node: None })),
+            NodeData::JsxOpeningFragment(Box::new(a::JsxOpeningFragmentData)),
+            NodeData::JsxClosingFragment(Box::new(a::JsxClosingFragmentData)),
+            NodeData::JsDocAllType(Box::new(a::JsDocAllTypeData)),
+            NodeData::JsDocText(Box::new(a::JsDocTextData { text: Vec::new() })),
+            NodeData::NotEmittedStatement(Box::new(a::NotEmittedStatementData { flow_node: None })),
+            NodeData::NotEmittedTypeElement(Box::new(a::NotEmittedTypeElementData)),
+        ];
+        let fields = |kind: SyntaxKind, d: &NodeData| {
+            let mut fields = 0;
+            for_each_child_field(kind, 1, d, |_| fields += 1);
+            fields
+        };
+        for d in &leaves {
+            assert_eq!(fields(SyntaxKind::Unknown, d), 0, "{}", d.schema_name());
+        }
+        for k in 0..SyntaxKind::COUNT as u16 {
+            let kind = SyntaxKind::try_from(k).unwrap();
+            let leaf = leaves.iter().any(|d| d.matches_syntax_kind(kind));
+            assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
+        }
+
+        fn collect(n: Node, out: &mut Vec<Node>) {
+            out.push(n);
+            n.for_each_child(|c| {
+                collect(c, out);
+                false
+            });
+        }
+        let text = "@dec export abstract class C<T extends object = {}> extends B implements I {\n\
+            ;  #p?: T; static { debugger; } constructor(private a: number) { super(); }\n\
+            get g(): this { return this; } set g(v) {} [k: string]: any; m?<U>(...r: U[]): void;\n\
+            }\n\
+            interface I { (x: number): string; new (): I; readonly [P in keyof T]-?: T[P] }\n\
+            type M<T> = { [P in keyof T as `k${string & P}`]+?: T[P] extends infer U ? U : never };\n\
+            type F = typeof import('m', { with: { a: 'b' } }).x | (new () => unknown) & [a: 1, b?: 2, ...c: 3[]];\n\
+            enum E { A = 1 << 2, B }\n\
+            declare module 'm' { export = x; }\n\
+            namespace N.M { export import Q = N.Q; }\n\
+            import d, { a as b, type c } from 'm' with { type: 'json' };\n\
+            import * as ns from 'm';\n\
+            export { a as default } from 'm';\n\
+            export * as e from 'm';\n\
+            label: for (const [a, , ...b] of x) { if (a) continue label; else break; }\n\
+            for (let i = 0; i < 1; i++) for (const k in o) while (k) do { ; } while (0);\n\
+            switch (x) { case 1: throw new Error(); default: }\n\
+            try { using r = f(); } catch ({ e = 1 }) { } finally { }\n\
+            async function* g() { yield* await x!; return void delete o[1]?.[2]; }\n\
+            const o = { a, b: 1, ...c, ['d']: 2, m() {}, get x() { return 1; } } satisfies O as const;\n\
+            let t = tag<string>`a${1}b${2}c` + /re/g.source + 1n + (x, y++) - ~!x + (-x) ** 2;\n\
+            let f2 = function () { return <T,>(a: T): a is T => true; };\n\
+            x ??= y ||= z &&= import.meta.url ? new.target : null;\n\
+            declare function h(this: Window, x: unknown): asserts x is string;\n\
+            declare const u: unique symbol;\n";
+        let opts = SourceFileParseOptions {
+            file_name: "/leaves.ts".to_string(),
+            ..Default::default()
+        };
+        let root = parse_source_file(&opts, text, ScriptKind::TS).root;
+        let mut nodes = Vec::new();
+        collect(root, &mut nodes);
+        let (mut leaves_seen, mut inner_seen) = (0, 0);
+        for &n in &nodes {
+            let kind = n.kind();
+            let leaf = with_ast_data(n, |d| fields(kind, d)) == 0;
+            assert_eq!(has_no_child_fields(kind), leaf, "{kind:?}");
+            if leaf {
+                leaves_seen += 1;
+            } else {
+                inner_seen += 1;
+            }
+        }
+        assert!(
+            leaves_seen > 50 && inner_seen > 100,
+            "{leaves_seen} {inner_seen}"
+        );
     }
 }

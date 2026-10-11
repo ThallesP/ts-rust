@@ -24,7 +24,6 @@ use crate::emitter::program_emit::{
 use crate::frontend::prelude::*;
 use crate::program::source_file_may_be_emitted;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 // Go: incremental/emitfileshandler.go:15 emitUpdate
@@ -55,10 +54,9 @@ pub struct EmitFilesHandler<'a> {
     deleted_pending_kinds: FxIndexSet<Path>,
     emit_updates: FxIndexMap<Path, EmitUpdate>,
     has_emit_diagnostics: bool,
-    /// PORT: not in Go (perf). Where the write callbacks of
-    /// `get_emit_options` keep the writes of an early `tsc -b` emit
-    /// (`buffer_early_emit_writes`); `None` writes at once.
-    buffer: Option<WriteBuffer>,
+    /// PORT: not in Go. Where the write callbacks of `get_emit_options`
+    /// send the writes (`Writes`).
+    writes: Writes,
 }
 
 /// Go `file.Path()` as a `tspath.Path`.
@@ -95,7 +93,7 @@ impl<'a> EmitFilesHandler<'a> {
             deleted_pending_kinds: IndexSet::default(),
             emit_updates: IndexMap::default(),
             has_emit_diagnostics: false,
-            buffer: None,
+            writes: Writes::Direct,
         }
     }
 
@@ -156,8 +154,11 @@ impl<'a> EmitFilesHandler<'a> {
                 self.combine_results_and_emit_build_info(results, &options)
             }
         } else if !self.is_for_dts_errors {
-            let emit_options = self.get_emit_options(options.clone());
-            let mut result = emit(emit_options);
+            let mut result = self.emit_with_writes_here(
+                || source_files().into_iter().map(path_of).collect(),
+                options.write_file.as_ref(),
+                |handler| emit(handler.get_emit_options(options.clone())),
+            );
             self.update_has_emit_diagnostics(Some(&result));
             self.update_snapshot();
             self.emit_build_info(&options, &mut result);
@@ -226,7 +227,11 @@ impl<'a> EmitFilesHandler<'a> {
     fn emit_files_incremental(&mut self, options: &EmitOptions) -> Vec<EmitResult> {
         let queued = self.queue_affected_files(options);
         let results: Vec<EmitResult> = if !self.is_for_dts_errors {
-            self.send_emit_batch(&queued, options).wait()
+            self.emit_with_writes_here(
+                || queued.iter().map(|(path, ..)| path.clone()).collect(),
+                options.write_file.as_ref(),
+                |handler| handler.send_emit_batch(&queued, options).wait(),
+            )
         } else {
             // Go `GetDeclarationDiagnostics(ctx, affectedFile)`. Send every
             // job first, then wait for each in order.
@@ -304,6 +309,55 @@ impl<'a> EmitFilesHandler<'a> {
             })
             .collect();
         start_emit_batch(targets)
+    }
+
+    /// PORT: not in Go. Runs `emit`, which emits files (`order` gives
+    /// them in emit order), and returns its result. Go's emitter gets each
+    /// write's error at the write and puts its TS5033 into the result of
+    /// the file. Under `flush_writes_on_this_thread` (the API build) only
+    /// this thread reaches the file system. So the emit keeps its writes
+    /// (`Writes::Buffer`), then this thread makes them (`flush_writes`).
+    /// After a failed write the files emit again with the results of the
+    /// flush (`replay_after_flush`), as `finish_emit_files` does for an
+    /// early emit. Else `emit` writes at once.
+    fn emit_with_writes_here<R>(
+        &mut self,
+        order: impl FnOnce() -> Vec<Path>,
+        write_file: Option<&WriteFile>,
+        emit: impl Fn(&Self) -> R,
+    ) -> R {
+        if !FLUSH_ON_THIS_THREAD.get() {
+            return emit(self);
+        }
+        let buffer = WriteBuffer::default();
+        self.writes = Writes::Buffer(buffer.clone());
+        let mut result = emit(self);
+        let writes = std::mem::take(&mut *buffer.lock().unwrap_or_else(PoisonError::into_inner));
+        if self.replay_after_flush(writes, &order(), write_file) {
+            result = emit(self);
+        }
+        self.writes = Writes::Direct;
+        result
+    }
+
+    /// PORT: not in Go. Makes the buffered `writes` of an emit of the
+    /// files in `order` (`flush_writes`). After a failed write it gets the
+    /// handler ready for the same emit again: each write gives the result
+    /// of the flush (`Writes::Replay`), and `shared` is empty (the
+    /// callbacks of the buffered emit filled it). Then it returns true, and
+    /// the caller emits again.
+    fn replay_after_flush(
+        &mut self,
+        writes: Vec<BufferedWrite>,
+        order: &[Path],
+        write_file: Option<&WriteFile>,
+    ) -> bool {
+        let Some(failures) = flush_writes(writes, order, write_file) else {
+            return false;
+        };
+        *self.shared.lock().expect("emit files lock") = EmitFilesShared::default();
+        self.writes = Writes::Replay(Arc::new(failures));
+        true
     }
 
     /// Pass 3 of `emit_files_incremental` with the pass 2 `results` of the
@@ -386,23 +440,24 @@ impl<'a> EmitFilesHandler<'a> {
     // compiler host wraps. Without `options.WriteFile`, Go writes with the
     // compiler host file system; the port follows `program::EmitHost`,
     // whose write fails without a callback.
-    // PORT: perf. With `self.buffer`, the callback keeps each write (and
-    // the `differsOnlyInMap` time revert) for `flush_writes`, also without
+    // PORT: perf. With `Writes::Buffer` or `Writes::Replay` (see `Writes`),
+    // the callback keeps each write (and the `differsOnlyInMap` time
+    // revert) for `flush_writes`, or gives the flush's result, also without
     // declarations, where Go passes `options` through.
     fn get_emit_options(&self, options: EmitOptions) -> EmitOptions {
         let writer = OutputWriter {
             write_file: options.write_file.clone(),
-            buffer: self.buffer.clone(),
+            writes: self.writes.clone(),
         };
         let snapshot = self.program.snapshot.borrow();
         if !snapshot.options.get_emit_declarations() {
-            if writer.buffer.is_none() {
+            if matches!(writer.writes, Writes::Direct) {
                 return options;
             }
             return EmitOptions {
                 write_file: Some(Arc::new(
                     move |file_name: &str, text: &str, data: &mut WriteFileData| {
-                        writer.write(file_name, text, data, false)
+                        writer.write(file_name, text, data, false, false)
                     },
                 )),
                 ..options
@@ -438,6 +493,9 @@ impl<'a> EmitFilesHandler<'a> {
         let write_file: WriteFile = Arc::new(
             move |file_name: &str, text: &str, data: &mut WriteFileData| {
                 let mut differs_only_in_map = false;
+                // PORT: not in Go. True when the signature below read
+                // `data.diagnostics` (see `flush_writes`).
+                let mut signature_read_diagnostics = false;
                 if is_declaration_file_name(file_name) && can_use_incremental_state {
                     let mut emit_signature = String::new();
                     // #4699: the file of `data.SourceFile`.
@@ -451,6 +509,7 @@ impl<'a> EmitFilesHandler<'a> {
                         .as_ref()
                         .expect("file info of the emitted file");
                     if info.signature == info.version {
+                        signature_read_diagnostics = true;
                         let signature = compute_signature_with_diagnostics(
                             data.source_file,
                             text,
@@ -489,7 +548,13 @@ impl<'a> EmitFilesHandler<'a> {
                     }
                 }
 
-                writer.write(file_name, text, data, differs_only_in_map)
+                writer.write(
+                    file_name,
+                    text,
+                    data,
+                    differs_only_in_map,
+                    signature_read_diagnostics,
+                )
             },
         );
         EmitOptions {
@@ -588,41 +653,74 @@ struct DtsWriteFile {
     file_info: Option<FileInfo>,
 }
 
+/// PORT: not in Go. Where the `get_emit_options` callback sends a write.
+#[derive(Clone)]
+enum Writes {
+    /// Go: `write_output` at once.
+    Direct,
+    /// Into the buffer, for `flush_writes`: an early emit
+    /// (`buffer_early_emit_writes`, perf), or an emit whose writes only this
+    /// thread can make (`flush_writes_on_this_thread`).
+    Buffer(WriteBuffer),
+    /// The emit again after a failed flush (`replay_after_flush`): the result
+    /// that `flush_writes` had for the file name, with no write.
+    Replay(Arc<FlushFailures>),
+}
+
 /// Where the `get_emit_options` callback writes: `write_file` (Go
-/// `options.WriteFile`) at once, or into `buffer` for `flush_writes`.
+/// `options.WriteFile`), as `writes` says.
 struct OutputWriter {
     write_file: Option<WriteFile>,
-    buffer: Option<WriteBuffer>,
+    writes: Writes,
 }
 
 impl OutputWriter {
+    /// `signature_read_diagnostics`: the callback computed the d.ts
+    /// signature from `data.diagnostics` (see `flush_writes`).
     fn write(
         &self,
         file_name: &str,
         text: &str,
         data: &mut WriteFileData,
         differs_only_in_map: bool,
+        signature_read_diagnostics: bool,
     ) -> Result<(), String> {
-        let Some(buffer) = &self.buffer else {
-            return write_output(
+        match &self.writes {
+            Writes::Buffer(buffer) => {
+                buffer
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(BufferedWrite {
+                        source: path_of(data.source_file),
+                        file_name: file_name.to_string(),
+                        text: text.to_string(),
+                        data: data.clone(),
+                        differs_only_in_map,
+                        signature_read_diagnostics,
+                    });
+                Ok(())
+            }
+            Writes::Replay(failures) => match failures.get(file_name) {
+                None => Ok(()),
+                Some(Some(err)) => Err(err.clone()),
+                // The flush left it out. Go's callback panics before this
+                // write, so does the port's (`diagnostic_to_string_builder`).
+                Some(None) => write_output(
+                    self.write_file.as_ref(),
+                    file_name,
+                    text,
+                    data,
+                    differs_only_in_map,
+                ),
+            },
+            Writes::Direct => write_output(
                 self.write_file.as_ref(),
                 file_name,
                 text,
                 data,
                 differs_only_in_map,
-            );
-        };
-        buffer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(BufferedWrite {
-                source: path_of(data.source_file),
-                file_name: file_name.to_string(),
-                text: text.to_string(),
-                data: data.clone(),
-                differs_only_in_map,
-            });
-        Ok(())
+            ),
+        }
     }
 }
 
@@ -653,23 +751,50 @@ fn write_output(
     err
 }
 
-/// PORT: not in Go (perf). The writes of an emit that `tsc -b` starts
-/// before the task's turn to write (`buffer_early_emit_writes`).
+/// PORT: not in Go. The writes of an emit that `tsc -b` starts before the
+/// task's turn to write (`buffer_early_emit_writes`, perf), or of an emit
+/// in the API build (`flush_writes_on_this_thread`).
 type WriteBuffer = Arc<Mutex<Vec<BufferedWrite>>>;
 
-/// One write in a `WriteBuffer`: the source file whose output it is, and
-/// the arguments of `write_output`.
+/// One write in a `WriteBuffer`: the source file whose output it is, the
+/// arguments of `write_output`, and `signature_read_diagnostics` (see
+/// `OutputWriter::write`).
 struct BufferedWrite {
     source: Path,
     file_name: String,
     text: String,
     data: WriteFileData,
     differs_only_in_map: bool,
+    signature_read_diagnostics: bool,
+}
+
+/// What `flush_writes` did not write, by file name: the error text of each
+/// failed write, and `None` for each write that it left out. Every other
+/// write succeeded, or was not made because the replay panics first
+/// (`flush_client_writes`).
+type FlushFailures = FxHashMap<String, Option<String>>;
+
+/// PORT: not in Go. How the writes of the API build reach the client when
+/// each one is a `writeFile` call (`--callbacks writeFile`). Go's emit
+/// goroutines make the calls, so which outputs exist when a d.ts signature
+/// panics (`diagnostic_to_string_builder`) depends on the calls
+/// (`flush_client_writes`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientWrites {
+    /// The calls run at the same time (`--async`, Go `AsyncConn.Call`).
+    Concurrent,
+    /// One call at a time: Go `SyncConn.Call` (msgpack) holds a mutex for
+    /// each call (ipc/conn_sync.go:170).
+    Serialized,
 }
 
 thread_local! {
     /// True while `buffer_early_emit_writes` runs its `start`.
     static BUFFER_EARLY_EMIT_WRITES: Cell<bool> = const { Cell::new(false) };
+    /// True while `flush_writes_on_this_thread` runs its `f`.
+    static FLUSH_ON_THIS_THREAD: Cell<bool> = const { Cell::new(false) };
+    /// The `client_writes` of `flush_writes_on_this_thread` while it runs.
+    static CLIENT_WRITES: Cell<Option<ClientWrites>> = const { Cell::new(None) };
 }
 
 /// PORT: not in Go (perf). Runs `start`, a `Program::start_emit` call, so
@@ -694,58 +819,113 @@ pub(crate) fn buffer_early_emit_writes(start: impl FnOnce()) {
     start();
 }
 
+/// PORT: not in Go. Runs `f` so that `flush_writes` writes on this thread
+/// only, and so that an emit that did not start early keeps its writes
+/// for `flush_writes` too (`EmitFilesHandler::emit_with_writes_here`). The
+/// API build runs a task's emit under it: only its orchestrator thread
+/// reaches the file system (`System::emit_writes_through_osvfs`), so a
+/// write on another thread would wait (build_task.rs `DeferredWrites`), and
+/// the emit would not get its result. `client_writes` is
+/// `System::client_writes`.
+pub(crate) fn flush_writes_on_this_thread<R>(
+    client_writes: Option<ClientWrites>,
+    f: impl FnOnce() -> R,
+) -> R {
+    /// Puts back the values of the caller when `f` ends, also on a panic.
+    struct Reset(bool, Option<ClientWrites>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FLUSH_ON_THIS_THREAD.set(self.0);
+            CLIENT_WRITES.set(self.1);
+        }
+    }
+    let _reset = Reset(
+        FLUSH_ON_THIS_THREAD.replace(true),
+        CLIENT_WRITES.replace(client_writes),
+    );
+    f()
+}
+
 /// The most threads that `flush_writes` writes on.
 const MAX_FLUSH_THREADS: usize = 8;
 
-/// Writes the `writes` of an early emit of the `queued` files with
-/// `write_file` (`write_output`). Go writes each file's outputs on the
-/// goroutine that emits it: the source map, then the JS, then the
-/// declaration map, then the declaration. Here the files' outputs go in
-/// that order, the files in `queued` order, on up to `MAX_FLUSH_THREADS`
-/// threads. False when a write failed; the later writes are left out.
+/// Writes the buffered `writes` of an emit of the files in `order` (their
+/// paths, in emit order) with `write_file` (`write_output`), each once. Go
+/// writes each file's outputs on the goroutine that emits it: the source
+/// map, then the JS, then the declaration map, then the declaration; a
+/// failed write does not stop the others. Here the files' outputs go in
+/// that order, the files in `order`, on up to `MAX_FLUSH_THREADS` threads
+/// (1 under `flush_writes_on_this_thread`). Returns what it did not write
+/// when a write failed (`FlushFailures`), else `None`.
+///
+/// After a failed write of a file, Go's d.ts callback has the TS5033 in
+/// `data.Diagnostics`. When the callback computes the signature from them
+/// (`signature_read_diagnostics`), Go panics there
+/// (`diagnostic_to_string_builder`) before the write, so this leaves the
+/// write out. In the API build with client calls the writes go as
+/// `flush_client_writes` says.
 fn flush_writes(
     mut writes: Vec<BufferedWrite>,
-    queued: &[QueuedEmit],
+    order: &[Path],
     write_file: Option<&WriteFile>,
-) -> bool {
-    let order: FxHashMap<&Path, usize> = queued
+) -> Option<FlushFailures> {
+    let order: FxHashMap<&Path, usize> = order
         .iter()
         .enumerate()
-        .map(|(index, (path, ..))| (path, index))
+        .map(|(index, path)| (path, index))
         .collect();
     // A file's JS and declaration can emit on two threads, each in order.
     let key = |write: &BufferedWrite| {
-        let output = write.file_name.as_str();
-        let declaration = is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output));
-        (order.get(&write.source).copied(), declaration)
+        (
+            order.get(&write.source).copied(),
+            is_declaration_output(write),
+        )
     };
     crate::gostd::slices::stable_sort_by(&mut writes, |a, b| key(a).cmp(&key(b)));
+    if let Some(calls) = CLIENT_WRITES.get()
+        && !crate::program::single_threaded()
+    {
+        return flush_client_writes(writes, calls, write_file);
+    }
     let files: Vec<&mut [BufferedWrite]> =
         writes.chunk_by_mut(|a, b| a.source == b.source).collect();
-    let threads = MAX_FLUSH_THREADS
-        .min(crate::program::available_cores())
-        .min(files.len().div_ceil(16))
-        .max(1);
+    let threads = if FLUSH_ON_THIS_THREAD.get() {
+        1
+    } else {
+        MAX_FLUSH_THREADS
+            .min(crate::program::available_cores())
+            .min(files.len().div_ceil(16))
+            .max(1)
+    };
     let files = Mutex::new(files.into_iter());
-    let failed = AtomicBool::new(false);
+    let failures = Mutex::new(FlushFailures::default());
     let work = || {
-        while !failed.load(Ordering::Relaxed) {
+        loop {
             let next = files.lock().unwrap_or_else(PoisonError::into_inner).next();
             let Some(file) = next else {
                 break;
             };
+            let mut failed = false;
             for write in file {
-                let written = write_output(
-                    write_file,
-                    &write.file_name,
-                    &write.text,
-                    &mut write.data,
-                    write.differs_only_in_map,
-                );
-                if written.is_err() {
-                    failed.store(true, Ordering::Relaxed);
-                    break;
-                }
+                let result = if failed && write.signature_read_diagnostics {
+                    None
+                } else {
+                    match write_output(
+                        write_file,
+                        &write.file_name,
+                        &write.text,
+                        &mut write.data,
+                        write.differs_only_in_map,
+                    ) {
+                        Ok(()) => continue,
+                        Err(err) => Some(err),
+                    }
+                };
+                failed = true;
+                failures
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(write.file_name.clone(), result);
             }
         }
     };
@@ -763,7 +943,290 @@ fn flush_writes(
         }
         work();
     });
-    !failed.load(Ordering::Relaxed)
+    let failures = failures
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    (!failures.is_empty()).then_some(failures)
+}
+
+/// True for a declaration output or its map.
+fn is_declaration_output(write: &BufferedWrite) -> bool {
+    let output = write.file_name.as_str();
+    is_declaration_file_name(output.strip_suffix(".map").unwrap_or(output))
+}
+
+/// `flush_writes` in the API build when each write is a client `writeFile`
+/// call (`calls`), without `--singleThreaded`. `writes` are in file order,
+/// each file's outputs in Go's order. Go's emit goroutines make the calls
+/// in parallel. A d.ts signature that reads the TS5033 of an earlier
+/// failed write of its file (`signature_read_diagnostics`) panics and ends
+/// the process during the other goroutines' calls, so Go makes some of
+/// their calls and writes some of their outputs, by timing. This makes
+/// calls and writes that Go N' often makes (gopanicout1, gopanicout2 and
+/// gopanicout3 `go-model.md`, the client's call set and the written files
+/// are one of Go's results in 30 to 190 runs per shape):
+/// - The outputs go in rounds: the first output of each file that comes
+///   before its declarations, then the second..., then the declaration
+///   outputs in rounds. A file's goroutine writes its JS and maps before
+///   its declarations.
+/// - After a failed write of a file whose d.ts then panics (doomed), with
+///   `Concurrent` calls: the rest of the outputs before the declarations
+///   and, for a failed declaration output, the rest of its round (the
+///   other files' calls are in flight), then the doomed file's own
+///   outputs. Go's panic needs no more answers, and another file's next
+///   output needs one more.
+/// - With `Serialized` calls (`flush_serialized_client_writes`): in the
+///   round of the failure the next file's output is written too, and in
+///   the first round every file's output is called; then the doomed
+///   file's own outputs. A failed OS write after a `useOS` answer dooms
+///   its file one round later.
+/// - No other write is made: the replay panics at the doomed d.ts, and the
+///   process ends (`program_emit::wait_emit_jobs`).
+///
+/// Without a doomed file every write is made, in rounds.
+fn flush_client_writes(
+    writes: Vec<BufferedWrite>,
+    calls: ClientWrites,
+    write_file: Option<&WriteFile>,
+) -> Option<FlushFailures> {
+    // (declaration, the output's place among its file's outputs of that
+    // kind, the file), and the write.
+    let mut rounds = Vec::with_capacity(writes.len());
+    let mut file = 0;
+    let mut place = [0; 2];
+    let mut previous: Option<Path> = None;
+    for write in writes {
+        if previous.as_ref() != Some(&write.source) {
+            if previous.is_some() {
+                file += 1;
+            }
+            place = [0; 2];
+            previous = Some(write.source.clone());
+        }
+        let declaration = is_declaration_output(&write);
+        rounds.push(((declaration, place[usize::from(declaration)], file), write));
+        place[usize::from(declaration)] += 1;
+    }
+    crate::gostd::slices::stable_sort_by(&mut rounds, |a, b| a.0.cmp(&b.0));
+    let mut flush = ClientFlush {
+        // The files whose d.ts signature reads `data.diagnostics`.
+        reads_diagnostics: rounds
+            .iter()
+            .filter(|(_, write)| write.signature_read_diagnostics)
+            .map(|&((.., file), _)| file)
+            .collect(),
+        write_file,
+        failed: FxHashSet::default(),
+        doomed: None,
+        failures: FlushFailures::default(),
+    };
+    match calls {
+        ClientWrites::Concurrent => {
+            let mut doomed_round = None;
+            for ((declaration, place, file), write) in rounds {
+                let made = match (flush.doomed, doomed_round) {
+                    (Some(doomed), Some(round)) => {
+                        !declaration || file == doomed || (declaration, place) == round
+                    }
+                    _ => true,
+                };
+                if made && flush.write(file, write) {
+                    doomed_round = Some((declaration, place));
+                }
+            }
+        }
+        ClientWrites::Serialized => flush_serialized_client_writes(rounds, &mut flush),
+    }
+    (!flush.failures.is_empty()).then_some(flush.failures)
+}
+
+/// The state of `flush_client_writes`.
+struct ClientFlush<'a> {
+    reads_diagnostics: FxHashSet<usize>,
+    write_file: Option<&'a WriteFile>,
+    /// The files with a failed output.
+    failed: FxHashSet<usize>,
+    /// The file whose d.ts panics.
+    doomed: Option<usize>,
+    failures: FlushFailures,
+}
+
+impl ClientFlush<'_> {
+    /// Makes the write of an output of `file` and records a failure (`fail`).
+    /// True when this failure dooms the file.
+    fn write(&mut self, file: usize, mut write: BufferedWrite) -> bool {
+        let result = if self.failed.contains(&file) && write.signature_read_diagnostics {
+            None
+        } else {
+            match write_output(
+                self.write_file,
+                &write.file_name,
+                &write.text,
+                &mut write.data,
+                write.differs_only_in_map,
+            ) {
+                Ok(()) => return false,
+                Err(err) => Some(err),
+            }
+        };
+        self.fail(
+            file,
+            write.file_name,
+            result,
+            write.signature_read_diagnostics,
+        )
+    }
+
+    /// Records a write of an output of `file` that failed with `result`, or
+    /// that was left out (`None`). True when this failure dooms the file: a
+    /// failed output before the file's d.ts (not the d.ts itself, whose
+    /// signature comes before its write, `signature_read_diagnostics`).
+    fn fail(
+        &mut self,
+        file: usize,
+        file_name: String,
+        result: Option<String>,
+        signature_read_diagnostics: bool,
+    ) -> bool {
+        let dooms = self.doomed.is_none()
+            && result.is_some()
+            && !signature_read_diagnostics
+            && self.reads_diagnostics.contains(&file);
+        if dooms {
+            self.doomed = Some(file);
+        }
+        self.failed.insert(file);
+        self.failures.insert(file_name, result);
+        dooms
+    }
+}
+
+/// `flush_client_writes` with `Serialized` calls. Go `SyncConn.Call` takes
+/// one mutex for each call (ipc/conn_sync.go:170), so the emit goroutines
+/// take turns. The OS writes of a round wait until the round's calls end
+/// (`defer_os_writes`). After a failure that dooms a file in the round,
+/// the next file (after the doomed one, in file order, the first after the
+/// last) writes its output of the round and the process ends:
+/// - in the first round every file's first output is called, and only the
+///   doomed file's and the next file's are written;
+/// - in a later round only the next file's output is called after the
+///   failure, and the earlier writes of the round are lost.
+///
+/// Then only the doomed file's own outputs are made.
+///
+/// A failed OS write after a `useOS` answer (gopanicout3 `go-model.md`) is
+/// slower than a failed call: Go tries the write again after it makes the
+/// directory (vfs/osvfs/os.go:161 `writeFileEnsuringDir`). So it dooms its
+/// file after the round's OS writes, and in the next round the doomed
+/// file's output is called and written, and the next file's output is
+/// called without its write. Then only the doomed file's own outputs.
+fn flush_serialized_client_writes(
+    rounds: Vec<((bool, usize, usize), BufferedWrite)>,
+    flush: &mut ClientFlush<'_>,
+) {
+    let files = rounds
+        .iter()
+        .map(|&((.., file), _)| file + 1)
+        .max()
+        .unwrap_or(0);
+    let mut rounds = rounds.into_iter().peekable();
+    let mut first_round = true;
+    // A failed OS write of the last round doomed its file.
+    let mut doomed_by_os_write = false;
+    while let Some(&((declaration, place, _), _)) = rounds.peek() {
+        let mut round = Vec::new();
+        while let Some(((_, _, file), write)) =
+            rounds.next_if(|&((d, p, _), _)| (d, p) == (declaration, place))
+        {
+            round.push((file, write));
+        }
+        if let Some(doomed) = flush.doomed {
+            for (file, write) in round {
+                if file == doomed {
+                    flush.write(file, write);
+                } else if doomed_by_os_write && file == (doomed + 1) % files {
+                    // The process ends before this OS write.
+                    drop(defer_os_writes(|| flush.write(file, write)));
+                }
+            }
+            doomed_by_os_write = false;
+            continue;
+        }
+        let mut held = Vec::new();
+        for (file, write) in round {
+            let called = match flush.doomed {
+                None => true,
+                Some(doomed) => first_round || file == (doomed + 1) % files,
+            };
+            if called {
+                let name = write.file_name.clone();
+                let signature_read_diagnostics = write.signature_read_diagnostics;
+                let os_writes = defer_os_writes(|| flush.write(file, write));
+                held.push((file, name, signature_read_diagnostics, os_writes));
+            }
+        }
+        // The doom of a failed call of the round.
+        let doomed_by_call = flush.doomed;
+        for (file, name, signature_read_diagnostics, os_writes) in held {
+            let written =
+                doomed_by_call.is_none_or(|doomed| file == doomed || file == (doomed + 1) % files);
+            if !written {
+                continue;
+            }
+            for os_write in os_writes {
+                if let Err(err) = os_write() {
+                    doomed_by_os_write |= flush.fail(
+                        file,
+                        name.clone(),
+                        Some(fs_error_text(&err)),
+                        signature_read_diagnostics,
+                    );
+                }
+            }
+        }
+        first_round = false;
+    }
+}
+
+/// An OS write that `defer_os_writes` holds back.
+pub type DeferredOsWrite = Box<dyn FnOnce() -> Result<(), FsError>>;
+
+thread_local! {
+    /// The OS writes that the running `defer_os_writes` holds back.
+    static DEFERRED_OS_WRITES: std::cell::RefCell<Option<Vec<DeferredOsWrite>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// PORT: not in Go. Runs `f`, a client `writeFile` call, and returns the
+/// OS write that the client asked for (`useOS`) instead of making it
+/// (`os_write_or_defer`): `flush_serialized_client_writes` makes it only
+/// when Go's goroutine would have written before the panic ends the
+/// process.
+fn defer_os_writes(f: impl FnOnce() -> bool) -> Vec<DeferredOsWrite> {
+    DEFERRED_OS_WRITES.with(|deferred| *deferred.borrow_mut() = Some(Vec::new()));
+    f();
+    DEFERRED_OS_WRITES
+        .with(|deferred| deferred.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+/// The OS write of a `writeFile` call that the client answered with
+/// `useOS` (api/callbackfs.go:415 `WriteFile`): made now, or held back
+/// while `defer_os_writes` runs (then `Ok`).
+pub fn os_write_or_defer(
+    os_write: impl FnOnce() -> Result<(), FsError> + 'static,
+) -> Result<(), FsError> {
+    let os_write = DEFERRED_OS_WRITES.with(|deferred| match deferred.borrow_mut().as_mut() {
+        Some(writes) => {
+            writes.push(Box::new(os_write));
+            None
+        }
+        None => Some(os_write),
+    });
+    match os_write {
+        Some(os_write) => os_write(),
+        None => Ok(()),
+    }
 }
 
 // Go: incremental/emitfileshandler.go:252 skipDtsOutputOfComposite
@@ -894,7 +1357,10 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
         "start_emit_files: only the emit of all affected files starts early"
     );
     let mut handler = EmitFilesHandler::new(program, false);
-    handler.buffer = BUFFER_EARLY_EMIT_WRITES.get().then(WriteBuffer::default);
+    let buffer = BUFFER_EARLY_EMIT_WRITES.get().then(WriteBuffer::default);
+    if let Some(buffer) = &buffer {
+        handler.writes = Writes::Buffer(buffer.clone());
+    }
     let queued = handler.queue_affected_files(&options);
     let batch = handler.send_emit_batch(&queued, &options);
     StartedEmit {
@@ -903,11 +1369,10 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
         queued,
         batch,
         write_file: options.write_file,
-        fingerprint: handler
-            .buffer
+        fingerprint: buffer
             .is_none()
             .then(crate::program::bind_thread_fingerprint),
-        buffer: handler.buffer,
+        buffer,
     }
 }
 
@@ -921,8 +1386,9 @@ pub(crate) fn start_emit_files(program: &Program, options: EmitOptions) -> Start
 /// (`flush_writes`). When a write fails, Go's emitter sees the error at
 /// the write: the file gets a TS5033 diagnostic instead of the output in
 /// `EmittedFiles`, and the declaration signature takes the diagnostic. So
-/// then the files emit again from the start state with direct writes, and
-/// their results replace the buffered emit's.
+/// then the files emit again from the start state, and each write gives
+/// the flush's result without a write (`Writes::Replay`; Go writes each
+/// file once). Their results replace the buffered emit's.
 pub(crate) fn finish_emit_files(
     program: &Program,
     started: StartedEmit,
@@ -954,14 +1420,17 @@ pub(crate) fn finish_emit_files(
         deleted_pending_kinds: started.deleted_pending_kinds,
         emit_updates: IndexMap::default(),
         has_emit_diagnostics: false,
-        buffer: None,
+        writes: Writes::Direct,
     };
     let mut results = started.batch.wait();
     if let Some(buffer) = started.buffer {
         let writes = std::mem::take(&mut *buffer.lock().unwrap_or_else(PoisonError::into_inner));
-        if !flush_writes(writes, &started.queued, options.write_file.as_ref()) {
-            // The callbacks of the buffered emit filled `shared`.
-            *handler.shared.lock().expect("emit files lock") = EmitFilesShared::default();
+        let order: Vec<Path> = started
+            .queued
+            .iter()
+            .map(|(path, ..)| path.clone())
+            .collect();
+        if handler.replay_after_flush(writes, &order, options.write_file.as_ref()) {
             results = handler.send_emit_batch(&started.queued, options).wait();
         }
     }

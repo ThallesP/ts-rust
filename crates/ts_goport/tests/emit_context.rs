@@ -299,7 +299,8 @@ fn api_emit_to_string_matches_go() {
                 "{what}: emitSkipped"
             );
             assert_eq!(result.get("diagnostics").array().len(), 0, "{what}");
-            let out = format!("{}/out/", dir.display());
+            // The API gives paths with "/" on every OS (Go normalizes them).
+            let out = format!("{}/out/", dir.display()).replace('\\', "/");
             let files: BTreeMap<String, String> = result
                 .get("outputFiles")
                 .array()
@@ -334,7 +335,8 @@ fn emit_project(name: &str, edit: fn(&mut CompilerOptions)) -> Run {
         .unwrap_or_else(|error| panic!("cannot load {config}: {error}"));
     let writes: Arc<Mutex<BTreeMap<String, String>>> = Arc::default();
     let sink = Arc::clone(&writes);
-    let out = format!("{FIXTURES}/{name}/out/");
+    // The emit gives paths with "/" on every OS (Go normalizes them).
+    let out = format!("{FIXTURES}/{name}/out/").replace('\\', "/");
     let write_file: WriteFile =
         Arc::new(move |file: &str, text: &str, _data: &mut WriteFileData| {
             let file = file

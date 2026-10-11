@@ -262,11 +262,12 @@ impl ApiStabilitySurface {
     }
 }
 
-/// Go `*apiStabilityCarrier`: an index into the analysis carrier table
-/// (`ApiStabilityAnalysis::carrier_nodes`). Zero is Go nil.
+/// Go `*apiStabilityCarrier`: the intern number of a carrier in its analysis
+/// (`ApiStabilityAnalysis::carriers`). Zero is Go nil.
 ///
 /// PORT: Go interns carriers by pointer. Equal chains share one node, so the
-/// interned index is the same identity.
+/// interned number is the same identity. Go only compares the pointers and
+/// never reads a carrier's fields, so the port keeps no table of the nodes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ApiStabilityCarrierId(pub u32);
 
@@ -432,17 +433,11 @@ impl ApiStabilityAnalysis {
         if let Some(&existing) = self.carriers.get(&key) {
             return existing;
         }
-        self.carrier_nodes.push(key);
         let carrier = ApiStabilityCarrierId(
-            u32::try_from(self.carrier_nodes.len()).expect("carrier overflow"),
+            u32::try_from(self.carriers.len() + 1).expect("carrier overflow"),
         );
         self.carriers.insert(key, carrier);
         carrier
-    }
-
-    /// Go `*carrier` for a non-nil interned carrier.
-    pub fn carrier_node(&self, carrier: ApiStabilityCarrierId) -> &ApiStabilityCarrier {
-        &self.carrier_nodes[carrier.0 as usize - 1]
     }
 
     // Go: typeparser/api_stability.go apiStabilityAnalysis.extendParametersSubstitution
@@ -1009,6 +1004,9 @@ impl ApiStabilitySession {
     }
 
     // Go: typeparser/api_stability.go ApiStabilitySession.UsedByType
+    // Callers: only Go tests (api_stability_surface_test.go:88, :148 and
+    // more); the port's `units_emit/effect_api_stability_tests.rs` calls it
+    // through `api_stability_used_by_type`.
     /// UsedByType computes the stability the children of an already represented
     /// checker type expose inside this session. The type's own declared tag is
     /// excluded from the returned dependencies and minimum: a type alias
@@ -1046,6 +1044,11 @@ impl ApiStabilitySession {
     }
 
     // Go: typeparser/api_stability.go ApiStabilitySession.UsedBySignature
+    // Callers: only Go tests (api_stability_surface_test.go:121, :342,
+    // api_stability_test.go:458, :467 and more) and
+    // `api_stability_used_by_signature`; the port's
+    // `test_api_stability_overload_tags_stay_distinct` and
+    // `test_api_stability_signature_surface_retains_substitution`.
     /// UsedBySignature computes the stability the children of an already
     /// represented signature expose inside this session. The signature's own
     /// declared tag is excluded from the returned dependencies and minimum; its
@@ -1080,6 +1083,10 @@ impl ApiStabilitySession {
 
 impl TypeParser<'_> {
     // Go: typeparser/api_stability.go TypeParser.ApiStabilityUsedBySymbol
+    // Callers: only Go tests (api_stability_safety_test.go:100,
+    // api_stability_inheritance_test.go:41 and more; the rule uses a session,
+    // `ApiStabilitySession::used_by_symbol`); the port's
+    // `units_emit/effect_api_stability_tests.rs`.
     /// ApiStabilityUsedBySymbol computes the stability the children of a symbol's
     /// public surface expose in a fresh one-call session. The root symbol's own
     /// declared tag is excluded; use DeclaredApiStabilityOfSymbol to read it. The
@@ -1120,6 +1127,8 @@ impl TypeParser<'_> {
     }
 
     // Go: typeparser/api_stability.go TypeParser.ApiStabilityUsedByType
+    // Callers: only Go tests (api_stability_inheritance_test.go:54); the
+    // port's `test_api_stability_inheritance_minimum_and_cache_isolation_*`.
     /// ApiStabilityUsedByType computes the stability the children of an already
     /// represented checker type expose in a fresh one-call session. The type's own
     /// declared tag is excluded; use the declared accessors to read it. It switches
@@ -1133,6 +1142,11 @@ impl TypeParser<'_> {
     }
 
     // Go: typeparser/api_stability.go TypeParser.ApiStabilityUsedBySignature
+    // Callers: only Go tests (api_stability_test.go:480 in
+    // TestApiStabilitySignatureSurfaceRetainsSubstitution; :659 and :662 in
+    // TestApiStabilitySignatureCacheIsolation, which needs two programs and is
+    // not portable here); the port's
+    // `test_api_stability_signature_surface_retains_substitution`.
     /// ApiStabilityUsedBySignature computes the stability the children of an
     /// already represented signature expose in a fresh one-call session. The
     /// signature's own declared tag is excluded; use DeclaredApiStabilityOfSignature
@@ -1559,9 +1573,6 @@ pub struct ApiStabilityAnalysis {
     // cache and cycle keys compare by concrete identity instead of a serialized
     // substitution context; the table is discarded with the analysis.
     pub carriers: FxHashMap<ApiStabilityCarrier, ApiStabilityCarrierId>,
-    /// PORT: the interned carrier nodes (Go heap nodes); `ApiStabilityCarrierId(i)`
-    /// is `carrier_nodes[i - 1]`.
-    pub carrier_nodes: Vec<ApiStabilityCarrier>,
 
     // settleSymbols, settleTypes, settleComponents and settleSignatures record
     // the first-insertion order of the session results. Settlement recollects

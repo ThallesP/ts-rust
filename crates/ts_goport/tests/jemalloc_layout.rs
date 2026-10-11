@@ -5,6 +5,13 @@
 //! checks what that process can see: 4 arenas, the holder thread, and
 //! arena grows at 2 MiB boundaries in every arena.
 //!
+//! `layout_stops_at_4_arenas` does the same without `narenas:4` (4 arenas
+//! per CPU): the layout makes no arena after the fourth.
+//!
+//! `claims_move_off_held_arenas` and `claims_keep_own_arenas`: the arena
+//! claims of a checker pool (`ArenaClaims`) with `narenas:4` and without
+//! it.
+//!
 //! `tsgo_exits_with_the_holder`: tsgo still exits, with its exit code, in
 //! each mode that keeps the holder thread to the end (plain, worker,
 //! `--singleThreaded`, `-b`, `-w` and `--lsp`). Each tsgo has SIGKILL as
@@ -15,15 +22,16 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use tikv_jemalloc_ctl::{Access, AsName};
-use ts_goport::jemalloc_layout::{HOLDER_NAME, jemalloc_layout};
+use ts_goport::jemalloc_layout::{ArenaClaims, HOLDER_NAME, jemalloc_layout};
 
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-/// Set in the process that `layout_from_inside` starts.
+/// Set in the process that `inner` starts.
 const INNER: &str = "JEMALLOC_LAYOUT_TEST_INNER";
 
 /// Set in the process that `tsgo` starts: the process id of the test, and
@@ -44,16 +52,7 @@ const RUN_LIMIT: Duration = Duration::from_secs(60);
 
 #[test]
 fn layout_from_inside() {
-    if std::env::var_os(INNER).is_none() {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "layout_from_inside", "--nocapture"])
-            .args(["--test-threads", "1"])
-            .env(INNER, "1")
-            .env("_RJEM_MALLOC_CONF", bins_jemalloc_conf())
-            .env_remove("GOPORT_JEMALLOC_LAYOUT")
-            .status()
-            .unwrap();
-        assert!(status.success(), "{status}");
+    if !inner("layout_from_inside", bins_jemalloc_conf()) {
         return;
     }
     if ts_goport::gostd::stack::memory_limit().is_some() {
@@ -116,6 +115,70 @@ fn layout_from_inside() {
 }
 
 #[test]
+fn layout_stops_at_4_arenas() {
+    if !inner("layout_stops_at_4_arenas", &conf_without_narenas()) {
+        return;
+    }
+    if ts_goport::gostd::stack::memory_limit().is_some() {
+        eprintln!("skipped: the layout does nothing under a memory limit");
+        return;
+    }
+    let arenas = Access::<u32>::read(b"opt.narenas\0".name()).unwrap();
+    if arenas <= 4 {
+        eprintln!("skipped: jemalloc has {arenas} arenas here");
+        return;
+    }
+    // This process has at most 2 threads (libtest's), so only the layout
+    // can make arenas 2 to 4.
+    jemalloc_layout();
+    assert!(arena_made(3), "arena 3");
+    assert!(!arena_made(4), "the layout made arena 4 of {arenas}");
+}
+
+#[test]
+fn claims_move_off_held_arenas() {
+    if !inner("claims_move_off_held_arenas", bins_jemalloc_conf()) {
+        return;
+    }
+    // The first thread in arena 2 keeps it, though arenas 0 and 1 have no
+    // claim. The others move off a claimed arena to the lowest arena with
+    // none, so the arena they leave keeps the thread that claimed it: arena
+    // 2 keeps the first, arena 0 the second. The fifth finds all 4 claimed
+    // and keeps its arena.
+    let arenas = claim_on_threads(&[Some(2), Some(2), Some(0), Some(0), Some(0)]);
+    let after: Vec<u32> = arenas.iter().map(|&(_, after)| after).collect();
+    assert_eq!(after, [2, 0, 1, 3, 0], "{arenas:?}");
+}
+
+#[test]
+fn claims_keep_own_arenas() {
+    if !inner("claims_keep_own_arenas", &conf_without_narenas()) {
+        return;
+    }
+    let arenas = Access::<u32>::read(b"opt.narenas\0".name()).unwrap();
+    if arenas <= 4 {
+        eprintln!("skipped: jemalloc has {arenas} arenas here");
+        return;
+    }
+    // Each new thread gets an arena with no thread (4 per CPU): no claim
+    // moves one.
+    let threads = claim_on_threads(&[None; 4]);
+    let mut after: Vec<u32> = threads.iter().map(|&(_, after)| after).collect();
+    assert!(
+        threads.iter().all(|(before, after)| before == after),
+        "{threads:?}"
+    );
+    after.sort_unstable();
+    after.dedup();
+    assert_eq!(after.len(), 4, "{threads:?}");
+    // Arena 64 and later have no claim.
+    if arenas > 64 {
+        let threads = claim_on_threads(&[Some(64), Some(64)]);
+        assert_eq!(threads, [(64, 64), (64, 64)]);
+    }
+}
+
+#[test]
 fn tsgo_exits_with_the_holder() {
     if let Some(parent) = std::env::var_os(EXEC_PARENT) {
         exec_tsgo(&parent);
@@ -164,6 +227,74 @@ fn tsgo_exits_with_the_holder() {
     wait_for(&mut lsp, || !holder || has_thread(&lsp_dir, HOLDER_NAME));
     drop(lsp.stdin.take());
     assert_eq!(wait_limited(lsp, &["--lsp"]).code(), Some(0), "--lsp");
+}
+
+/// True in the process that `name` (this test) starts again, with
+/// `_RJEM_MALLOC_CONF` `conf` and jemalloc as its allocator. In the test
+/// process it starts that process, checks that it passes and returns false.
+fn inner(name: &str, conf: &str) -> bool {
+    if std::env::var_os(INNER).is_some() {
+        return true;
+    }
+    let status = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .args(["--test-threads", "1"])
+        .env(INNER, "1")
+        .env("_RJEM_MALLOC_CONF", conf)
+        .env_remove("GOPORT_JEMALLOC_LAYOUT")
+        .status()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    false
+}
+
+/// True when jemalloc has made arena `arena`.
+fn arena_made(arena: u32) -> bool {
+    // `arena.<i>.initialized` reads what the last epoch saw.
+    tikv_jemalloc_ctl::epoch::advance().unwrap();
+    let name = format!("arena.{arena}.initialized\0");
+    Access::<bool>::read(name.as_bytes().name()).unwrap()
+}
+
+/// Starts one thread for each of `starts`, one after the other, which
+/// moves to that arena (None: jemalloc's choice) and claims an arena of one
+/// `ArenaClaims`. Returns each thread's arena before its claim, and after
+/// every thread has claimed, while all of them still run.
+fn claim_on_threads(starts: &[Option<u32>]) -> Vec<(u32, u32)> {
+    let claims = Arc::new(ArenaClaims::default());
+    let claimed = Arc::new(Barrier::new(starts.len() + 1));
+    let (sender, receiver) = mpsc::channel();
+    let threads: Vec<_> = starts
+        .iter()
+        .map(|&start| {
+            let (claims, claimed, sender) = (claims.clone(), claimed.clone(), sender.clone());
+            let thread = std::thread::spawn(move || {
+                let arena = || Access::<u32>::read(b"thread.arena\0".name()).unwrap();
+                if let Some(start) = start {
+                    b"thread.arena\0".name().write(start).unwrap();
+                }
+                let before = arena();
+                claims.claim();
+                sender.send(()).unwrap();
+                claimed.wait();
+                (before, arena())
+            });
+            receiver.recv().unwrap();
+            thread
+        })
+        .collect();
+    claimed.wait();
+    threads.into_iter().map(|t| t.join().unwrap()).collect()
+}
+
+/// `JEMALLOC_CONF` of bin/tsgo.rs without `narenas:4`: jemalloc then has 4
+/// arenas per CPU.
+fn conf_without_narenas() -> String {
+    let conf: Vec<&str> = bins_jemalloc_conf()
+        .split(',')
+        .filter(|option| !option.starts_with("narenas:"))
+        .collect();
+    conf.join(",")
 }
 
 /// `JEMALLOC_CONF` of bin/tsgo.rs, so this test follows a change there.
