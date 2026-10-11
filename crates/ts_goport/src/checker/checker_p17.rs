@@ -1436,11 +1436,27 @@ impl Checker {
         module_specifier: Node,
         import_attributes_type: TypeId,
     ) -> TypeId {
-        let has_default_only = self.is_only_importable_as_default(
-            module_specifier,
-            SymbolId::NIL,
-            import_attributes_type,
-        );
+        // PERF: portonly1 item 10. Go computes this again on each call
+        // (checker.go:16019), and `resolveESModuleSymbol` makes the call for
+        // each use of one import of a module. With no resolved module given,
+        // the answer depends only on `module_specifier` (its file's module
+        // format and its module name) and `import_attributes_type`, and the
+        // work adds nothing on a later call (`resolveExternalModuleName` with
+        // ignoreErrors reports no error), so the answer is kept per node and
+        // attributes type, as a node link would keep it.
+        let key = (module_specifier, import_attributes_type);
+        let has_default_only = match self.only_importable_as_default.get(&key) {
+            Some(&answer) => answer,
+            None => {
+                let answer = self.is_only_importable_as_default(
+                    module_specifier,
+                    SymbolId::NIL,
+                    import_attributes_type,
+                );
+                self.only_importable_as_default.insert(key, answer);
+                answer
+            }
+        };
         if has_default_only && t.is_some() && !self.is_error_type(t) {
             let key = CachedTypeKey {
                 kind: CachedTypeKind::DEFAULT_ONLY_TYPE,

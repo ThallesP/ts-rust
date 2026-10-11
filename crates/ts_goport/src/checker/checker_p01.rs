@@ -860,6 +860,10 @@ pub struct Checker {
     pub this_expando_locations: FxHashMap<SymbolId, Node>,
     pub subtype_reduction_cache: CacheKeyMap<Vec<TypeId>>,
     pub cached_types: FxHashMap<CachedTypeKey, TypeId>,
+    /// `is_only_importable_as_default(usage, nil, attributes)` per usage node
+    /// and attributes type (`get_type_with_synthetic_default_only`).
+    // PERF: portonly1 item 10. Not in Go; see `get_type_with_synthetic_default_only`.
+    pub only_importable_as_default: FxHashMap<(Node, TypeId), bool>,
     pub cached_signatures: FxHashMap<CachedSignatureKey, SignatureId>,
     pub undefined_properties: FxHashMap<String, SymbolId>,
     pub narrowed_types: FxHashMap<NarrowedTypeKey, TypeId>,
@@ -1407,6 +1411,7 @@ impl Checker {
             this_expando_locations: FxHashMap::default(),
             subtype_reduction_cache: CacheKeyMap::default(),
             cached_types: FxHashMap::default(),
+            only_importable_as_default: FxHashMap::default(),
             cached_signatures: FxHashMap::default(),
             undefined_properties: FxHashMap::default(),
             narrowed_types: FxHashMap::default(),
