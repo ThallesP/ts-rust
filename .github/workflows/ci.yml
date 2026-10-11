@@ -51,7 +51,7 @@ jobs:
           cargo run --locked --quiet -p ts_ast_codegen -- check crates/ts_goport/src/astdata/syntax_kind.rs
           cargo run --locked --quiet -p ts_ast_codegen -- check-ast crates/ts_goport/src/astdata/ast_generated.rs
       # The packages of the revision quality step (candidate.sh): 0 warnings.
-      - run: cargo clippy --locked -p ts_goport -p goport_util -p goport_lsproto --all-targets -- -D warnings
+      - run: cargo clippy --locked -p ts_goport -p goport_core -p goport_util -p goport_lsproto --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.runner }})

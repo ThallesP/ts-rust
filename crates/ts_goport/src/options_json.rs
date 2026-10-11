@@ -678,7 +678,7 @@ fn unmarshal_core_int(
 
 // Go v2 pointer arshaler for a `*int` member: `null` sets nil. Go `int` is
 // 64-bit; errors name Go `int`.
-pub(crate) fn unmarshal_go_int_ptr(
+pub fn unmarshal_go_int_ptr(
     dec: &mut JsonDecoder<'_>,
     v: &mut Option<i64>,
 ) -> Result<(), JsonError> {

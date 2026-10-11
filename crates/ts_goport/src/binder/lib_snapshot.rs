@@ -1268,7 +1268,7 @@ mod tests {
             sections.push((lib, section));
         });
         let blob = write_blob(MAGIC, &sections);
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/binder/lib_bind.bin");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../src/binder/lib_bind.bin");
         std::fs::write(path, &blob).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
         eprintln!("wrote {path}: {} bytes", blob.len());
     }

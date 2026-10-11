@@ -71,7 +71,7 @@ fn path_of(file: Node) -> Path {
 // Go `syscall.Errno` text (`pprof::path_error`, which uses
 // `fswatch::syscall::io_error_text` on every target). The other errors are
 // the Go `io/fs` errors.
-pub(crate) fn fs_error_text(err: &FsError) -> String {
+pub fn fs_error_text(err: &FsError) -> String {
     match err {
         FsError::Path { op, path, err } => crate::pprof::path_error(op, path, err).error(),
         FsError::Invalid => "invalid argument".to_string(),

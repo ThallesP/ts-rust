@@ -1984,7 +1984,7 @@ mod tests {
         let blob = write_blob(MAGIC, &sections);
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/frontend/parser/lib_parse.bin"
+            "/../../src/frontend/parser/lib_parse.bin"
         );
         std::fs::write(path, &blob).unwrap_or_else(|e| panic!("cannot write {path}: {e}"));
         eprintln!("wrote {path}: {} bytes", blob.len());

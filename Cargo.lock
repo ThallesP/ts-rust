@@ -137,6 +137,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "goport_core"
+version = "7.0.0-dev"
+dependencies = [
+ "bumpalo",
+ "flate2",
+ "goport_util",
+ "indexmap",
+ "jiff",
+ "memchr",
+ "miow",
+ "nix",
+ "rustc-hash",
+ "rustix",
+ "same-file",
+ "signal-hook",
+ "smallvec",
+ "tikv-jemalloc-ctl",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "goport_lsproto"
 version = "7.0.0-dev"
 dependencies = [
@@ -671,6 +692,7 @@ version = "7.0.0-dev"
 dependencies = [
  "bumpalo",
  "flate2",
+ "goport_core",
  "goport_lsproto",
  "goport_util",
  "indexmap",

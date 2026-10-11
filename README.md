@@ -258,8 +258,9 @@ with `tsc-rs` 0.1.0 and R179 on Linux.
 
 ## Development
 
-`crates/ts_goport` is the compiler. It has two parts crates, `goport_util` and `goport_lsproto`,
-in `crates/ts_goport/parts`, and uses the lib files in `crates/ts_goport/libs`.
+`crates/ts_goport` is the compiler. It has three parts crates in `crates/ts_goport/parts`:
+`goport_core` (everything below the language service), `goport_util` and `goport_lsproto`. Their
+files stay in `crates/ts_goport/src`. It uses the lib files in `crates/ts_goport/libs`.
 `tools/ts_ast_codegen` generates `crates/ts_goport/src/astdata`, and
 `tools/ts_diagnostics_codegen` generates `crates/ts_goport/src/diagnostics/catalog.rs` and
 `crates/ts_goport/src/diag.rs`. `crates/ts_wasm` is the WebAssembly build

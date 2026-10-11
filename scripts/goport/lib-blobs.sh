@@ -36,7 +36,8 @@ stale_one() {
     "$blob" "$n" "${c:0:9}" "$(printf '%s\n' "${changed[@]:0:3}" | xargs -n1 basename | paste -sd, -)" "$( ((n > 3)) && echo ", ...")"
 }
 
-cargo_test() { scripts/run-cargo-capped.sh test --release -p ts_goport --lib -- --exact --test-threads=1 "$@"; }
+# The snapshot tests are lib tests of goport_core (crate split step 2).
+cargo_test() { scripts/run-cargo-capped.sh test --release -p goport_core --lib -- --exact --test-threads=1 "$@"; }
 
 case ${1:-} in
   stale)

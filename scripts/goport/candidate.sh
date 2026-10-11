@@ -622,10 +622,11 @@ PY
     if [[ $DRY == 0 ]]; then
       local fpa fpb fmt=0 cl=0 warn
       fpb=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
-      # After split step 1 (R131), goport_util and goport_lsproto are workspace crates built from ts_goport files.
+      # After split steps 1 (R131) and 2, goport_core, goport_util and goport_lsproto are workspace crates built
+      # from ts_goport files. clippy lints only the packages it names, so each one is named.
       # The kept crates that are still workspace members (stages 5 and 6 move some into goport) count too.
       local pkgs=(-p ts_goport) dirs=(crates/ts_goport) p
-      for p in goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
+      for p in goport_core goport_util goport_lsproto; do grep -q "\"crates/ts_goport/parts/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p"); done
       for p in "${KEPT_CRATES[@]}"; do grep -q "\"crates/$p\"" "$wt/Cargo.toml" && pkgs+=(-p "$p") dirs+=("crates/$p"); done
       (cd "$wt" && rustfmt --edition 2024 --check $(git ls-files "${dirs[@]/%//**/*.rs}") > "$C/rustfmt.log" 2>&1) || fmt=$?
       (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$R/runtime/cargo-r113-clippy \

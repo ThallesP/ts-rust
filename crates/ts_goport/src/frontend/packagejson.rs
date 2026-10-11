@@ -899,7 +899,7 @@ static TYPE_SCRIPT_VERSION: LazyLock<Version> =
 pub struct PackageJson {
     pub fields: Fields,
     pub parseable: bool,
-    pub(crate) version_paths: OnceCell<(VersionPaths, Vec<DiagnosticAndArgs>)>,
+    pub version_paths: OnceCell<(VersionPaths, Vec<DiagnosticAndArgs>)>,
 }
 
 impl std::ops::Deref for PackageJson {

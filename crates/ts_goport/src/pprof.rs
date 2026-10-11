@@ -313,7 +313,7 @@ fn create(name: &str) -> Result<File, GoError> {
 }
 
 // Go: io/fs.PathError.Error, "op path: err", with the Go text of the errno.
-pub(crate) fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
+pub fn path_error(op: &str, path: &str, err: &io::Error) -> GoError {
     errors::new(format!("{op} {path}: {}", io_error_text(err)))
 }
 

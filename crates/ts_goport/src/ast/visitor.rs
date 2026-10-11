@@ -132,7 +132,7 @@ pub fn new_node_visitor<'a, C>(
 
 /// Go `node.AsSyntaxList().Children`.
 // PORT: node.rs has no accessor for the `SyntaxList` children.
-pub(crate) fn syntax_list_children(node: Node) -> Vec<Node> {
+pub fn syntax_list_children(node: Node) -> Vec<Node> {
     let file = node.file_index();
     with_ast_data(node, |d| match d {
         NodeData::SyntaxList(d) => d.children.iter().map(|&id| Node::new(file, id)).collect(),

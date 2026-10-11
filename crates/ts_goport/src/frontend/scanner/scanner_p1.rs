@@ -42,9 +42,9 @@ pub type ErrorCallback =
 // ---------------------------------------------------------------------------
 
 /// Go `utf8.RuneError`.
-pub(crate) const RUNE_ERROR: i32 = 0xFFFD;
+pub const RUNE_ERROR: i32 = 0xFFFD;
 /// Go `utf8.RuneSelf`.
-pub(crate) const RUNE_SELF: i32 = 0x80;
+pub const RUNE_SELF: i32 = 0x80;
 
 /// Go `utf8.DecodeRuneInString(text[pos:])`. Returns `(RuneError, 0)` at the
 /// end and `(RuneError, 1)` for an invalid sequence (for example `pos` inside
@@ -54,7 +54,7 @@ pub(crate) const RUNE_SELF: i32 = 0x80;
 // size in `text`: a real U+FDD0 as `(0xFDD0, 6)`, an invalid byte as
 // `(RuneError, 7)` where Go gives `(RuneError, 1)`, and a lone surrogate
 // (only in values, never in source text) as `(RuneError, 7)`.
-pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
+pub fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if pos >= bytes.len() {
         return (RUNE_ERROR, 0);
@@ -71,7 +71,7 @@ pub(crate) fn utf8_decode_rune_in_string(text: &str, pos: usize) -> (i32, i32) {
 
 /// Go `utf8.DecodeLastRuneInString(text[:end])`.
 // PORT: a unit of the port form decodes as in `utf8_decode_rune_in_string`.
-pub(crate) fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
+pub fn utf8_decode_last_rune_in_string(text: &str, end: usize) -> (i32, i32) {
     let bytes = text.as_bytes();
     if end == 0 {
         return (RUNE_ERROR, 0);
@@ -151,7 +151,7 @@ pub(crate) fn utf8_decode_last_rune(s: &str) -> (i32, i32) {
 /// Maps a Go rune to a `char` for the `stringutil` predicates.
 // PORT: Go passes the rune through. A value that is not a Unicode scalar
 // (-1, a surrogate) becomes U+FFFD, which no predicate accepts, as Go.
-pub(crate) fn rune_to_char(r: i32) -> char {
+pub fn rune_to_char(r: i32) -> char {
     u32::try_from(r)
         .ok()
         .and_then(char::from_u32)

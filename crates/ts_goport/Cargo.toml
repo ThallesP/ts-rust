@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 # Parts of this crate built as their own crates. Their files stay in src/
-# (see src/goport_util_root.rs and src/goport_lsproto_root.rs).
+# (see src/goport_core_root.rs, src/goport_util_root.rs and
+# src/goport_lsproto_root.rs).
+goport_core = { path = "parts/goport_core", default-features = false }
 goport_lsproto = { path = "parts/goport_lsproto" }
 goport_util = { path = "parts/goport_util" }
 rustc-hash = "=2.1.2"
@@ -56,13 +58,13 @@ default = ["jemalloc"]
 # jemalloc as the global allocator of the goport binaries (default; the
 # shipped build). `--no-default-features` gives glibc malloc with its
 # tunables. See bin/goport.rs `set_malloc_tunables`.
-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+jemalloc = ["goport_core/jemalloc", "dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Go build tag `noembed`, as in Go's release builds and npm packages: the
 # lib files are not in the binary. The binaries read them from their own
 # directory and print their real paths, not `bundled:///libs/...`. Put them
 # there with crates/ts_goport/scripts/copy-libs.sh (build-release.sh does
 # this).
-noembed = ["goport_util/noembed"]
+noembed = ["goport_core/noembed", "goport_util/noembed"]
 
 [lints]
 workspace = true

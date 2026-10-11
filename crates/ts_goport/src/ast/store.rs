@@ -2273,9 +2273,10 @@ fn owned_nodes_enabled() -> bool {
 }
 
 /// `enter_freeable_parse` with owned nodes on, whatever the flag, for the
-/// unit tests of the owned stores.
-#[cfg(test)]
-pub(crate) fn enter_owned_parse() -> FreeableParseScope {
+/// unit tests of the owned stores. Not `cfg(test)`: the api encoder tests in
+/// ts_goport use it too, and `cfg(test)` is per crate.
+#[doc(hidden)]
+pub fn enter_owned_parse() -> FreeableParseScope {
     FreeableParseScope {
         previous: FREEABLE_PARSE.replace(true),
         previous_version: FREEABLE_VERSION_PARSE.replace(true),

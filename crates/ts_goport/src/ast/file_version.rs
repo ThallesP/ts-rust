@@ -127,7 +127,7 @@ impl FileVersion {
     /// The owner of file version `file`, registered in the registry. The
     /// language server parse cache and `program::mark_freeable_parses`
     /// make it (`freeable_path`).
-    pub(crate) fn new(file: usize) -> Arc<Self> {
+    pub fn new(file: usize) -> Arc<Self> {
         let version = Arc::new(FileVersion {
             file,
             published: OnceLock::new(),
@@ -306,7 +306,7 @@ thread_local! {
 
 /// Records that a publish on this thread published a file at `path`. Does
 /// nothing while `free_file_versions` is off.
-pub(crate) fn note_published_path(path: &str) {
+pub fn note_published_path(path: &str) {
     if !free_file_versions() {
         return;
     }
@@ -331,7 +331,7 @@ pub fn published_paths() -> Arc<FxHashSet<String>> {
 /// The freeable rule: true when a new parse of `path` gets a
 /// `FileVersion`, because `free_file_versions` is on and a publish on this
 /// thread published `path` before.
-pub(crate) fn freeable_path(path: &str) -> bool {
+pub fn freeable_path(path: &str) -> bool {
     free_file_versions() && PUBLISHED_PATHS.with(|paths| paths.borrow().contains(path))
 }
 
