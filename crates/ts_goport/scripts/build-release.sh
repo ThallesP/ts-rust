@@ -3,8 +3,8 @@
 # change, not the source.
 #
 # Default (the shipped build): dynamic glibc with jemalloc as the allocator
-# (default cargo feature `jemalloc`; jemalloc has
-# narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false built in: this script sets
+# (default cargo feature `jemalloc`; jemalloc has the JEMALLOC_CONF settings
+# (narenas:4,thp:always,...) built in: this script sets
 # JEMALLOC_SYS_WITH_MALLOC_CONF to the JEMALLOC_CONF line of bin/tsgo.rs, see bin/goport.rs
 # `set_malloc_tunables`; step 4 checks it). The bins link against glibc 2.28, so
 # they start on any x86-64 Linux with glibc 2.28 or later (Debian 10, RHEL 8,

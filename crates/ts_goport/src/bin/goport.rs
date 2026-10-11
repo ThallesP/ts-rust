@@ -59,7 +59,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// the same value into jemalloc (`JEMALLOC_SYS_WITH_MALLOC_CONF`); with
 /// another value there, the bins exec themselves to set it.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false,slab_sizes:16-16:2|32-32:2|48-48:6|64-64:2|96-96:6|128-128:2,tcache_nslots_small_max:400";
 
 fn main() {
     // First: it must run before the first heap allocation.
@@ -141,6 +141,22 @@ fn main() {
 ///   huge pages make those pages resident. In THP `always` mode (cup2) the
 ///   kernel gives huge pages to the metadata anyway, and the change saves
 ///   4 to 50 MiB.
+/// - `slab_sizes:...` and `tcache_nslots_small_max:400` (jemtune1) make
+///   the refills of small allocations rarer. Go takes them from a per-P
+///   mcache with no lock. jemalloc refills a tcache bin from the arena (a
+///   lock, about 500 instructions), and takes each new slab from the extent
+///   cache (an extent split, an `edata` allocation and more locks, about
+///   3,000 instructions). The 6 classes of 16 to 128 B (the most new slabs
+///   on query) get slabs of 256 or 512 regions, a multiple of the default
+///   slab, so a slab has no unused bytes. Single-threaded query check: 6.2k
+///   refills and 2.9k slabs became 3.4k and 2.3k. R193 release build, 7
+///   projects: single-thread instructions -0.23% (query -0.44%), wall -0.6%
+///   single-threaded and -0.5% default (mini-743d), peak RSS the same
+///   (query within 0.1%). Larger slabs for more classes, or no tcache GC
+///   (`tcache_gc_incr_bytes`), saved up to 0.3% more instructions. But
+///   each arena keeps a partly used slab of each class, and with huge
+///   pages those slabs make more memory resident: query default peak RSS
+///   +1 to +6%.
 ///
 /// glibc malloc (a build without the `jemalloc` feature):
 /// - `top_pad=67108864` (64 MiB) makes each thread heap read-write in full

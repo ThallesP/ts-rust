@@ -62,7 +62,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 /// Same as `goport.rs` `JEMALLOC_CONF`. `scripts/build-release.sh` reads it
 /// from this line for its BOLT runs.
 #[cfg(all(target_os = "linux", target_env = "gnu", feature = "jemalloc"))]
-const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false";
+const JEMALLOC_CONF: &str = "narenas:4,thp:always,metadata_thp:disabled,cache_oblivious:false,slab_sizes:16-16:2|32-32:2|48-48:6|64-64:2|96-96:6|128-128:2,tcache_nslots_small_max:400";
 
 /// The `arg0` of a worker (see `launch`) is this word, the launcher's
 /// process id, and the number, device and inode of the launcher's end of

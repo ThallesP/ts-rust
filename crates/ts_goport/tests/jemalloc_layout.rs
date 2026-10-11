@@ -3,7 +3,8 @@
 //! `layout_from_inside` runs again in a process with the jemalloc settings
 //! of the bins and jemalloc as its allocator, calls `jemalloc_layout` and
 //! checks what that process can see: 4 arenas, the holder thread, and
-//! arena grows at 2 MiB boundaries in every arena.
+//! arena grows at 2 MiB boundaries in every arena. Each test that starts
+//! such a process also checks that jemalloc took every setting.
 //!
 //! `layout_stops_at_4_arenas` does the same without `narenas:4` (4 arenas
 //! per CPU): the layout makes no arena after the fourth.
@@ -231,20 +232,29 @@ fn tsgo_exits_with_the_holder() {
 
 /// True in the process that `name` (this test) starts again, with
 /// `_RJEM_MALLOC_CONF` `conf` and jemalloc as its allocator. In the test
-/// process it starts that process, checks that it passes and returns false.
+/// process it starts that process, checks that it passes and that jemalloc
+/// took every setting of `conf`, and returns false. jemalloc goes on without
+/// a setting that it cannot read, and prints `<jemalloc>: ...` for it.
 fn inner(name: &str, conf: &str) -> bool {
     if std::env::var_os(INNER).is_some() {
         return true;
     }
-    let status = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name, "--nocapture"])
         .args(["--test-threads", "1"])
         .env(INNER, "1")
         .env("_RJEM_MALLOC_CONF", conf)
         .env_remove("GOPORT_JEMALLOC_LAYOUT")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "{status}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{stderr}");
+    assert!(output.status.success(), "{}", output.status);
+    assert!(
+        !stderr.contains("<jemalloc>"),
+        "jemalloc refused a setting of {conf}"
+    );
     false
 }
 
