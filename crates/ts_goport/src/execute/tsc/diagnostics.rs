@@ -1266,6 +1266,34 @@ fn pretty_path_for_file_error(
     )
 }
 
+/// `convert_to_relative_path(file_name, &format_opts.compare_paths_options)`.
+// PERF: diagnostics come sorted by file, so the last answer of this thread
+// is kept with all its inputs (effperf3 item 10).
+fn relative_file_name_of(file_name: &str, format_opts: &FormattingOptions) -> Rc<str> {
+    thread_local! {
+        /// (file name, current directory, case-sensitive names, relative name).
+        static LAST: RefCell<Option<(String, String, bool, Rc<str>)>> = const { RefCell::new(None) };
+    }
+    let options = &format_opts.compare_paths_options;
+    LAST.with_borrow_mut(|last| {
+        if let Some((name, directory, case_sensitive, relative)) = last
+            && name == file_name
+            && *directory == options.current_directory
+            && *case_sensitive == options.use_case_sensitive_file_names
+        {
+            return relative.clone();
+        }
+        let relative: Rc<str> = convert_to_relative_path(file_name, options).into();
+        *last = Some((
+            file_name.to_string(),
+            options.current_directory.clone(),
+            options.use_case_sensitive_file_names,
+            relative.clone(),
+        ));
+        relative
+    })
+}
+
 // Go: diagnosticwriter/diagnosticwriter.go:576 WriteFormatDiagnostic
 pub fn write_format_diagnostic(
     output: &Writer,
@@ -1276,9 +1304,7 @@ pub fn write_format_diagnostic(
     if let Some(file) = wrapped.file() {
         let (line, character) =
             get_ecma_line_and_utf16_character_of_file_position(&file, wrapped.pos());
-        let file_name = file.file_name();
-        let relative_file_name =
-            convert_to_relative_path(file_name, &format_opts.compare_paths_options);
+        let relative_file_name = relative_file_name_of(file.file_name(), format_opts);
         write_str(
             output,
             &format!("{}({},{}): ", relative_file_name, line + 1, character + 1),
