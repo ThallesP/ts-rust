@@ -210,8 +210,8 @@ pub struct EffectLinks {
     pub effect_context_flags: LinkStore<Node, EffectContextFlags>,
     pub effect_yield_generator_function: LinkStore<Node, CachedNode>,
 
-    pub discover_packages_computed: bool,
-    pub discover_packages_value: Vec<DiscoveredPackage>,
+    /// `discover_packages`, once computed.
+    pub discover_packages: Option<Rc<[DiscoveredPackage]>>,
     pub detect_effect_version_computed: bool,
     pub detect_effect_version_value: EffectMajorVersion,
     pub package_json_for_source_file: FxHashMap<Node, Option<PackageJsonRef>>,

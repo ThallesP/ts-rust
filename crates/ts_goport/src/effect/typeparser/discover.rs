@@ -68,7 +68,7 @@ impl TypeParser<'_> {
         let mut detected = EffectMajorVersion::Unknown;
         let mut found = false;
 
-        for pkg in &packages {
+        for pkg in packages.iter() {
             if pkg.name != "effect" {
                 continue;
             }
@@ -117,7 +117,7 @@ impl TypeParser<'_> {
         let mut detected = String::new();
         let mut found = false;
 
-        for pkg in &packages {
+        for pkg in packages.iter() {
             let Some(version) = &pkg.version else {
                 continue;
             };
@@ -144,14 +144,15 @@ impl TypeParser<'_> {
     /// Results are cached per checker so repeated calls within the same check cycle
     /// (from DetectEffectVersion, DetectEffectVersionString, duplicatePackage rule, etc.)
     /// do not re-scan all source files.
-    pub fn discover_packages(&mut self) -> Vec<DiscoveredPackage> {
-        if self.links().discover_packages_computed {
-            return self.links().discover_packages_value.clone();
+    // PERF: the cache shares one list; the duplicatePackage rule asks for it
+    // once per file (effperf3 item 9).
+    pub fn discover_packages(&mut self) -> Rc<[DiscoveredPackage]> {
+        if let Some(packages) = &self.links().discover_packages {
+            return packages.clone();
         }
 
-        let result = self.discover_packages_uncached();
-        self.links().discover_packages_value = result.clone();
-        self.links().discover_packages_computed = true;
+        let result: Rc<[DiscoveredPackage]> = self.discover_packages_uncached().into();
+        self.links().discover_packages = Some(result.clone());
         result
     }
 

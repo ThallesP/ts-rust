@@ -68,7 +68,7 @@ fn compute_duplicate_package_diags(
         dir: String,
     }
     let mut by_name: FxHashMap<String, Vec<VersionEntry>> = FxHashMap::default();
-    for pkg in &packages {
+    for pkg in packages.iter() {
         if pkg.name != "effect" && !pkg.depends_on_effect {
             continue;
         }
