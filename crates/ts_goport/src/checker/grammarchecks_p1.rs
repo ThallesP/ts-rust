@@ -1336,13 +1336,11 @@ impl Checker {
             // from one struct; `parameter_parts` reads them with one node data
             // load. Go's `AsParameterDeclaration` panics on another kind, and
             // so do the field accessors.
-            let parts = parameter
-                .parameter_parts()
-                .unwrap_or_else(|| ParameterParts {
-                    dot_dot_dot_token: parameter.dot_dot_dot_token(),
-                    question_token: parameter.question_token(),
-                    initializer: parameter.initializer(),
-                });
+            let parts = parameter_parts(parameter).unwrap_or_else(|| ParameterParts {
+                dot_dot_dot_token: parameter.dot_dot_dot_token(),
+                question_token: parameter.question_token(),
+                initializer: parameter.initializer(),
+            });
             if parts.dot_dot_dot_token.is_some() {
                 if i != parameter_count - 1 {
                     return self.grammar_error_on_node(
