@@ -122,6 +122,13 @@ const FLAG_COUNT_RESET: u8 = 4;
 /// on the entries older than the frame not matching (M6): used only while
 /// both stacks are empty.
 const FLAG_CONTEXT: u8 = 8;
+/// The frame passed a branch label that a reduce label of its file targets
+/// (a finally block's label, W4). Such a frame is not stored: an `on` mode
+/// lacks the shared entries of a hit's sub-walk, and walks their nodes again
+/// later in the walk, where an active reduce label can give such a label
+/// other antecedents than Go's entry saw. Kept per walk: shared entries
+/// belong to one walk.
+const FLAG_FINALLY: u8 = 16;
 
 #[derive(Clone, Copy, Default)]
 struct Slot {
@@ -284,6 +291,7 @@ stats!(
     refused_effects,
     refused_incomplete,
     refused_short,
+    refused_finally,
     shared_ends,
     region_tainted,
     saved_steps,
@@ -329,6 +337,8 @@ pub struct FlowMemo {
     frames: Vec<Frame>,
     checkpoints: Vec<FlowNodeId>,
     shared_meta: Vec<SharedMeta>,
+    /// Per file: the branch labels its reduce labels target.
+    finally_targets: FxHashMap<u32, Box<[FlowNodeId]>>,
     /// Verify regions (would-be hits whose sub-walk runs) now active.
     region: u32,
     /// `GOPORT_FLOWMEMO_STATS` is set: walks read the clock.
@@ -364,6 +374,7 @@ impl Default for FlowMemo {
             frames: Vec::new(),
             checkpoints: Vec::new(),
             shared_meta: Vec::new(),
+            finally_targets: FxHashMap::default(),
             region: 0,
             stats_on: stats_path().is_some(),
             region_walk: 0,
@@ -597,7 +608,7 @@ impl Checker {
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow_node: FlowNodeId,
-    ) -> u16 {
+    ) -> (u16, u8) {
         let (reference, declared, initial, container) = {
             let fb = f.borrow();
             (
@@ -622,11 +633,16 @@ impl Checker {
         } else {
             KEYLESS
         };
+        let finally = key != 0
+            && !self
+                .flow_memo_finally_targets(flow_node.file_index())
+                .is_empty();
         {
             let mut fb = f.borrow_mut();
             fb.memo_key = if key == 0 { keyless } else { key };
             fb.memo_walk = walk;
             fb.memo_impure = 0;
+            fb.memo_finally = finally;
         }
         let memo = &mut self.flow_memo;
         memo.bump(S::walks, 1);
@@ -637,14 +653,36 @@ impl Checker {
             memo.walk_time = Some(Instant::now());
         }
         memo.walk_depth += 1;
-        std::mem::take(&mut memo.regs.height)
+        let finally = memo.regs.flags & FLAG_FINALLY;
+        (std::mem::take(&mut memo.regs.height), finally)
     }
 
+    /// The branch labels that the reduce labels of static file `file`
+    /// target (empty for another file).
+    fn flow_memo_finally_targets(&mut self, file: usize) -> &[FlowNodeId] {
+        self.flow_memo
+            .finally_targets
+            .entry(file as u32)
+            .or_insert_with(|| {
+                let Some(flows) = static_go_file(file).and_then(|g| g.flow_nodes.get()) else {
+                    return Box::default();
+                };
+                flows
+                    .iter()
+                    .filter(|flow| flow.flags.intersects(FlowFlags::REDUCE_LABEL))
+                    .map(|flow| flow.antecedents[0])
+                    .collect()
+            })
+    }
+
+    /// Ends a walk in a memo mode: the enclosing frame's height and
+    /// `FLAG_FINALLY` come back (`saved` from `flow_memo_walk_begin`).
     #[cold]
     #[inline(never)]
-    pub(crate) fn flow_memo_walk_end(&mut self, saved_height: u16) {
+    pub(crate) fn flow_memo_walk_end(&mut self, saved: (u16, u8)) {
         let memo = &mut self.flow_memo;
-        memo.regs.height = saved_height;
+        memo.regs.height = saved.0;
+        memo.regs.flags = memo.regs.flags & !FLAG_FINALLY | saved.1;
         memo.walk_depth -= 1;
         if memo.walk_depth == 0 {
             if let Some(t0) = memo.walk_time.take() {
@@ -727,15 +765,21 @@ impl Checker {
         flow_data: &FlowNode,
         shared_flow: FlowNodeId,
     ) -> Option<FlowType> {
-        let (key, impure) = {
+        let (key, impure, finally) = {
             let fb = f.borrow();
-            (fb.memo_key, fb.memo_impure)
+            (fb.memo_key, fb.memo_impure, fb.memo_finally)
         };
         self.flow_memo.bump(S::steps, 1);
         if key == KEYLESS {
             return None;
         }
         self.flow_memo.bump(S::keyed_steps, 1);
+        if finally
+            && flow_data.flags.intersects(FlowFlags::BRANCH_LABEL)
+            && self.flow_memo.finally_targets[&(flow.file_index() as u32)].contains(&flow)
+        {
+            self.flow_memo.regs.flags |= FLAG_FINALLY;
+        }
         let frame = self.flow_memo.frames.last_mut()?;
         frame.own_steps += 1;
         if !frame.memo || self.flow_memo.region != 0 {
@@ -994,13 +1038,15 @@ impl Checker {
         if meta.lost && self.flow_memo.region == 0 {
             // An `on` mode does not have this entry: this frame walks the
             // node again. That walk equals the one Go's entry stands for only
-            // in the same state (W4): no reduce label (`getBranchLabelAntecedents`
-            // reads them, and a region has none), no loop analysis, the same
+            // in the same state (W4): no active reduce label that targets a
+            // label the entry passed (`getBranchLabelAntecedents` reads them;
+            // a region has none, `FLAG_FINALLY`), no loop analysis, the same
             // `flowTypeCache` when the entry read it, room below the depth
             // limit, and an entry that consumed no transient value and made
             // nothing.
-            let problem = if !f.borrow().reduce_labels.is_empty() {
-                Some("a reduce label is active")
+            let problem = if !f.borrow().reduce_labels.is_empty() && meta.flags & FLAG_FINALLY != 0
+            {
+                Some("a reduce label is active and the entry passed a label it can target")
             } else if !self.flow_loop_stack.is_empty() {
                 Some("loop analysis is active")
             } else if meta.flags & FLAG_TYPE_CACHE != 0 && meta.epoch != self.flow_memo.epoch {
@@ -1107,6 +1153,8 @@ impl Checker {
             Some(S::refused_effects)
         } else if t.incomplete || self.flow_analysis_disabled {
             Some(S::refused_incomplete)
+        } else if taint.flags & FLAG_FINALLY != 0 {
+            Some(S::refused_finally)
         } else if height == 0 && frame.own_steps < 4 && hit_node.is_nil() {
             // A short iteration without recursion costs less to walk again.
             Some(S::refused_short)

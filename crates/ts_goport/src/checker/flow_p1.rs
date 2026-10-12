@@ -92,6 +92,8 @@ pub struct FlowState {
     pub memo_walk: u32,
     /// flowmemo1: `sharedFlows` entries of this walk with a transient taint.
     pub memo_impure: u32,
+    /// flowmemo1: the walk's file has reduce labels (`FLAG_FINALLY`).
+    pub memo_finally: bool,
 }
 
 impl Checker {
@@ -246,14 +248,14 @@ impl Checker {
             fb.shared_flow_start = self.shared_flows.len() as i32;
         }
         let memo = self.flow_memo.mode != FlowMemoMode::Off;
-        let saved_height = if memo {
+        let saved = if memo {
             self.flow_memo_walk_begin(&f, flow_node)
         } else {
-            0
+            (0, 0)
         };
         let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
         if memo {
-            self.flow_memo_walk_end(saved_height);
+            self.flow_memo_walk_end(saved);
         }
         let shared_flow_start = f.borrow().shared_flow_start as usize;
         self.shared_flows.truncate(shared_flow_start);
