@@ -27,7 +27,8 @@
 # shared target do not change the run, and the run does not change them.
 #
 # Suites (results.json "suites" keys):
-#   lib_snapshot                  ts_goport_lib snapshot_matches_live (the 2 lib snapshot tests, first)
+#   lib_snapshot                  goport_core_lib (ts_goport_lib before crate split step 2)
+#                                 snapshot_matches_live (the 2 lib snapshot tests, first)
 #   <suite>                       each test binary of SUITES, by name (ts_goport_lib, goport_util_lib,
 #                                 go_baselines (the default set), multi_program, ts_scanner_lib, ...)
 #   go_baselines_local            TestLocal subtests, "<kind> <key>" (COMPILER_RUNNER_RESULTS rows)
@@ -170,7 +171,10 @@ suite() {
 echo "== goport tests: $TB (${COMMIT:0:9}, crates tree ${tree:0:12}), pin $pin, Go $GO, out $O"
 [[ $layout == typescript-go ]] || echo "layout $layout: $shard_test runs in 4 shards"
 state before
-[[ -z ${crate_dir[ts_goport_lib]+x} ]] || suite lib_snapshot ts_goport_lib 1200 snapshot_matches_live
+# The 2 lib snapshot tests are in goport_core_lib from crate split step 2, in ts_goport_lib before.
+snapshot_bin=ts_goport_lib
+[[ -z ${crate_dir[goport_core_lib]+x} ]] || snapshot_bin=goport_core_lib
+[[ -z ${crate_dir[$snapshot_bin]+x} ]] || suite lib_snapshot "$snapshot_bin" 1200 snapshot_matches_live
 for s in "${suites[@]}"; do
   if [[ $s != go_baselines ]]; then
     suite "$s" "$s" 1800

@@ -43,8 +43,8 @@ fi
 # - When the nightly is not installed, an edit-loop build stops here with the
 #   install command: a quiet fallback to the default toolchain made builds
 #   slower with no error.
-# - TS_CARGO_INCREMENTAL unset: incremental ts_goport and its parts (goport_util,
-#   goport_lsproto) in edit-loop builds only.
+# - TS_CARGO_INCREMENTAL unset: incremental ts_goport and its parts (goport_core,
+#   goport_util, goport_lsproto) in edit-loop builds only.
 #   Other crates stay non-incremental, so sccache still caches them. 0 turns it
 #   off, 1 turns it on for every workspace crate.
 goport_profile=0
@@ -216,6 +216,8 @@ case "$incremental" in
       --config profile.release.package.goport_util.incremental=true
       --config profile.dev.package.goport_lsproto.incremental=true
       --config profile.release.package.goport_lsproto.incremental=true
+      --config profile.dev.package.goport_core.incremental=true
+      --config profile.release.package.goport_core.incremental=true
     )
     ;;
   *)
