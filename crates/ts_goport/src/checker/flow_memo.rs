@@ -52,6 +52,23 @@ pub fn flow_memo_mode_from_env() -> FlowMemoMode {
     })
 }
 
+/// The gates of the use rule, in the order `flow_memo_turn` tests them.
+const GATE_NAMES: [&str; 8] = [
+    "loop", "mapper", "epoch", "count", "impure", "height", "disabled", "context",
+];
+
+/// `GOPORT_FLOWMEMO_DROP`: a comma list of `GATE_NAMES` that verify mode
+/// does not apply (a stress test: a needed gate makes verify panic).
+fn dropped_gates() -> u16 {
+    static DROP: OnceLock<u16> = OnceLock::new();
+    *DROP.get_or_init(|| {
+        let list = std::env::var("GOPORT_FLOWMEMO_DROP").unwrap_or_default();
+        list.split(',')
+            .filter_map(|name| GATE_NAMES.iter().position(|g| *g == name.trim()))
+            .fold(0, |bits, i| bits | 1 << i)
+    })
+}
+
 fn table_bits() -> u32 {
     static BITS: OnceLock<u32> = OnceLock::new();
     *BITS.get_or_init(|| {
@@ -160,6 +177,9 @@ struct Hit {
     snapshot: Snapshot,
     steps: u64,
     time: Instant,
+    /// Gates (bits by `GATE_NAMES`) that would have blocked the hit, dropped
+    /// by `GOPORT_FLOWMEMO_DROP`.
+    bypassed: u16,
 }
 
 struct Frame {
@@ -246,6 +266,7 @@ stats!(
     saved_frames,
     lost_shared,
     lost_steps,
+    bypassed,
     context_reads,
     context_found_old,
     init_fallback,
@@ -275,6 +296,9 @@ pub struct FlowMemo {
     pub misses: u64,
     /// `get_narrowable_type_for_reference` reads of the reference position.
     pub position_reads: u64,
+    /// Verify: gates of the use rule that are not applied (bits by
+    /// `GATE_NAMES`).
+    dropped: u16,
     slots: Vec<Slot>,
     keys: FxHashMap<MemoKey, u32>,
     frames: Vec<Frame>,
@@ -295,8 +319,14 @@ pub struct FlowMemo {
 
 impl Default for FlowMemo {
     fn default() -> Self {
+        let mode = flow_memo_mode_from_env();
         FlowMemo {
-            mode: flow_memo_mode_from_env(),
+            mode,
+            dropped: if mode == FlowMemoMode::Verify {
+                dropped_gates()
+            } else {
+                0
+            },
             serial: 1,
             regs: FRESH,
             epoch: UNTAINTED,
@@ -662,32 +692,47 @@ impl Checker {
             return;
         };
         self.flow_memo.bump(S::found, 1);
-        let blocked = if !self.flow_loop_stack.is_empty() {
-            Some(S::blocked_loop)
-        } else if !self.active_mappers.is_empty() {
-            Some(S::blocked_mapper)
-        } else if slot.epoch != 0 && slot.epoch != self.flow_memo.epoch {
-            Some(S::blocked_epoch)
-        } else if slot.count_reset && self.instantiation_count != 0 {
-            Some(S::blocked_count)
-        } else if impure != 0 {
-            Some(S::blocked_impure)
-        } else if entry_depth + i32::from(slot.height) >= DEPTH_LIMIT {
-            Some(S::blocked_height)
-        } else if self.flow_analysis_disabled {
+        // The use rule, gate by gate, in `GATE_NAMES` order. Verify can drop
+        // gates (`GOPORT_FLOWMEMO_DROP`) to show that each one is needed.
+        let gates = [
+            (!self.flow_loop_stack.is_empty(), S::blocked_loop),
+            (!self.active_mappers.is_empty(), S::blocked_mapper),
+            (
+                slot.epoch != 0 && slot.epoch != self.flow_memo.epoch,
+                S::blocked_epoch,
+            ),
+            (
+                slot.count_reset && self.instantiation_count != 0,
+                S::blocked_count,
+            ),
+            (impure != 0, S::blocked_impure),
+            (
+                entry_depth + i32::from(slot.height) >= DEPTH_LIMIT,
+                S::blocked_height,
+            ),
             // A nested walk reached the depth limit in this frame: Go's walk
             // from here gets errorType from every nested walk (M1).
-            Some(S::blocked_disabled)
-        } else if slot.context
-            && !(self.contextual_infos.is_empty() && self.inference_context_infos.is_empty())
-        {
-            Some(S::blocked_context)
-        } else {
-            None
-        };
-        if let Some(reason) = blocked {
-            self.flow_memo.bump(reason, 1);
-            return;
+            (self.flow_analysis_disabled, S::blocked_disabled),
+            (
+                slot.context
+                    && !(self.contextual_infos.is_empty()
+                        && self.inference_context_infos.is_empty()),
+                S::blocked_context,
+            ),
+        ];
+        let mut bypassed = 0u16;
+        for (i, (closed, stat)) in gates.into_iter().enumerate() {
+            if closed {
+                if self.flow_memo.dropped & (1 << i) != 0 {
+                    bypassed |= 1 << i;
+                    continue;
+                }
+                self.flow_memo.bump(stat, 1);
+                return;
+            }
+        }
+        if bypassed != 0 {
+            self.flow_memo.bump(S::bypassed, 1);
         }
         self.flow_memo.bump(S::hits, 1);
         // Verify: Go's walk runs on; the frame's end checks it.
@@ -699,6 +744,7 @@ impl Checker {
             snapshot: self.flow_memo_snapshot(),
             steps: self.flow_memo.stats[S::steps as usize],
             time: Instant::now(),
+            bypassed,
         };
         self.flow_memo.regs = FRESH;
         self.flow_memo.region += 1;
@@ -799,7 +845,14 @@ impl Checker {
         } else {
             None
         };
-        if let Some(problem) = problem {
+        if let Some(mut problem) = problem {
+            if hit.bypassed != 0 {
+                let names: Vec<&str> = (0..GATE_NAMES.len())
+                    .filter(|i| hit.bypassed & (1 << i) != 0)
+                    .map(|i| GATE_NAMES[i])
+                    .collect();
+                problem.push_str(&format!(" (dropped gates passed: {})", names.join(",")));
+            }
             self.flow_memo_panic(f, hit.node, &problem);
         }
         let memo = &mut self.flow_memo;
