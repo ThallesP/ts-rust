@@ -1099,8 +1099,12 @@ impl Checker {
             && self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
                 c.is_generic_type_with_union_constraint(t)
             })
-            && (self.is_constraint_position(t, reference)
-                || self.has_contextual_type_with_no_generic_types(reference, check_mode));
+            && {
+                // flowmemo1: the position of the reference is read.
+                self.flow_memo.position_reads += 1;
+                self.is_constraint_position(t, reference)
+                    || self.has_contextual_type_with_no_generic_types(reference, check_mode)
+            };
         if substitute_constraints {
             return self.map_type(t, &mut |c: &mut Checker, t: TypeId| {
                 c.get_base_constraint_or_type(t)

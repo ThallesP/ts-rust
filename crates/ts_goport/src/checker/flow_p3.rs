@@ -158,6 +158,7 @@ impl Checker {
         self.flow_skip.effects += 1;
         let state = self.switch_statement_links.get(node).exhaustive_state;
         if state == ExhaustiveState::UNKNOWN {
+            self.flow_memo.misses += 1;
             // Indicate resolution is in process
             self.switch_statement_links.get(node).exhaustive_state = ExhaustiveState::COMPUTING;
             let is_exhaustive = self.compute_exhaustive_switch_statement(node);
@@ -170,6 +171,8 @@ impl Checker {
                 };
             }
         } else if state == ExhaustiveState::COMPUTING {
+            // flowmemo1: a transient state.
+            self.flow_memo.taint(0);
             // Resolve circularity to false
             self.switch_statement_links.get(node).exhaustive_state = ExhaustiveState::FALSE;
         }
@@ -314,6 +317,7 @@ impl Checker {
         if signature.is_nil() {
             // flowskip1 verify: an effect site (flow_skip.rs).
             self.flow_skip.effects += 1;
+            self.flow_memo.misses += 1;
             // A call expression parented by an expression statement is a potential assertion. Other call
             // expressions are potential type predicate function calls. In order to avoid triggering
             // circularities in control flow analysis, we use getTypeOfDottedName when resolving the call
@@ -1287,6 +1291,7 @@ impl Checker {
             links.flags |= NodeCheckFlags::ASSIGNMENTS_MARKED;
             // flowskip1 verify: an effect site (flow_skip.rs).
             self.flow_skip.effects += 1;
+            self.flow_memo.misses += 1;
             if !self.has_parent_with_assignments_marked(parent) {
                 let mark_node_assignments = self.mark_node_assignments.clone();
                 mark_node_assignments(self, parent);

@@ -1462,6 +1462,8 @@ impl Checker {
         // that could cause infinite recursion. Instead, return anySignature.
         let signature;
         if self.signature_links.get(call_target).resolved_signature == self.resolving_signature {
+            // flowmemo1: a transient marker.
+            self.flow_memo.taint(0);
             signature = self.resolving_signature;
         } else {
             signature = self.get_resolved_signature(call_target, None, CheckMode::NORMAL);

@@ -290,6 +290,8 @@ pub struct FlowLoopKey {
 pub struct FlowLoopInfo {
     pub key: FlowLoopKey,
     pub types: Vec<TypeId>,
+    /// flowmemo1: the entry's taint source (flow_memo.rs).
+    pub memo_serial: u32,
 }
 
 // InferenceContext
@@ -1179,6 +1181,8 @@ pub struct Checker {
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
     /// flowskip1: the index and state of the flow walk skip (flow_skip.rs).
     pub flow_skip: crate::checker::flow_skip::FlowSkip,
+    /// flowmemo1: the flow memo, verify mode only (flow_memo.rs).
+    pub flow_memo: crate::checker::flow_memo::FlowMemo,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
     /// `record_merged_symbol`), so a memo of a merged symbol or of the flags
     /// a merge adds knows when to read them again (`MatchingReferenceMemo`,
@@ -1685,6 +1689,7 @@ impl Checker {
             alternative_module_import_misses: FxHashSet::default(),
             matching_reference_memo: Default::default(),
             flow_skip: Default::default(),
+            flow_memo: Default::default(),
             merge_version: 0,
             union_subset_answers: FxHashMap::default(),
             fast_never_order: crate::checker::checker_p24::fast_never_order_from_env(),

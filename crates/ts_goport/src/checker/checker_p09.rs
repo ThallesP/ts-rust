@@ -1494,6 +1494,12 @@ impl Checker {
         {
             return cached;
         }
+        // flowmemo1: a resolution that runs (an effect site), and a
+        // re-entered one reads a transient marker.
+        self.flow_memo.misses += 1;
+        if cached == self.resolving_signature {
+            self.flow_memo.taint(0);
+        }
         let save_resolution_start = self.resolution_start;
         if cached.is_nil() {
             // If we haven't already done so, temporarily reset the resolution stack. This allows us to
@@ -1527,6 +1533,8 @@ impl Checker {
                 self.signature_links.get(node).resolved_signature = result;
             } else {
                 self.signature_links.get(node).resolved_signature = cached;
+                // flowmemo1: a later walk resolves it again.
+                self.flow_memo_taint_loop_top();
             }
         }
         result

@@ -196,6 +196,7 @@ impl Checker {
             }
             return false;
         }
+        self.flow_memo.misses += 1;
         self.type_resolutions.push(TypeResolution {
             target,
             property_name,
@@ -228,6 +229,11 @@ impl Checker {
                 return -1;
             }
             if resolution.target == target && resolution.property_name == property_name {
+                // flowmemo1: frames younger than the entry read a transient
+                // result.
+                if self.flow_memo.mode != FlowMemoMode::Off {
+                    self.flow_memo_resolution_cycle(i as usize);
+                }
                 return i;
             }
             i -= 1;

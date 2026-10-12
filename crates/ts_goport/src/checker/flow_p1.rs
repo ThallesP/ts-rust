@@ -85,6 +85,13 @@ pub struct FlowState {
     pub shared_flow_start: i32,
     pub reduce_labels: Vec<ReduceLabel>,
     pub next: Option<Rc<RefCell<FlowState>>>,
+    /// flowmemo1 (flow_memo.rs): the walk's memo key id, `KEYLESS` for a
+    /// memo walk without a key, 0 when the memo is off.
+    pub memo_key: u32,
+    /// flowmemo1: the walk's serial (source of its reference taint).
+    pub memo_walk: u32,
+    /// flowmemo1: `sharedFlows` entries of this walk with a transient taint.
+    pub memo_impure: u32,
 }
 
 impl Checker {
@@ -238,7 +245,16 @@ impl Checker {
             fb.flow_container = flow_container;
             fb.shared_flow_start = self.shared_flows.len() as i32;
         }
+        let memo = self.flow_memo.mode != FlowMemoMode::Off;
+        let saved_height = if memo {
+            self.flow_memo_walk_begin(&f)
+        } else {
+            0
+        };
         let evolved_type = self.get_type_at_flow_node(&f, flow_node).t;
+        if memo {
+            self.flow_memo_walk_end(saved_height);
+        }
         let shared_flow_start = f.borrow().shared_flow_start as usize;
         self.shared_flows.truncate(shared_flow_start);
         self.put_flow_state(f);
@@ -246,15 +262,47 @@ impl Checker {
     }
 
     // Go: checker/flow.go:117 getTypeAtFlowNode
+    // flowmemo1: a walk in a memo mode (`memo_key != 0`, flow_memo.rs) takes
+    // the copy of the walk with the memo hooks; the plain copy has none.
     pub fn get_type_at_flow_node(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,
     ) -> FlowType {
+        let (depth, memo_key) = {
+            let fb = f.borrow();
+            (fb.depth, fb.memo_key)
+        };
+        if memo_key != 0 {
+            return self.get_type_at_flow_node_memo(f, flow, depth);
+        }
+        self.get_type_at_flow_node_impl::<false>(f, flow, depth)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn get_type_at_flow_node_memo(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        depth: i32,
+    ) -> FlowType {
+        self.get_type_at_flow_node_impl::<true>(f, flow, depth)
+    }
+
+    #[inline(always)]
+    fn get_type_at_flow_node_impl<const MEMO: bool>(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        depth: i32,
+    ) -> FlowType {
         let mut flow = flow;
-        if f.borrow().depth == 2000 {
+        if depth == 2000 {
             // We have made 2000 recursive invocations. To avoid overflowing the call stack we report an error
             // and disable further control flow analysis in the containing function or module body.
+            // flowmemo1: the limit taints every active frame.
+            self.flow_memo.taint(0);
             if let Some(tr) = self.tracer {
                 let depth = f.borrow().depth;
                 tr.instant(
@@ -272,6 +320,10 @@ impl Checker {
             };
         }
         f.borrow_mut().depth += 1;
+        // flowmemo1: a frame of a keyed walk (flow_memo.rs).
+        if MEMO {
+            self.flow_memo_begin(f, flow, depth);
+        }
         let mut shared_flow = FlowNodeId::NIL;
         // PERF: lsshells M3b. No guard for a static file (`get_flow_in`).
         // lsshells M3 repair: one guard for the whole walk, so the steps in
@@ -280,10 +332,17 @@ impl Checker {
         // flowskip1 verify mode: record each loop turn (read once per call;
         // a nested verify restores the recording before it returns).
         let recording = self.flow_skip.recording.is_some();
+        // flowmemo1: memo walks count and consult at each loop turn.
+        let hooks = recording || MEMO;
         loop {
-            if recording {
-                let depth = f.borrow().depth;
-                self.flow_skip_record(flow, depth);
+            if hooks {
+                if recording {
+                    let depth = f.borrow().depth;
+                    self.flow_skip_record(flow, depth);
+                }
+                if MEMO {
+                    self.flow_memo_turn(f, flow);
+                }
             }
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
@@ -295,6 +354,9 @@ impl Checker {
                 for i in start..self.shared_flows.len() {
                     if self.shared_flows[i].flow == flow {
                         f.borrow_mut().depth -= 1;
+                        if MEMO {
+                            self.flow_memo_end_shared(f, i);
+                        }
                         return self.shared_flows[i].flow_type;
                     }
                 }
@@ -339,6 +401,9 @@ impl Checker {
                     continue;
                 }
             } else if flags.intersects(FlowFlags::REDUCE_LABEL) {
+                // flowmemo1: Go's sharedFlows keep what a shared node got
+                // under a reduce label for the rest of the walk.
+                self.flow_memo.taint(0);
                 f.borrow_mut()
                     .reduce_labels
                     .push(ReduceLabel::of(flow_data));
@@ -386,6 +451,10 @@ impl Checker {
                 });
             }
             f.borrow_mut().depth -= 1;
+            if MEMO {
+                let shared = shared_flow.is_some().then(|| self.shared_flows.len() - 1);
+                self.flow_memo_end(f, flow, t, shared);
+            }
             return t;
         }
     }
@@ -539,16 +608,18 @@ impl Checker {
         node: Node,
     ) -> TypeId {
         let reference = f.borrow().reference;
-        if is_variable_declaration(node) || is_binding_element(node) {
-            let initial_type = self.get_initial_type(node);
-            return self.get_narrowable_type_for_reference(
-                initial_type,
-                reference,
-                CheckMode::NORMAL,
-            );
+        let t = if is_variable_declaration(node) || is_binding_element(node) {
+            self.get_initial_type(node)
+        } else {
+            self.get_assigned_type(node)
+        };
+        // flowmemo1: a read of the reference's position is a reference taint.
+        let position_reads = self.flow_memo.position_reads;
+        let t = self.get_narrowable_type_for_reference(t, reference, CheckMode::NORMAL);
+        if self.flow_memo.position_reads != position_reads {
+            self.flow_memo_reference_read(f);
         }
-        let assigned_type = self.get_assigned_type(node);
-        self.get_narrowable_type_for_reference(assigned_type, reference, CheckMode::NORMAL)
+        t
     }
 
     // Go: checker/flow.go:283 isEmptyArrayAssignment
@@ -757,7 +828,12 @@ impl Checker {
                     // When narrowing a reference to a const variable, non-assigned parameter, or readonly property, we inline
                     // up to five levels of aliased conditional expressions that are themselves declared as const variables.
                     let reference = f.borrow().reference;
-                    if !self.is_matching_reference(reference, expr) && self.inline_level < 5 {
+                    let matching = self.is_matching_reference(reference, expr);
+                    if !matching && self.inline_level >= 5 {
+                        // flowmemo1: the inline limit taints every active frame.
+                        self.flow_memo.taint(0);
+                    }
+                    if !matching && self.inline_level < 5 {
                         let symbol = self.get_resolved_symbol(expr);
                         if self.is_constant_variable(symbol) {
                             let declaration = self.sym(symbol).value_declaration;
@@ -765,7 +841,15 @@ impl Checker {
                                 && is_variable_declaration(declaration)
                                 && declaration.type_().is_nil()
                                 && declaration.initializer().is_some()
-                                && self.is_constant_reference(reference)
+                                && {
+                                    let constant = self.is_constant_reference(reference);
+                                    // flowmemo1: for an access reference this read
+                                    // the symbol that node resolved to.
+                                    if f.borrow().reference_is_access {
+                                        self.flow_memo_reference_read(f);
+                                    }
+                                    constant
+                                }
                             {
                                 self.inline_level += 1;
                                 let result =

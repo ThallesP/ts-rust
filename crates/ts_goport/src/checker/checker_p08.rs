@@ -1323,6 +1323,7 @@ impl Checker {
         // If a type has been cached for the node, return it.
         if let Some(&cached_type) = self.flow_type_cache.get(&node) {
             if cached_type.is_some() {
+                self.flow_memo.type_cache_used();
                 return cached_type;
             }
         }
@@ -1332,6 +1333,7 @@ impl Checker {
         if self.flow_invocation_count != start_invocation_count {
             // PORT: Go lazily makes the nil map; the Rust map always exists.
             self.flow_type_cache.insert(node, t);
+            self.flow_memo.type_cache_used();
         }
         t
     }
@@ -1603,11 +1605,14 @@ impl Checker {
             // analysis because variables may have transient types in indeterminable states. Moving flowLoopStart
             // to the top of the stack ensures all transient types are computed from a known point.
             // PORT: Go nil-assigns the stack and cache; `mem::take` leaves them empty.
+            self.flow_memo.misses += 1;
             let save_flow_loop_stack = std::mem::take(&mut self.flow_loop_stack);
             let save_flow_type_cache = std::mem::take(&mut self.flow_type_cache);
+            let save_epoch = self.flow_memo.type_cache_reset();
             let t = self.check_expression_ex(node, check_mode);
             self.type_node_links.get(node).resolved_type = t;
             self.flow_type_cache = save_flow_type_cache;
+            self.flow_memo.epoch = save_epoch;
             self.flow_loop_stack = save_flow_loop_stack;
         }
         self.type_node_links.get(node).resolved_type

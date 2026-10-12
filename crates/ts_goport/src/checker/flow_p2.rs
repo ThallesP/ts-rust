@@ -651,8 +651,11 @@ impl Checker {
             .flow_loop_stack
             .iter()
             .find(|loop_info| loop_info.key == key && !loop_info.types.is_empty())
-            .map(|loop_info| loop_info.types.clone());
-        if let Some(loop_types) = in_process {
+            .map(|loop_info| (loop_info.types.clone(), loop_info.memo_serial));
+        if let Some((loop_types, serial)) = in_process {
+            // flowmemo1: frames younger than the stack entry read a
+            // transient value.
+            self.flow_memo.taint(serial);
             let union =
                 self.get_union_or_evolving_array_type(f, &loop_types, UnionReduction::LITERAL);
             return self.new_flow_type(union, true /*incomplete*/);
@@ -681,15 +684,19 @@ impl Checker {
                 // PORT: Go appends a slice header that shares `antecedentTypes`; this
                 // frame does not change `antecedentTypes` while the entry is on the
                 // stack, so a copy is equivalent.
+                let memo_serial = self.flow_memo.next_serial();
                 self.flow_loop_stack.push(FlowLoopInfo {
                     key,
                     types: antecedent_types.clone(),
+                    memo_serial,
                 });
                 // PORT: Go sets `c.flowTypeCache = nil`; the map field is taken and
                 // restored instead.
                 let save_flow_type_cache = std::mem::take(&mut self.flow_type_cache);
+                let save_epoch = self.flow_memo.type_cache_reset();
                 flow_type = self.get_type_at_flow_node(f, antecedent);
                 self.flow_type_cache = save_flow_type_cache;
+                self.flow_memo.epoch = save_epoch;
                 self.flow_loop_stack.pop();
                 // If we see a value appear in the cache it is a sign that control flow analysis
                 // was restarted and completed by checkExpressionCached. We can simply pick up
