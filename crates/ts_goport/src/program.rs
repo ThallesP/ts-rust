@@ -3596,6 +3596,10 @@ fn start_checkers(count: usize) -> CheckerPool {
     let claims = arena
         .is_none()
         .then(Arc::<crate::jemalloc_layout::ArenaClaims>::default);
+    #[cfg(all(feature = "jemalloc", target_os = "linux"))]
+    if let Some(claims) = &claims {
+        crate::jemalloc_layout::start_prefault(claims, count);
+    }
     let carry_from = symbol_id_carry_start(count);
     let (workers, threads): (Vec<_>, Vec<_>) = (0..count)
         .map(|index| {

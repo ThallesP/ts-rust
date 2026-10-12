@@ -190,3 +190,65 @@ impl ArenaClaims {
         }
     }
 }
+
+/// The name of the prefault thread (`start_prefault`).
+pub const PREFAULT_NAME: &str = "prefault";
+
+/// PERF (prezero1, experiment): a thread that keeps faulted free memory in
+/// the arenas of the checkers of one pool, so a checker takes memory that
+/// the kernel has zeroed already, on another core. Each round it moves to
+/// each arena that a checker of the pool holds, allocates `GOPORT_PREFAULT_KIB`
+/// (default 4096) KiB in chunks of `GOPORT_PREFAULT_CHUNK_KIB` (default
+/// 1024), writes one byte in each 4 KiB page and frees them. jemalloc gives
+/// a later allocation of the arena that freed memory first (its dirty
+/// extents), before memory that no thread has touched. It waits
+/// `GOPORT_PREFAULT_US` (default 1000) between rounds and ends with the pool.
+/// `GOPORT_PREFAULT=0` turns it off; it does not start without a core to
+/// spare.
+pub fn start_prefault(claims: &std::sync::Arc<ArenaClaims>, checkers: usize) {
+    let var = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    if std::env::var_os("GOPORT_PREFAULT").is_some_and(|v| v == "0")
+        || std::thread::available_parallelism().map_or(0, usize::from) <= checkers
+    {
+        return;
+    }
+    let chunk = var("GOPORT_PREFAULT_CHUNK_KIB", 1024).max(16) << 10;
+    let chunks = (var("GOPORT_PREFAULT_KIB", 4096) << 10).div_ceil(chunk);
+    let wait = std::time::Duration::from_micros(var("GOPORT_PREFAULT_US", 1000) as u64);
+    let pool = std::sync::Arc::downgrade(claims);
+    let _ = std::thread::Builder::new()
+        .name(PREFAULT_NAME.into())
+        .stack_size(256 << 10)
+        .spawn(move || {
+            let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(chunks);
+            loop {
+                let Some(claims) = pool.upgrade() else {
+                    return;
+                };
+                let held = *claims.held.lock().unwrap_or_else(PoisonError::into_inner);
+                drop(claims);
+                let mut arenas = held;
+                while arenas != 0 {
+                    let arena = arenas.trailing_zeros();
+                    arenas &= arenas - 1;
+                    if b"thread.arena\0".name().write(arena).is_err() {
+                        return;
+                    }
+                    for _ in 0..chunks {
+                        let mut buf = Vec::<u8>::with_capacity(chunk);
+                        for page in buf.spare_capacity_mut().iter_mut().step_by(4096) {
+                            page.write(0);
+                        }
+                        bufs.push(std::hint::black_box(buf));
+                    }
+                    bufs.clear();
+                }
+                std::thread::sleep(wait);
+            }
+        });
+}
