@@ -438,11 +438,16 @@ impl FlowMemo {
     }
 
     /// Adds the counts since the last flush to the process totals and writes
-    /// the totals to the stats file.
-    fn flush(&mut self) {
+    /// the totals to the stats file. Called at the end of each checked file
+    /// (`check_source_file`) and when the checker is dropped, so the file
+    /// has every count when the process exits without dropping checkers.
+    /// One lock for the add and the write: the last write has the totals.
+    pub fn flush(&mut self) {
         let Some(path) = stats_path() else {
             return;
         };
+        static WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = WRITE.lock().unwrap_or_else(|e| e.into_inner());
         for i in 0..STATS {
             STATS_TOTAL[i].fetch_add(self.stats[i] - self.flushed[i], Ordering::Relaxed);
         }
@@ -585,9 +590,6 @@ impl Checker {
                 memo.bump(S::flow_ns, t0.elapsed().as_nanos() as u64);
             }
             memo.outer_walks += 1;
-            if memo.outer_walks % 256 == 0 {
-                memo.flush();
-            }
         }
     }
 
@@ -953,8 +955,14 @@ impl Checker {
         }
         if meta.transient != UNTAINTED {
             let source = meta.transient;
-            // A resolution cycle's source is not an entry's serial
-            // (`flow_memo_resolution_cycle`): it counts as not live.
+            // The source is live when it is a loop stack entry still on the
+            // stack: only the frames younger than it are tainted. Any other
+            // source (0, or a resolution cycle's serial before a frame's
+            // start, `flow_memo_resolution_cycle`) taints every frame. A cycle
+            // source can equal the serial of a loop entry pushed just before
+            // that frame began; that entry is younger than the resolution, so
+            // while it is live the resolution is too, and the frames younger
+            // than it are the frames the cycle tainted.
             let live = source != 0 && self.flow_loop_stack.iter().any(|l| l.memo_serial == source);
             self.flow_memo.taint(if live { source } else { 0 });
         }

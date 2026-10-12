@@ -258,6 +258,10 @@ impl Checker {
             self.produce_deferred_diagnostics();
             self.reported_unreachable_nodes.clear();
             self.source_file_links.get(source_file).type_checked = true;
+            // flowmemo1: the stats file has the counts of every checked file.
+            if self.flow_memo.mode != FlowMemoMode::Off {
+                self.flow_memo.flush();
+            }
         }
         // Effect-TS/tsgo patch 002 runs the Effect rules inside the block above, before the
         // unused check. Their type queries can mark a symbol referenced (for example the
