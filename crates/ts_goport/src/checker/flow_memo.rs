@@ -132,9 +132,9 @@ const FLAG_FINALLY: u8 = 16;
 
 #[derive(Clone, Copy, Default)]
 struct Slot {
+    /// NIL: empty.
     flow: FlowNodeId,
-    /// 0: empty.
-    key: u32,
+    key: FlowMemoKey,
     t: TypeId,
     height: u16,
     count_reset: bool,
@@ -243,16 +243,23 @@ struct Frame {
     hit: Option<Box<Hit>>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct MemoKey {
+/// The exact key of a walk's reference (design 4.1), kept in each slot (no
+/// interning per walk: most keys are new, and a map of them cost VS Code
+/// about 2% of cycles).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FlowMemoKey {
     /// Root symbol, or `u32::MAX` for `this`.
     root: u32,
+    /// The property names from the reference down to the root, interned
+    /// (`FlowMemo::names`); 0 for none.
+    names: u32,
     declared: TypeId,
     initial: TypeId,
     container: Node,
-    /// Property names from the reference down to the root.
-    names: SmallVec<[&'static str; 4]>,
 }
+
+/// `FlowState::memo_key` of a walk with a key (`FlowState::memo_full`).
+pub const KEYED: u32 = 1;
 
 macro_rules! stats {
     ($($name:ident),* $(,)?) => {
@@ -333,7 +340,8 @@ pub struct FlowMemo {
     /// `GATE_NAMES`).
     dropped: u16,
     slots: Vec<Slot>,
-    keys: FxHashMap<MemoKey, u32>,
+    /// Interned property name chains of access references.
+    names: FxHashMap<SmallVec<[&'static str; 4]>, u32>,
     frames: Vec<Frame>,
     checkpoints: Vec<FlowNodeId>,
     shared_meta: Vec<SharedMeta>,
@@ -370,7 +378,7 @@ impl Default for FlowMemo {
             misses: 0,
             position_reads: 0,
             slots: Vec::new(),
-            keys: FxHashMap::default(),
+            names: FxHashMap::default(),
             frames: Vec::new(),
             checkpoints: Vec::new(),
             shared_meta: Vec::new(),
@@ -392,7 +400,7 @@ impl std::fmt::Debug for FlowMemo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FlowMemo")
             .field("mode", &self.mode)
-            .field("keys", &self.keys.len())
+            .field("names", &self.names.len())
             .finish_non_exhaustive()
     }
 }
@@ -470,24 +478,31 @@ impl FlowMemo {
         self.stats[s as usize] += n;
     }
 
-    fn slot_index(&self, flow: FlowNodeId, key: u32) -> usize {
-        let h = flow.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(key).rotate_left(29);
-        (h.wrapping_mul(0xFF51_AFD7_ED55_8CCD) >> 32) as usize & (self.slots.len() - 1)
+    fn slot_index(&self, flow: FlowNodeId, key: &FlowMemoKey) -> usize {
+        let mut h = flow.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for w in [
+            u64::from(key.root) | u64::from(key.names) << 32,
+            u64::from(key.declared.0) | u64::from(key.initial.0) << 32,
+            key.container.0,
+        ] {
+            h = (h ^ w).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29);
+        }
+        (h >> 32) as usize & (self.slots.len() - 1)
     }
 
-    fn lookup(&self, flow: FlowNodeId, key: u32) -> Option<Slot> {
+    fn lookup(&self, flow: FlowNodeId, key: &FlowMemoKey) -> Option<Slot> {
         if self.slots.is_empty() {
             return None;
         }
         let slot = self.slots[self.slot_index(flow, key)];
-        (slot.key == key && slot.flow == flow).then_some(slot)
+        (slot.flow == flow && slot.key == *key).then_some(slot)
     }
 
     fn store(&mut self, slot: Slot) {
         if self.slots.is_empty() {
             self.slots = vec![Slot::default(); 1 << table_bits()];
         }
-        let i = self.slot_index(slot.flow, slot.key);
+        let i = self.slot_index(slot.flow, &slot.key);
         self.slots[i] = slot;
         self.stats[S::store_slots as usize] += 1;
     }
@@ -553,51 +568,55 @@ impl Checker {
     /// The key of a walk's reference (design 4.1): an identifier with a
     /// cached resolved symbol, `this`, or a chain of non-optional property
     /// accesses on them; with the declared and initial types and the flow
-    /// container. 0 when the reference has none. Reads no uncached state.
+    /// container. None when the reference has none. Reads no uncached state.
     fn flow_memo_key(
         &mut self,
         reference: Node,
         declared: TypeId,
         initial: TypeId,
         container: Node,
-    ) -> u32 {
+    ) -> Option<FlowMemoKey> {
         let mut names = SmallVec::new();
         let mut x = reference;
         let root = loop {
             match x.kind() {
                 SyntaxKind::Identifier => {
                     if is_this_in_type_query(x) {
-                        return 0;
+                        return None;
                     }
                     let Some(links) = self.symbol_node_links.try_get(x) else {
-                        return 0;
+                        return None;
                     };
                     let symbol = links.resolved_symbol;
                     if symbol.is_nil() || symbol == self.unknown_symbol {
-                        return 0;
+                        return None;
                     }
                     break symbol.0;
                 }
                 SyntaxKind::ThisKeyword => break u32::MAX,
                 SyntaxKind::PropertyAccessExpression => {
                     if x.flags().intersects(NodeFlags::OPTIONAL_CHAIN) {
-                        return 0;
+                        return None;
                     }
                     names.push(x.name().text());
                     x = x.expression();
                 }
-                _ => return 0,
+                _ => return None,
             }
         };
-        let key = MemoKey {
+        let names = if names.is_empty() {
+            0
+        } else {
+            let next = self.flow_memo.names.len() as u32 + 1;
+            *self.flow_memo.names.entry(names).or_insert(next)
+        };
+        Some(FlowMemoKey {
             root,
+            names,
             declared,
             initial,
             container,
-            names,
-        };
-        let next = self.flow_memo.keys.len() as u32 + 1;
-        *self.flow_memo.keys.entry(key).or_insert(next)
+        })
     }
 
     /// Starts a walk in a memo mode (`flow_walk`): its key, its serial, and
@@ -623,7 +642,7 @@ impl Checker {
         let key = if matches!(flow_node.get_flow(), FileRef::Static(_)) {
             self.flow_memo_key(reference, declared, initial, container)
         } else {
-            0
+            None
         };
         let walk = self.flow_memo.next_serial();
         // A keyless walk takes the plain copy of the walk in `on` mode
@@ -633,20 +652,21 @@ impl Checker {
         } else {
             KEYLESS
         };
-        let finally = key != 0
+        let finally = key.is_some()
             && !self
                 .flow_memo_finally_targets(flow_node.file_index())
                 .is_empty();
         {
             let mut fb = f.borrow_mut();
-            fb.memo_key = if key == 0 { keyless } else { key };
+            fb.memo_key = if key.is_some() { KEYED } else { keyless };
+            fb.memo_full = key.unwrap_or_default();
             fb.memo_walk = walk;
             fb.memo_impure = 0;
             fb.memo_finally = finally;
         }
         let memo = &mut self.flow_memo;
         memo.bump(S::walks, 1);
-        if key != 0 {
+        if key.is_some() {
             memo.bump(S::keyed_walks, 1);
         }
         if memo.walk_depth == 0 && memo.stats_on {
@@ -767,12 +787,12 @@ impl Checker {
         flow_data: &FlowNode,
         shared_flow: FlowNodeId,
     ) -> Option<FlowType> {
-        let (key, impure, finally) = {
+        let (marker, key, impure, finally) = {
             let fb = f.borrow();
-            (fb.memo_key, fb.memo_impure, fb.memo_finally)
+            (fb.memo_key, fb.memo_full, fb.memo_impure, fb.memo_finally)
         };
         self.flow_memo.bump(S::steps, 1);
-        if key == KEYLESS {
+        if marker == KEYLESS {
             return None;
         }
         self.flow_memo.bump(S::keyed_steps, 1);
@@ -800,7 +820,7 @@ impl Checker {
             self.flow_memo.checkpoints.push(flow);
         }
         self.flow_memo.bump(S::consults, 1);
-        let slot = self.flow_memo.lookup(flow, key)?;
+        let slot = self.flow_memo.lookup(flow, &key)?;
         self.flow_memo.bump(S::found, 1);
         // The use rule, gate by gate, in `GATE_NAMES` order. Verify can drop
         // gates (`GOPORT_FLOWMEMO_DROP`) to show that each one is needed.
@@ -1113,8 +1133,11 @@ impl Checker {
         t: FlowType,
         shared: Option<usize>,
     ) {
-        let key = f.borrow().memo_key;
-        if key == KEYLESS {
+        let (marker, key) = {
+            let fb = f.borrow();
+            (fb.memo_key, fb.memo_full)
+        };
+        if marker == KEYLESS {
             return;
         }
         let mut frame = self.flow_memo.frames.pop().expect("a flow memo frame");

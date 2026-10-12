@@ -85,9 +85,11 @@ pub struct FlowState {
     pub shared_flow_start: i32,
     pub reduce_labels: Vec<ReduceLabel>,
     pub next: Option<Rc<RefCell<FlowState>>>,
-    /// flowmemo1 (flow_memo.rs): the walk's memo key id, `KEYLESS` for a
-    /// memo walk without a key, 0 when the memo is off.
+    /// flowmemo1 (flow_memo.rs): `KEYED` for a walk with a key
+    /// (`memo_full`), `KEYLESS` for a memo walk without one, 0 when the
+    /// memo is off.
     pub memo_key: u32,
+    pub memo_full: crate::checker::flow_memo::FlowMemoKey,
     /// flowmemo1: the walk's serial (source of its reference taint).
     pub memo_walk: u32,
     /// flowmemo1: `sharedFlows` entries of this walk with a transient taint.
