@@ -1181,7 +1181,7 @@ pub struct Checker {
     pub(crate) matching_reference_memo: crate::checker::flow_p2::MatchingReferenceMemo,
     /// flowskip1: the index and state of the flow walk skip (flow_skip.rs).
     pub flow_skip: crate::checker::flow_skip::FlowSkip,
-    /// flowmemo1: the flow memo, verify mode only (flow_memo.rs).
+    /// flowmemo1: the flow memo (flow_memo.rs; off unless GOPORT_FLOWMEMO).
     pub flow_memo: crate::checker::flow_memo::FlowMemo,
     /// PERF: not in Go. Counts the merges (`merge_symbol` and
     /// `record_merged_symbol`), so a memo of a merged symbol or of the flags

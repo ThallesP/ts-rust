@@ -961,8 +961,17 @@ fn run_main(start: Instant) -> i32 {
 
     if let Some(first) = args.first() {
         match first.as_str() {
-            "--lsp" => return finish(catch_unwind(AssertUnwindSafe(|| run_lsp(&args[1..])))),
-            "--api" => return finish(catch_unwind(AssertUnwindSafe(|| run_api(&args[1..])))),
+            "--lsp" | "--api" => {
+                // flowmemo1: the flow memo stays off in sessions (design 4.6).
+                ts_goport::checker::flow_memo::disable_flow_memo();
+                return finish(catch_unwind(AssertUnwindSafe(|| {
+                    if first == "--lsp" {
+                        run_lsp(&args[1..])
+                    } else {
+                        run_api(&args[1..])
+                    }
+                })));
+            }
             _ => {}
         }
     }

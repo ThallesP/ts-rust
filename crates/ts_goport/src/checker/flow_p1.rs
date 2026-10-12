@@ -247,7 +247,7 @@ impl Checker {
         }
         let memo = self.flow_memo.mode != FlowMemoMode::Off;
         let saved_height = if memo {
-            self.flow_memo_walk_begin(&f)
+            self.flow_memo_walk_begin(&f, flow_node)
         } else {
             0
         };
@@ -332,17 +332,10 @@ impl Checker {
         // flowskip1 verify mode: record each loop turn (read once per call;
         // a nested verify restores the recording before it returns).
         let recording = self.flow_skip.recording.is_some();
-        // flowmemo1: memo walks count and consult at each loop turn.
-        let hooks = recording || MEMO;
         loop {
-            if hooks {
-                if recording {
-                    let depth = f.borrow().depth;
-                    self.flow_skip_record(flow, depth);
-                }
-                if MEMO {
-                    self.flow_memo_turn(f, flow);
-                }
+            if recording {
+                let depth = f.borrow().depth;
+                self.flow_skip_record(flow, depth);
             }
             let flow_data = flow.get_flow_in(&mut flow_data_guard);
             let flags = flow_data.flags;
@@ -361,6 +354,11 @@ impl Checker {
                     }
                 }
                 shared_flow = flow;
+            }
+            // flowmemo1: memo walks count and consult at each loop turn,
+            // after the scan; a hit in `on` mode ends the frame.
+            if MEMO && let Some(t) = self.flow_memo_turn(f, flow, flow_data, shared_flow) {
+                return t;
             }
             let t: FlowType;
             if flags.intersects(FlowFlags::ASSIGNMENT) {

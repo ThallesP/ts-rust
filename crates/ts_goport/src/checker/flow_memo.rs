@@ -1,6 +1,7 @@
-//! flowmemo1 step 0: an exact memo of flow sub-walk results, verify mode
-//! only (design: `flowmemo0/design.md` under `target/continuation-r97-goport`,
-//! sections 4 and 7; the register model follows tsrs `flowmemo.rs`).
+//! flowmemo1: an exact memo of flow sub-walk results (design:
+//! `flowmemo0/design.md` under `target/continuation-r97-goport`, sections 4
+//! and 7; the Go model and its check: `flowmemo1/go-model.md`,
+//! `go-model-check.md`; the register model follows tsrs `flowmemo.rs`).
 //!
 //! Go walks the flow graph backwards from each reference
 //! (`getTypeAtFlowNode`, flow.go:117) and keeps results only inside one walk
@@ -8,28 +9,39 @@
 //! result of a sub-walk (a "frame": one `get_type_at_flow_node` call) under
 //! (flow node, reference key) across walks.
 //!
-//! Store rule: the frame's result is complete, it consumed no transient
-//! state older than itself (a loop label in process, a resolution cycle, a
-//! re-entered or uncached signature resolution, a reduce label, the inline
-//! or depth limit, or a shared-flow entry that carries one), read nothing of
-//! the reference node beyond its key, and made nothing (types, symbols,
-//! signatures, instantiations, diagnostics). Use rule: no loop analysis and
-//! no instantiation is active, the `flowTypeCache` epoch and the
-//! instantiation count match when the entry depends on them, the walk has no
+//! Store rule: the frame began at inline and serialization level 0, outside
+//! reduce labels, with flow analysis on; its result is complete, it consumed
+//! no transient state older than itself (a loop label in process, a
+//! resolution cycle, a re-entered or uncached signature resolution, a reduce
+//! label, the inline or depth limit, an initializer type with no link, a
+//! context stack entry older than the frame, or a shared-flow entry that
+//! carries one), read nothing of the reference node beyond its key, and made
+//! nothing (types, symbols, signatures, instantiations, diagnostics,
+//! suggestions, deferred diagnostics). Use rule: no loop analysis and no
+//! instantiation is active, flow analysis is on, the `flowTypeCache` epoch
+//! and the instantiation count match when the entry depends on them, both
+//! context stacks are empty when the entry read them, the walk has no
 //! tainted shared-flow entry, and the depth limit cannot be reached.
 //!
 //! Taint uses serial numbers: frames, walks, loop-stack entries and type
 //! resolutions take one; an event taints the active frames younger than its
 //! source.
 //!
-//! `GOPORT_FLOWMEMO`: unset or `0` off (no key, no frames), `verify` keeps
-//! the table and both rules, but at each would-be hit it lets Go's walk run
-//! on and panics at the frame's end when Go's result or effects differ from
-//! the entry. A verify run's output is Go's output. While a would-be hit's
-//! sub-walk runs, nothing is consulted or stored, as in an `on` mode that
-//! skips it. `GOPORT_FLOWMEMO_STATS=<file>` writes the process totals
-//! (walks, steps, consults, hits, blocks and refusals by rule, saved steps).
-//! `GOPORT_FLOWMEMO_BITS` sets log2 of the table size (default 14).
+//! `GOPORT_FLOWMEMO`: unset or `0` off (no key, no frames). `on`: a hit ends
+//! the frame with the entry's type (no redo rule: verify checks the depth at
+//! hits and where Go answers from a shared entry an `on` walk lacks).
+//! `verify` keeps the table and both rules, but at each would-be hit it lets
+//! Go's walk run on and panics at the frame's end when Go's result, effects
+//! or depth differ from the entry, or when Go's walk consumed a value older
+//! than the frame; it also panics when Go answers from a shared entry that
+//! an `on` mode lacks and walking the node again could differ. A verify
+//! run's output is Go's output. While a would-be hit's sub-walk runs,
+//! nothing is consulted or stored, as in an `on` mode that skips it.
+//! `GOPORT_FLOWMEMO_DROP` drops use-rule gates in verify (a stress test).
+//! `GOPORT_FLOWMEMO_STATS=<file>` writes the process totals (walks, steps,
+//! consults, hits, blocks and refusals by rule, saved steps).
+//! `GOPORT_FLOWMEMO_BITS` sets log2 of the table size (default 14). The
+//! memo is off in LSP and API sessions and for walks of freeable files.
 
 use crate::prelude::*;
 use smallvec::SmallVec;
@@ -40,16 +52,26 @@ use std::time::Instant;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlowMemoMode {
     Off,
+    /// A hit ends the frame with the entry's type.
+    On,
     Verify,
 }
 
+static MODE: OnceLock<FlowMemoMode> = OnceLock::new();
+
 /// `GOPORT_FLOWMEMO`, read once per process.
 pub fn flow_memo_mode_from_env() -> FlowMemoMode {
-    static MODE: OnceLock<FlowMemoMode> = OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("GOPORT_FLOWMEMO").as_deref() {
+        Ok("on") => FlowMemoMode::On,
         Ok("verify") => FlowMemoMode::Verify,
         _ => FlowMemoMode::Off,
     })
+}
+
+/// Keeps the memo off in this process (LSP and API sessions, design 4.6).
+/// Call before the first checker is made.
+pub fn disable_flow_memo() {
+    let _ = MODE.set(FlowMemoMode::Off);
 }
 
 /// The gates of the use rule, in the order `flow_memo_turn` tests them.
@@ -208,6 +230,9 @@ struct Frame {
     own_steps: u32,
     /// `S::steps` when the frame began.
     steps: u64,
+    /// The node of the frame's hit, or NIL.
+    hit_node: FlowNodeId,
+    /// Verify: the would-be hit, checked at the frame's end.
     hit: Option<Box<Hit>>,
 }
 
@@ -306,6 +331,8 @@ pub struct FlowMemo {
     shared_meta: Vec<SharedMeta>,
     /// Verify regions (would-be hits whose sub-walk runs) now active.
     region: u32,
+    /// `GOPORT_FLOWMEMO_STATS` is set: walks read the clock.
+    stats_on: bool,
     /// Verify: the walk of the active region, and the largest depth at
     /// which a frame of that walk began in it.
     region_walk: u32,
@@ -338,6 +365,7 @@ impl Default for FlowMemo {
             checkpoints: Vec::new(),
             shared_meta: Vec::new(),
             region: 0,
+            stats_on: stats_path().is_some(),
             region_walk: 0,
             region_max_depth: 0,
             walk_depth: 0,
@@ -409,6 +437,22 @@ impl FlowMemo {
             self.epoch = self.next_serial();
         }
         saved
+    }
+
+    /// The registers after a hit on `slot`: the entry's height and flags
+    /// added to those of the frame so far.
+    fn regs_after_hit(&self, mut regs: Regs, slot: &Slot) -> Regs {
+        regs.height = regs.height.max(slot.height);
+        if slot.epoch != 0 {
+            regs.flags |= FLAG_TYPE_CACHE;
+        }
+        if slot.count_reset {
+            regs.flags |= FLAG_COUNT_RESET;
+        }
+        if slot.context {
+            regs.flags |= FLAG_CONTEXT;
+        }
+        regs
     }
 
     fn bump(&mut self, s: S, n: u64) {
@@ -549,7 +593,11 @@ impl Checker {
     /// the enclosing frame's height set aside. Returns that height.
     #[cold]
     #[inline(never)]
-    pub(crate) fn flow_memo_walk_begin(&mut self, f: &Rc<RefCell<FlowState>>) -> u16 {
+    pub(crate) fn flow_memo_walk_begin(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow_node: FlowNodeId,
+    ) -> u16 {
         let (reference, declared, initial, container) = {
             let fb = f.borrow();
             (
@@ -559,11 +607,24 @@ impl Checker {
                 fb.flow_container,
             )
         };
-        let key = self.flow_memo_key(reference, declared, initial, container);
+        // Only a walk of a static file (a walk stays in one file): the
+        // flow node ids of a freeable file version can be used again.
+        let key = if matches!(flow_node.get_flow(), FileRef::Static(_)) {
+            self.flow_memo_key(reference, declared, initial, container)
+        } else {
+            0
+        };
         let walk = self.flow_memo.next_serial();
+        // A keyless walk takes the plain copy of the walk in `on` mode
+        // (`memo_key` 0); verify and the stats count its steps.
+        let keyless = if self.flow_memo.mode == FlowMemoMode::On && !self.flow_memo.stats_on {
+            0
+        } else {
+            KEYLESS
+        };
         {
             let mut fb = f.borrow_mut();
-            fb.memo_key = if key == 0 { KEYLESS } else { key };
+            fb.memo_key = if key == 0 { keyless } else { key };
             fb.memo_walk = walk;
             fb.memo_impure = 0;
         }
@@ -572,7 +633,7 @@ impl Checker {
         if key != 0 {
             memo.bump(S::keyed_walks, 1);
         }
-        if memo.walk_depth == 0 {
+        if memo.walk_depth == 0 && memo.stats_on {
             memo.walk_time = Some(Instant::now());
         }
         memo.walk_depth += 1;
@@ -641,6 +702,7 @@ impl Checker {
             inferences: self.inference_context_infos.len() as u32,
             own_steps: 0,
             steps: self.flow_memo.stats[S::steps as usize],
+            hit_node: FlowNodeId::NIL,
             hit: None,
         };
         self.flow_memo.regs = FRESH;
@@ -648,51 +710,51 @@ impl Checker {
         self.flow_memo.bump(S::frames, 1);
     }
 
-    /// One loop turn of `get_type_at_flow_node` in a memo walk: counts the
-    /// step and, in a keyed frame, consults the memo at its first node, at a
-    /// node that ends its iteration and at checkpoints.
+    /// One loop turn of `get_type_at_flow_node` in a memo walk, after Go's
+    /// `sharedFlows` scan (`shared_flow` is the iteration's last shared node
+    /// so far): counts the step and, in a keyed frame, consults the memo at
+    /// its first node, at a node that ends its iteration and at checkpoints.
+    /// A hit in `on` mode ends the frame as Go's walk from the node would and
+    /// returns the type: when the node ends the iteration, Go's last shared
+    /// node of the iteration is known and gets its entry; a hit in the middle
+    /// of an iteration pushes none. In verify, Go's walk runs on.
     #[cold]
     #[inline(never)]
-    pub(crate) fn flow_memo_turn(&mut self, f: &Rc<RefCell<FlowState>>, flow: FlowNodeId) {
-        let (key, start, impure) = {
+    pub(crate) fn flow_memo_turn(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        flow_data: &FlowNode,
+        shared_flow: FlowNodeId,
+    ) -> Option<FlowType> {
+        let (key, impure) = {
             let fb = f.borrow();
-            (fb.memo_key, fb.shared_flow_start as usize, fb.memo_impure)
+            (fb.memo_key, fb.memo_impure)
         };
         self.flow_memo.bump(S::steps, 1);
         if key == KEYLESS {
-            return;
+            return None;
         }
         self.flow_memo.bump(S::keyed_steps, 1);
-        let Some(frame) = self.flow_memo.frames.last_mut() else {
-            return;
-        };
+        let frame = self.flow_memo.frames.last_mut()?;
         frame.own_steps += 1;
         if !frame.memo || self.flow_memo.region != 0 {
-            return;
+            return None;
         }
         let entry = frame.entry;
         let entry_depth = frame.entry_depth;
-        let flow_data = flow.get_flow();
         let flags = flow_data.flags;
         let ends_iteration = flags.intersects(FlowFlags::CONDITION | FlowFlags::SWITCH_CLAUSE)
             || flags.intersects(FlowFlags::BRANCH_LABEL | FlowFlags::LOOP_LABEL)
                 && flow_data.antecedents.len() > 1;
         if !ends_iteration && flow != entry {
             if !is_checkpoint(flow) {
-                return;
+                return None;
             }
             self.flow_memo.checkpoints.push(flow);
         }
-        // Go answers a shared node that this walk has seen from `sharedFlows`.
-        if flags.intersects(FlowFlags::SHARED)
-            && self.shared_flows[start..].iter().any(|s| s.flow == flow)
-        {
-            return;
-        }
         self.flow_memo.bump(S::consults, 1);
-        let Some(slot) = self.flow_memo.lookup(flow, key) else {
-            return;
-        };
+        let slot = self.flow_memo.lookup(flow, key)?;
         self.flow_memo.bump(S::found, 1);
         // The use rule, gate by gate, in `GATE_NAMES` order. Verify can drop
         // gates (`GOPORT_FLOWMEMO_DROP`) to show that each one is needed.
@@ -730,13 +792,32 @@ impl Checker {
                     continue;
                 }
                 self.flow_memo.bump(stat, 1);
-                return;
+                return None;
             }
         }
         if bypassed != 0 {
             self.flow_memo.bump(S::bypassed, 1);
         }
         self.flow_memo.bump(S::hits, 1);
+        if self.flow_memo.mode == FlowMemoMode::On {
+            let t = FlowType {
+                t: slot.t,
+                incomplete: false,
+            };
+            let memo = &mut self.flow_memo;
+            memo.regs = memo.regs_after_hit(memo.regs, &slot);
+            memo.frames.last_mut().unwrap().hit_node = flow;
+            let shared = (ends_iteration && shared_flow.is_some()).then(|| {
+                self.shared_flows.push(SharedFlow {
+                    flow: shared_flow,
+                    flow_type: t,
+                });
+                self.shared_flows.len() - 1
+            });
+            f.borrow_mut().depth -= 1;
+            self.flow_memo_end(f, flow, t, shared);
+            return Some(t);
+        }
         // Verify: Go's walk runs on; the frame's end checks it.
         let hit = Hit {
             slot,
@@ -752,7 +833,10 @@ impl Checker {
         self.flow_memo.region += 1;
         self.flow_memo.region_walk = f.borrow().memo_walk;
         self.flow_memo.region_max_depth = entry_depth;
-        self.flow_memo.frames.last_mut().unwrap().hit = Some(Box::new(hit));
+        let frame = self.flow_memo.frames.last_mut().unwrap();
+        frame.hit_node = flow;
+        frame.hit = Some(Box::new(hit));
+        None
     }
 
     /// Ends the frame's registers: the taint older than the frame, its
@@ -867,18 +951,7 @@ impl Checker {
         }
         // The registers of the sub-walk Go ran are dropped: an `on` mode
         // takes only the entry's height and flags.
-        let mut regs = hit.regs;
-        regs.height = regs.height.max(hit.slot.height);
-        if hit.slot.epoch != 0 {
-            regs.flags |= FLAG_TYPE_CACHE;
-        }
-        if hit.slot.count_reset {
-            regs.flags |= FLAG_COUNT_RESET;
-        }
-        if hit.slot.context {
-            regs.flags |= FLAG_CONTEXT;
-        }
-        memo.regs = regs;
+        memo.regs = memo.regs_after_hit(hit.regs, &hit.slot);
     }
 
     /// Verify found a difference from Go at flow node `node`.
@@ -995,10 +1068,10 @@ impl Checker {
             return;
         }
         let mut frame = self.flow_memo.frames.pop().expect("a flow memo frame");
-        let hit = frame.hit.take();
-        if let Some(hit) = &hit {
-            self.flow_memo_verify(f, hit, frame.start, t);
+        if let Some(hit) = frame.hit.take() {
+            self.flow_memo_verify(f, &hit, frame.start, t);
         }
+        let hit_node = frame.hit_node;
         self.flow_memo_counters(&frame);
         let height = self.flow_memo.regs.height;
         let taint = self.flow_memo_end_regs(&frame, height);
@@ -1007,7 +1080,7 @@ impl Checker {
             if memo.shared_meta.len() <= i {
                 memo.shared_meta.resize(i + 1, SharedMeta::default());
             }
-            let lost = memo.region != 0 || hit.as_ref().is_some_and(|hit| hit.node != last);
+            let lost = memo.region != 0 || hit_node.is_some() && hit_node != last;
             let steps = (memo.stats[S::steps as usize] - frame.steps).min(u64::from(u32::MAX));
             memo.shared_meta[i] = SharedMeta {
                 transient: taint.transient,
@@ -1034,7 +1107,7 @@ impl Checker {
             Some(S::refused_effects)
         } else if t.incomplete || self.flow_analysis_disabled {
             Some(S::refused_incomplete)
-        } else if height == 0 && frame.own_steps < 4 && hit.is_none() {
+        } else if height == 0 && frame.own_steps < 4 && hit_node.is_nil() {
             // A short iteration without recursion costs less to walk again.
             Some(S::refused_short)
         } else {
@@ -1058,12 +1131,12 @@ impl Checker {
                     0
                 },
             };
-            // An `on` mode's hit ends the iteration at the hit node.
-            let last = hit.as_ref().map_or(last, |hit| hit.node);
-            if hit.is_none() || last != frame.entry {
+            // A hit ends the iteration at the hit node, which has the entry.
+            let last = if hit_node.is_some() { hit_node } else { last };
+            if hit_node.is_nil() || last != frame.entry {
                 memo.store(slot);
             }
-            if hit.is_none() && last != frame.entry {
+            if hit_node.is_nil() && last != frame.entry {
                 memo.store(Slot { flow: last, ..slot });
             }
             for i in frame.checkpoints as usize..memo.checkpoints.len() {
@@ -1178,10 +1251,19 @@ impl FlowMemo {
 mod tests {
     use super::*;
 
-    /// Checks `a.ts` (`source`) in a new project in verify mode (which
-    /// panics when a would-be hit differs from Go's walk). Returns the
-    /// diagnostic codes, the hits and the stores.
-    fn check_with_memo(label: &str, source: &str) -> (Vec<i32>, u64, u64) {
+    /// What a check of `a.ts` gave: diagnostic codes, the type, symbol and
+    /// instantiation counts, and the memo's hits and stores.
+    #[derive(Debug, PartialEq)]
+    struct Outcome {
+        codes: Vec<i32>,
+        counts: (u32, u32, u32),
+        hits: u64,
+        stores: u64,
+    }
+
+    /// Checks `a.ts` (`source`) in a new project with the memo in `mode`
+    /// (verify panics when a would-be hit differs from Go's walk).
+    fn check_with_memo(label: &str, source: &str, mode: FlowMemoMode) -> Outcome {
         let dir =
             std::env::temp_dir().join(format!("ts_goport_flowmemo_{label}_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1202,18 +1284,23 @@ mod tests {
             .expect("a.ts is not in the program")
             .root;
         let result = crate::program::with_type_checker_for_file(file, move |checker| {
-            checker.flow_memo.mode = FlowMemoMode::Verify;
+            checker.flow_memo.mode = mode;
             let ctx = crate::gostd::context::background();
             let codes: Vec<i32> = checker
                 .get_diagnostics(&ctx, file, false)
                 .iter()
                 .map(|d| d.code())
                 .collect();
-            (
+            Outcome {
                 codes,
-                checker.flow_memo.stat("hits"),
-                checker.flow_memo.stat("stores"),
-            )
+                counts: (
+                    checker.type_count,
+                    checker.symbol_count,
+                    checker.total_instantiation_count,
+                ),
+                hits: checker.flow_memo.stat("hits"),
+                stores: checker.flow_memo.stat("stores"),
+            }
         });
         drop(scope);
         crate::program::release_program(program);
@@ -1237,10 +1324,21 @@ mod tests {
             source.push_str("  g(typeof x === 'string' ? x.length : x);\n  o.a.b;\n");
         }
         source.push_str("}\n");
-        let (codes, hits, stores) = check_with_memo("repeat", &source);
-        assert_eq!(codes, Vec::<i32>::new());
-        assert!(stores > 0, "stores {stores}");
-        assert!(hits > 0, "hits {hits}");
+        let on = all_modes_agree("repeat", &source);
+        assert_eq!(on.codes, Vec::<i32>::new());
+        assert!(on.hits > 0, "{on:?}");
+    }
+
+    /// Off, verify and on give the same diagnostics and counts, and verify
+    /// and on hit the same number of times. Returns the `on` outcome.
+    fn all_modes_agree(label: &str, source: &str) -> Outcome {
+        let off = check_with_memo(&format!("{label}_off"), source, FlowMemoMode::Off);
+        let verify = check_with_memo(&format!("{label}_verify"), source, FlowMemoMode::Verify);
+        let on = check_with_memo(&format!("{label}_on"), source, FlowMemoMode::On);
+        assert_eq!((&off.codes, off.counts), (&verify.codes, verify.counts));
+        assert_eq!((&off.codes, off.counts), (&on.codes, on.counts));
+        assert!(verify.stores > 0, "{verify:?}");
+        on
     }
 
     /// Loops, try/finally, an auto-typed `let` assigned object literals,
@@ -1288,8 +1386,7 @@ export function constraint<T extends string | undefined>(t: T) {
   g(u); g(u);
 }
 "#;
-        let (codes, _, stores) = check_with_memo("transient", source);
-        assert_eq!(codes, Vec::<i32>::new());
-        assert!(stores > 0, "stores {stores}");
+        let on = all_modes_agree("transient", source);
+        assert_eq!(on.codes, Vec::<i32>::new());
     }
 }
