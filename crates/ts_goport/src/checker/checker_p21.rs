@@ -190,6 +190,8 @@ impl Checker {
         let resolution_cycle_start_index =
             self.find_resolution_cycle_start_index(target, property_name);
         if resolution_cycle_start_index >= 0 {
+            // flowmemo1: writes to older entries (verify counts a miss).
+            self.flow_memo.misses += 1;
             // A cycle was found
             for i in resolution_cycle_start_index as usize..self.type_resolutions.len() {
                 self.type_resolutions[i].result = false;

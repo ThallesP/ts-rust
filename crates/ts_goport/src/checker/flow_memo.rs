@@ -756,12 +756,19 @@ impl Checker {
     /// Verify: the frame had a would-be hit; Go's walk from there must give
     /// the entry's type and change nothing. Then the registers become what
     /// an `on` mode's hit leaves.
-    fn flow_memo_verify(&mut self, f: &Rc<RefCell<FlowState>>, hit: &Hit, t: FlowType) {
+    fn flow_memo_verify(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        hit: &Hit,
+        frame_start: u32,
+        t: FlowType,
+    ) {
         self.flow_memo.region -= 1;
         // The depth Go's walk reached below the frame (the registers' height
         // also counts shared-flow hits with the height they stand for).
         let region_height = (self.flow_memo.region_max_depth - hit.entry_depth) as u16;
-        let region_transient = self.flow_memo.regs.transient != UNTAINTED;
+        let region = self.flow_memo.regs;
+        let region_transient = region.transient != UNTAINTED;
         let now = self.flow_memo_snapshot();
         let problem = if t.t != hit.slot.t || t.incomplete {
             Some(format!(
@@ -781,6 +788,13 @@ impl Checker {
             Some(format!(
                 "Go's walk reached height {region_height}, the entry has {}",
                 hit.slot.height
+            ))
+        } else if region.transient < frame_start || region.reference < frame_start {
+            // The stored frame consumed nothing older than itself, so Go's
+            // walk took another path.
+            Some(format!(
+                "Go's walk consumed a value older than the frame (transient {}, reference {}, frame {frame_start})",
+                region.transient, region.reference
             ))
         } else {
             None
@@ -922,7 +936,7 @@ impl Checker {
         let mut frame = self.flow_memo.frames.pop().expect("a flow memo frame");
         let hit = frame.hit.take();
         if let Some(hit) = &hit {
-            self.flow_memo_verify(f, hit, t);
+            self.flow_memo_verify(f, hit, frame.start, t);
         }
         self.flow_memo_counters(&frame);
         let height = self.flow_memo.regs.height;

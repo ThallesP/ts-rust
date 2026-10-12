@@ -171,8 +171,10 @@ impl Checker {
                 };
             }
         } else if state == ExhaustiveState::COMPUTING {
-            // flowmemo1: a transient state.
+            // flowmemo1: a transient state, and a permanent write (verify
+            // counts it as a miss).
             self.flow_memo.taint(0);
+            self.flow_memo.misses += 1;
             // Resolve circularity to false
             self.switch_statement_links.get(node).exhaustive_state = ExhaustiveState::FALSE;
         }
