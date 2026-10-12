@@ -721,9 +721,17 @@ const CONTENT_MAPPER_CALL_HIERARCHY_REGISTRATION_ID: &str = "content-mapper-call
 const CONTENT_MAPPER_WILL_RENAME_FILES_REGISTRATION_ID: &str = "content-mapper-will-rename-files";
 
 // Go: server.go:388 supportedCodeActionKinds (ts#63951)
+// with effect-tsgo 0.51.1 patch 017 (`017-ls-server-refactor-capability`):
+// `refactor.rewrite` after `quickfix`, always, also without an Effect plugin
+// (decision D1 option B). The editor "Refactor..." menu asks only servers
+// that list a `refactor` kind, so it then shows the Effect refactors. The
+// `initialize` answer and the content mapper code action registration use
+// this list. Plain Go has no `refactor.rewrite`: `scripts/goport/lsp_oracle.py`
+// drops it from the port's `initialize` answer before it compares with Go.
 pub fn supported_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
     vec![
         lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind::REFACTOR_REWRITE,
         lsproto::CodeActionKind::SOURCE_ORGANIZE_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_REMOVE_UNUSED_IMPORTS_TS,
         lsproto::CodeActionKind::SOURCE_SORT_IMPORTS_TS,

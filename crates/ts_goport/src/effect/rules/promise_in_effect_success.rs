@@ -35,6 +35,8 @@ fn run_promise_in_effect_success(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagnosti
 
     while let Some(entry) = stack.pop() {
         let node = order.node(entry.index);
+        // Go: promise_in_effect_success.go:39. The node order holds no nil
+        // node, so this never skips; it keeps Go's shape.
         if node.is_nil() {
             continue;
         }

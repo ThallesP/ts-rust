@@ -34,9 +34,9 @@ fn run_any_unknown_in_error_context(ctx: &mut RuleContext<'_, '_>) -> Vec<Diagno
     let order = ctx.tp.node_order(ctx.source_file);
     let mut node_to_visit: Vec<u32> = order.children(0).collect();
 
+    // Pop from the end (stack)
     while let Some(i) = node_to_visit.pop() {
         let node = order.node(i);
-        // Pop from the end (stack)
 
         // Skip type nodes
         if is_type_node(node) {

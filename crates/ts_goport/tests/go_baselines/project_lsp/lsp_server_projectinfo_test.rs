@@ -8,10 +8,15 @@ use super::lsptestutil::{self, LspClient, result_response};
 use super::projecttestutil::files;
 use super::util::uri;
 
-// Go: server_projectinfo_test.go:16 expectedCodeActionKinds (ts#63951)
+// Go: server_projectinfo_test.go:17 expectedCodeActionKinds (ts#63951)
+// PORT: plus `refactor.rewrite` after `quickfix`, as effect-tsgo 0.51.1
+// patch 017 adds it to Go's `supportedCodeActionKinds` (decision D1 option
+// B). The server lists it always, also without an Effect plugin: this test
+// and the content mapper test have none.
 pub(super) fn expected_code_action_kinds() -> Vec<lsproto::CodeActionKind> {
     vec![
         lsproto::CodeActionKind::QUICK_FIX,
+        lsproto::CodeActionKind("refactor.rewrite".into()),
         lsproto::CodeActionKind("source.organizeImports.ts".into()),
         lsproto::CodeActionKind("source.removeUnusedImports.ts".into()),
         lsproto::CodeActionKind("source.sortImports.ts".into()),

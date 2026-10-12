@@ -13,6 +13,7 @@
 //! | 015 | `ls/inlay_hints.rs` `provide_inlay_hint` | [`inlay_hints::after_inlay_hints`] |
 //! | 022 | `ls/completions_p1.rs` `provide_completion` | [`after_completion`] |
 //! | 024 | `ls/symbols.rs` `get_document_symbols_for_children` | [`after_document_symbols`] |
+//! | 017 | `lsp/server.rs` `supported_code_action_kinds` | none: `refactor.rewrite` in the list |
 //! | 018, 027 | `ls/autoimport/view.rs` `new_view`, `ls/autoimport/fix.rs` `get_fixes` and `edits` | [`autoimportstyle::new_view_fix_transformer`] |
 //!
 //! Every hook returns its input at once when the program has no Effect
@@ -25,10 +26,10 @@
 //! fixable framework with the disable actions and all 55 fixes (E4, E5a,
 //! E5b, E5c), the completions (E6), the Layer hover (E7), the document
 //! symbols (E8) and the refactor framework with all 21 refactors (E9a to
-//! E9d). Not ported here: patch 017 (`refactor.rewrite` in the server's code
-//! action kinds). Root decision D1 keeps the plain list until Theo decides,
-//! so the editor "Refactor..." menu does not ask the server; the lightbulb
-//! and the quick fix menu (no `only` filter) show the Effect refactors.
+//! E9d). Patch 017 (`refactor.rewrite` in the server's code action kinds) is
+//! in `lsp/server.rs` `supported_code_action_kinds`, always on (decision D1
+//! option B), so the lightbulb, the quick fix menu and the editor
+//! "Refactor..." menu show the Effect refactors.
 
 use std::sync::LazyLock;
 

@@ -154,11 +154,11 @@ tsc mode never runs them.
 
 ## Not ported
 
-Editor features: none. One server change is not ported: effect-tsgo adds
-`refactor.rewrite` to the code action kinds of the `initialize` answer
-(patch 017). Without it, the lightbulb and the quick fix menu show the
-Effect refactors, because they ask for all code actions. The editor
-"Refactor..." menu asks only servers that list a `refactor` kind, so it
-does not show them. This waits for a decision (D1), because it changes the
-`initialize` answer that the LSP oracle compares. The `goto` and `renames`
-options are read, but effect-tsgo does not use them either.
+Editor features: none. The server change of patch 017 is ported too: the
+code action kinds of the `initialize` answer list `refactor.rewrite` after
+`quickfix`, always, also without an Effect plugin (decision D1 option B).
+So the editor "Refactor..." menu, which asks only servers that list a
+`refactor` kind, shows the Effect refactors. Plain tsgo does not list it,
+so the LSP oracle drops exactly that kind from the port's `initialize`
+answer before it compares. The `goto` and `renames` options are read, but
+effect-tsgo does not use them either.
