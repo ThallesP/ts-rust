@@ -819,6 +819,10 @@ impl Checker {
             }
             self.flow_memo.checkpoints.push(flow);
         }
+        // flowskip1 verify records Go's whole walk: no hit while it does.
+        if self.flow_skip.recording.is_some() {
+            return None;
+        }
         self.flow_memo.bump(S::consults, 1);
         let slot = self.flow_memo.lookup(flow, &key)?;
         self.flow_memo.bump(S::found, 1);
