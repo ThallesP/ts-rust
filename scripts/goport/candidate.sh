@@ -816,15 +816,18 @@ PY
         # clippy on the testbox copy of the checkout (the same fp.py), in the same target path there (32 jobs: the
         # default off zbook is 1).
         tbx_up "$wt" "$pin"
-        tbx_job "$C/clippy.log" "cd $wt && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=32 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target $ROOT/scripts/run-cargo-capped.sh clippy --locked ${pkgs[*]} --all-targets" || cl=$?
+        tbx_job "$C/clippy.log" "cd $wt && CARGO_TERM_COLOR=never TS_CARGO_LOCK_ID=candidate-side TS_CARGO_JOBS=32 TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target $ROOT/scripts/run-cargo-capped.sh clippy --locked ${pkgs[*]} --all-targets" || cl=$?
       else
         (cd "$wt" && TS_CARGO_LOCK_ID=candidate-side TS_CARGO_SEPARATE_TARGET=1 CARGO_TARGET_DIR=$clippy_target \
           "$ROOT/scripts/run-cargo-capped.sh" clippy --locked "${pkgs[@]}" --all-targets > "$C/clippy.log" 2>&1) || cl=$?
       fi
       fpa=$(python3 "$G/fp.py" "$wt" | cut -d' ' -f1)
-      local kept
-      warn=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -c -- '--> crates/ts_goport' || true)
-      kept=$(grep -E '^(warning|error)' -A4 "$C/clippy.log" | grep -cE -- "--> crates/($(IFS='|'; echo "${KEPT_CRATES[*]}"))/" || true)
+      local kept plain
+      # Count on the log without ANSI color codes: the testbox sets CARGO_TERM_COLOR=always, and a colored
+      # "warning" line matched neither grep, so warnings counted 0 (R197 reviewer).
+      plain=$(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' "$C/clippy.log")
+      warn=$(grep -E '^(warning|error)' -A4 <<< "$plain" | grep -c -- '--> crates/ts_goport' || true)
+      kept=$(grep -E '^(warning|error)' -A4 <<< "$plain" | grep -cE -- "--> crates/($(IFS='|'; echo "${KEPT_CRATES[*]}"))/" || true)
       jq -n --arg fp "$fpa" --argjson fmt "$fmt" --argjson cl "$cl" --argjson w "$warn" --argjson k "$kept" \
         --argjson same "$([[ $fpa == "$fpb" ]] && echo true || echo false)" --arg dirs "${dirs[*]}" \
         '{sourceFingerprint: $fp, rustfmtExit: $fmt, clippyExit: $cl, tsGoportWarnings: $w, keptCrateWarnings: $k,

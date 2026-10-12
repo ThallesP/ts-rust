@@ -8,17 +8,28 @@ oracle/<label>.effect.txt when that file is next to its plain oracle/<label>.txt
 plain file, so a TypeScript line that effect-tsgo gets wrong (the reference TS6133 bug) stays out.
 
 usage: GOPORT_PIN=<key> scripts/upstream/pin.py exec -- python3 scripts/goport/effect-oracle.py
-           --effect-tsc <effect-tsgo tsc> [--out DIR] [label ...]
+           --effect-tsc <effect-tsgo tsc> [--out DIR] [--counts] [label ...]
   --effect-tsc  the tsc of the effect-tsgo package at the Effect pin (run through scripts/tsgo-oracle.sh with
                 TS_GO_ORACLE_BIN, --pretty false, in the same cwd as the plain oracle run). Its --version must
                 end in +effect-tsgo.<EFFECT_VERSION of crates/ts_goport/src/effect/etscore.rs>, else the run stops.
-  --out DIR     write DIR/<project>/oracle/<label>.effect.txt. Default: next to the plain file (in a pin run,
-                the pin's oracle cache).
+  --out DIR     write DIR/<project>/oracle/<label>.effect.txt (and .effect-counts.txt). Default: next to the
+                plain file (in a pin run, the pin's oracle cache).
+  --counts      write only the counts files, for the configs that have an .effect.txt (next to the plain file
+                or in DIR).
   label         sweep-wide labels (<project>:<name>). Default: every sweep-wide config.
 A config gets a file only when its resolved tsconfig (--showConfig) lists the plugin and effect-tsgo reports at
 least one TS377xxx line there; otherwise the plain file is already the expected output. An existing file is not
 replaced: remove it first. Lines are merged in Go's order (ast.CompareDiagnostics: path, then position), and a
 plain line at the same path, line and column as an Effect line stops the run, since the text cannot order them.
+
+Counts (state note effperf1-f3-dropped-2026-10-11): each config with an .effect.txt also gets
+oracle/<label>.effect-counts.txt, the Symbols, Types and Instantiations lines that sweep-wide.sh expects from
+goport with --extendedDiagnostics --singleThreaded. They are made the same way as the lines: the plain oracle's
+counts plus the plugin's share in effect-tsgo (its counts with the plugin minus its counts without it).
+effect-tsgo's own counts are not the expected counts: its TypeScript base has other lib files than the pin.
+The run without the plugin is effect-tsgo in a private mount namespace (bwrap) where each config of the extends
+chain that names the plugin shows a copy with the plugin renamed. Each side runs 3 times and must give equal
+counts.
 """
 import argparse
 import json
@@ -26,12 +37,16 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 X = Path('/home/theo/Code/sandbox/ts-rust/target/project-inputs-wide')  # as sweep-wide.sh (worktrees too)
 PLUGIN = '@effect/language-service'
 HEAD = re.compile(r'^(.*)\((\d+),(\d+)\): \w+ TS(\d+): ')
+COUNTS = ('Symbols', 'Types', 'Instantiations')
+COUNT_LINE = re.compile(r'^(Symbols|Types|Instantiations): +(\d+)$', re.M)
+RUNS = 3
 
 
 def effect_pin():
@@ -60,6 +75,60 @@ def records(text, cwd):
     return out
 
 
+def counts(tsc, config, cwd, binds=()):
+    """((Symbols, Types, Instantiations), TS377xxx line count) of tsc --extendedDiagnostics --singleThreaded on
+    config, the same in RUNS runs. binds: (copy, path) pairs that bwrap shows at path."""
+    cmd = [str(REPO / 'scripts/tsgo-oracle.sh'), '-p', config, '--pretty', 'false', '--extendedDiagnostics', '--singleThreaded']
+    if binds:
+        cmd = ['bwrap', '--dev-bind', '/', '/', *[a for copy, path in binds for a in ('--ro-bind', str(copy), str(path))], '--', *cmd]
+    seen = set()
+    for _ in range(RUNS):
+        run = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=dict(os.environ, TS_GO_ORACLE_BIN=str(tsc)))
+        found = dict(COUNT_LINE.findall(run.stdout))
+        if run.returncode not in (0, 1, 2) or 'panic' in run.stderr or set(found) != set(COUNTS):
+            sys.exit(f'{tsc} -p {config}: rc={run.returncode}, counts {found}: {run.stderr[:300]}')
+        seen.add((tuple(int(found[k]) for k in COUNTS), sum(r[1].startswith('377') for r in records(run.stdout, cwd))))
+    if len(seen) != 1:
+        sys.exit(f'{tsc} -p {config}: the runs differ: {sorted(seen)}')
+    return seen.pop()
+
+
+def plugin_off(config, cwd, tmp):
+    """(copy, path) pairs for counts(): each config of the extends chain of config that names the plugin, as a copy
+    in tmp with the plugin renamed, so effect-tsgo runs without it. Only relative extends are followed."""
+    binds, todo = [], [(cwd / config).resolve()]
+    while todo:
+        f = todo.pop()
+        text = f.read_text()
+        if f'"{PLUGIN}"' in text:
+            copy = Path(tmp) / f'{len(binds)}.json'
+            copy.write_text(text.replace(f'"{PLUGIN}"', f'"{PLUGIN}-off"'))
+            binds.append((copy, f))
+        m = re.search(r'"extends"\s*:\s*("[^"]*"|\[[^\]]*\])', text)
+        for e in re.findall(r'"([^"]+)"', m[1]) if m else []:
+            if not e.startswith('.'):
+                sys.exit(f'{f}: extends {e}: only relative extends are followed')
+            p = (f.parent / e).resolve()
+            todo.append(p if p.is_file() else p.with_name(p.name + '.json'))
+    return binds
+
+
+def write_counts(label, oracle, effect_tsc, config, cwd, dest):
+    """Writes dest: the plain oracle's counts plus effect-tsgo's counts with the plugin minus without it."""
+    if dest.exists():
+        sys.exit(f'{label}: {dest} exists; remove it first')
+    with tempfile.TemporaryDirectory() as tmp:
+        go, _ = counts(oracle, config, cwd)
+        on, on_lines = counts(effect_tsc, config, cwd)
+        off, off_lines = counts(effect_tsc, config, cwd, plugin_off(config, cwd, tmp))
+    if not on_lines or off_lines:
+        sys.exit(f'{label}: effect-tsgo TS377xxx lines: {on_lines} with the plugin, {off_lines} without it')
+    want = [g + n - f for g, n, f in zip(go, on, off)]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(''.join(f'{k}: {v}\n' for k, v in zip(COUNTS, want)))
+    print(f'{label} counts: Go {go} + effect-tsgo {on} - {off} without the plugin = {tuple(want)} -> {dest}')
+
+
 def merge(plain, effect, label):
     for name, recs in (('plain', plain), ('effect', effect)):
         if any(a[0] > b[0] for a, b in zip(recs, recs[1:])):
@@ -74,6 +143,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     p.add_argument('--effect-tsc', required=True)
     p.add_argument('--out')
+    p.add_argument('--counts', action='store_true')
     p.add_argument('labels', nargs='*')
     a = p.parse_args()
     oracle = Path.home() / '.local/bin/tsgo-oracle'  # in a pin run, the pin's oracle
@@ -86,6 +156,13 @@ def main():
     print(f'effect-tsc {a.effect_tsc} ({version}); plain oracle {oracle}; pin {os.environ.get("GOPORT_PIN_ACTIVE", "default")}')
     for label, proj, cwd, config, ofile in rows:
         cwd = X / proj / cwd
+        plain_file = X / proj / ofile
+        out = Path(a.out) / proj / ofile if a.out else plain_file
+        dest, counts_dest = out.with_suffix('.effect.txt'), out.with_suffix('.effect-counts.txt')
+        if a.counts:
+            if plain_file.with_suffix('.effect.txt').is_file() or dest.is_file():
+                write_counts(label, oracle, a.effect_tsc, config, cwd, counts_dest)
+            continue
         shown = subprocess.run([oracle, '--showConfig', '-p', config], cwd=cwd, capture_output=True, text=True)
         if shown.returncode != 0:
             print(f'{label}: --showConfig rc={shown.returncode}, skipped')
@@ -98,7 +175,6 @@ def main():
             sys.exit(f'{label}: effect-tsgo rc={run.returncode}: {run.stderr[:300]}')
         ref = records(run.stdout, cwd)
         effect = [r for r in ref if r[1].startswith('377')]
-        plain_file = X / proj / ofile
         plain = records(plain_file.read_text(), cwd)
         # Information for the reviewer: TypeScript lines where effect-tsgo and the plain oracle differ.
         ref_ts, plain_ts = {r[2] for r in ref if not r[1].startswith('377')}, {r[2] for r in plain}
@@ -106,12 +182,12 @@ def main():
         if not effect:
             print(f'{label} plugin, 0 TS377xxx lines: no file (the plain oracle is the expected output); {note}')
             continue
-        dest = (Path(a.out) / proj / ofile if a.out else plain_file).with_suffix('.effect.txt')
         if dest.exists():
             sys.exit(f'{label}: {dest} exists; remove it first')
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(merge(plain, effect, label))
         print(f'{label} rc={run.returncode} effect={len(effect)} plain={len(plain)} -> {dest}; {note}')
+        write_counts(label, oracle, a.effect_tsc, config, cwd, counts_dest)
 
 
 if __name__ == '__main__':

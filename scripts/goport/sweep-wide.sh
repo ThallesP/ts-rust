@@ -3,8 +3,8 @@
 # 292 configs) and diffs against its saved oracle file. Entries come from each <project>/manifest.json
 # "configs" list (label, cwd, config, oracle file).
 # Outputs go to measure/<round>/<label>.{out,err}. Saved oracle files are never overwritten.
-# Line format matches sweep-extra2.sh. goport never writes an output file, so it runs on the
-# read-only inputs. GOPORT_BIN picks the binary (default: accepted R118 goport).
+# Line format matches sweep-extra2.sh; a config with an Effect counts file (below) adds counts=. goport never
+# writes an output file, so it runs on the read-only inputs. GOPORT_BIN picks the binary (default: accepted R118 goport).
 # GOPORT_PIN=<key> runs this against that upstream pin (scripts/upstream/pin.py). Unset: no change.
 [[ -z ${GOPORT_PIN:-} || -n ${GOPORT_PIN_ACTIVE:-} ]] || exec python3 /home/theo/Code/sandbox/ts-rust/scripts/upstream/pin.py exec -- bash "$0" "$@"
 . "$(dirname "$(realpath "$0")")/exit-rule.sh" || exit 2
@@ -320,5 +320,15 @@ for entry in \
   s=$(date +%s.%N); (cd $X/$n/$cwd && timeout 900 $B -p $c > $O/$l.out 2> $O/$l.err); e=$?
   t=$(python3 -c "import sys;print(round(float(sys.argv[2])-float(sys.argv[1]),1))" $s $(date +%s.%N))
   if incomplete $e $O/$l.err; then m=INCOMPLETE; elif diff -q $OR $O/$l.out >/dev/null; then m=MATCH; else m="DIFF(+$(diff $OR $O/$l.out | grep -c '^>') -$(diff $OR $O/$l.out | grep -c '^<'))"; fi
-  echo "$l exit=$e diags=$(grep -c 'error TS' $O/$l.out) oracle=$(grep -c 'error TS' $OR) $m ${t}s panics=$(grep -c 'panic' $O/$l.err) unported=$(grep -c '^unported' $O/$l.err)"
+  # Effect counts (state note effperf1-f3-dropped-2026-10-11): with oracle/<label>.effect-counts.txt next to the
+  # plain file (effect-oracle.py), goport's --extendedDiagnostics --singleThreaded Symbols, Types and
+  # Instantiations must equal it, or the result is COUNTS. The time is the diagnostics run's.
+  k=; CF=$X/$n/${of%.txt}.effect-counts.txt
+  if [[ -f $CF ]]; then
+    (cd $X/$n/$cwd && timeout 900 $B -p $c --extendedDiagnostics --singleThreaded > $O/$l.counts.out 2> $O/$l.counts.err)
+    got=$(sed -nE 's/^(Symbols|Types|Instantiations): +/\1: /p' $O/$l.counts.out)
+    k=" counts=$(tr -d ' ' <<< "$got" | paste -sd,)"
+    [[ $got == "$(< $CF)" ]] || { k+=" expected=$(tr -d ' ' < $CF | paste -sd,)"; [[ $m == MATCH ]] && m=COUNTS; }
+  fi
+  echo "$l exit=$e diags=$(grep -c 'error TS' $O/$l.out) oracle=$(grep -c 'error TS' $OR) $m ${t}s panics=$(grep -c 'panic' $O/$l.err) unported=$(grep -c '^unported' $O/$l.err)$k"
 done

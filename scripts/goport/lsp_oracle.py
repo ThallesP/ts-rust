@@ -60,6 +60,10 @@ Request ids are the request's ordinal among the trace's request events, from 1,
 so both servers get the same ids. `initialized` follows the initialize answer;
 `shutdown` (id N+1, no params) and `exit` end every session.
 
+Compare: both answers drop initialize serverInfo.version, and completion items
+sort. check also drops one "refactor.rewrite" from the port's initialize
+codeActionKinds when Go's list lacks it (decision D1 option B, drop_d1_kind).
+
 Exit status: 0 done, 1 a trace failed in the harness, 2 usage error or a safety
 refusal, 3 a project input changed during the run.
 """
@@ -722,6 +726,41 @@ def normalize_response(method, msg, norm: Replacer):
     return "ok", {"result": result}
 
 
+# Decision D1 option B (Theo, 2026-10-11, note theo-decisions-approval-2026-10-11):
+# the port lists "refactor.rewrite" in the initialize answer's
+# capabilities.codeActionProvider.codeActionKinds, as effect-tsgo 0.51.1 patch 017
+# does. Plain Go does not.
+D1_EXTRA_KIND = "refactor.rewrite"
+
+
+def initialize_code_action_kinds(result):
+    """The codeActionKinds list of an initialize result, or None."""
+    caps = result.get("capabilities") if isinstance(result, dict) else None
+    provider = caps.get("codeActionProvider") if isinstance(caps, dict) else None
+    kinds = provider.get("codeActionKinds") if isinstance(provider, dict) else None
+    return kinds if isinstance(kinds, list) else None
+
+
+def drop_d1_kind(method, g_result, r_result):
+    """Returns the port's result (r_result) to compare with Go's (g_result).
+
+    For initialize only, when Go's codeActionKinds lacks D1_EXTRA_KIND and the
+    port's has it, it returns a copy of r_result without one D1_EXTRA_KIND.
+    Every other kind and every other part of the answer stays. In all other
+    cases it returns r_result as it is (an E0 oracle that lists the kind
+    compares it as usual). The saved responses keep the port's answer.
+    """
+    if method != "initialize":
+        return r_result
+    g_kinds = initialize_code_action_kinds(g_result)
+    r_kinds = initialize_code_action_kinds(r_result)
+    if g_kinds is None or r_kinds is None or D1_EXTRA_KIND in g_kinds or D1_EXTRA_KIND not in r_kinds:
+        return r_result
+    out = copy.deepcopy(r_result)
+    out["capabilities"]["codeActionProvider"]["codeActionKinds"].remove(D1_EXTRA_KIND)
+    return out
+
+
 _UNPORTED_RE = re.compile(r"unported Go code: (.*)$")
 
 
@@ -763,7 +802,7 @@ def classify(golden_rec, run_rec, flaky_ev):
         return ("same", None, None) if same else ("diff", None, "")
     patterns = (flaky_ev or {}).get("multiset") or []
     a = apply_multisets(g_resp["result"], patterns)
-    b = apply_multisets(r_resp["result"], patterns)
+    b = apply_multisets(drop_d1_kind(golden_rec.get("method"), g_resp["result"], r_resp["result"]), patterns)
     if canon(a) == canon(b):
         return "same", None, None
     d = first_diff_path(a, b)
