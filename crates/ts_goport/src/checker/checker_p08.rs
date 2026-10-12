@@ -1320,10 +1320,11 @@ impl Checker {
         if quick_type.is_some() {
             return quick_type;
         }
+        // flowmemo1: a hit, a miss and a write all read this cache instance.
+        self.flow_memo.type_cache_used();
         // If a type has been cached for the node, return it.
         if let Some(&cached_type) = self.flow_type_cache.get(&node) {
             if cached_type.is_some() {
-                self.flow_memo.type_cache_used();
                 return cached_type;
             }
         }
@@ -1333,7 +1334,6 @@ impl Checker {
         if self.flow_invocation_count != start_invocation_count {
             // PORT: Go lazily makes the nil map; the Rust map always exists.
             self.flow_type_cache.insert(node, t);
-            self.flow_memo.type_cache_used();
         }
         t
     }

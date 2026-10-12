@@ -652,6 +652,11 @@ impl Checker {
                 return t;
             }
         }
+        // flowmemo1: a later `checkExpressionCached` sets the link, and a
+        // walk then reads it instead (flow_memo.rs, M4).
+        if self.flow_memo.mode != FlowMemoMode::Off {
+            self.flow_memo_initializer_fallback();
+        }
         self.get_type_of_expression(node)
     }
 

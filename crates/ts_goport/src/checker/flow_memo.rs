@@ -79,6 +79,10 @@ const FLAG_TYPE_CACHE: u8 = 2;
 /// The frame may have reset `instantiationCount` (it was 0 at the start, or
 /// it changed).
 const FLAG_COUNT_RESET: u8 = 4;
+/// The frame read the contextual or inference stack and its answer depends
+/// on the entries older than the frame not matching (M6): used only while
+/// both stacks are empty.
+const FLAG_CONTEXT: u8 = 8;
 
 #[derive(Clone, Copy, Default)]
 struct Slot {
@@ -88,6 +92,8 @@ struct Slot {
     t: TypeId,
     height: u16,
     count_reset: bool,
+    /// `FLAG_CONTEXT`: used only while both context stacks are empty.
+    context: bool,
     /// The `flowTypeCache` epoch the value depends on, or 0.
     epoch: u32,
 }
@@ -122,6 +128,8 @@ struct SharedMeta {
     /// would-be hit's sub-walk); `steps` is what its frame walked.
     lost: bool,
     steps: u32,
+    /// The `flowTypeCache` epoch when the entry was pushed.
+    epoch: u32,
 }
 
 /// Go state that a re-walk of a stored frame must leave as it is (verify).
@@ -134,6 +142,7 @@ struct Snapshot {
     instantiations: u32,
     diagnostics: i32,
     suggestions: i32,
+    deferred: usize,
     flow_loop_cache: usize,
     flow_node_reachable: usize,
     flow_type_cache: usize,
@@ -160,6 +169,9 @@ struct Frame {
     total_instantiations: u32,
     created: u32,
     diagnostics: i32,
+    suggestions: i32,
+    /// `deferred_diagnostic_callbacks.len()` when the frame began.
+    deferred: usize,
     in_instantiation: bool,
     entry: FlowNodeId,
     entry_depth: i32,
@@ -169,6 +181,10 @@ struct Frame {
     checkpoints: u32,
     /// `type_resolutions.len()` when the frame began.
     resolutions: u32,
+    /// `contextual_infos.len()` and `inference_context_infos.len()` when
+    /// the frame began (both only grow along the frame stack).
+    contexts: u32,
+    inferences: u32,
     own_steps: u32,
     /// `S::steps` when the frame began.
     steps: u64,
@@ -212,6 +228,8 @@ stats!(
     blocked_count,
     blocked_impure,
     blocked_height,
+    blocked_disabled,
+    blocked_context,
     stores,
     store_slots,
     refused_nomemo,
@@ -228,6 +246,9 @@ stats!(
     saved_frames,
     lost_shared,
     lost_steps,
+    context_reads,
+    context_found_old,
+    init_fallback,
 );
 
 const STATS: usize = S::COUNT as usize;
@@ -423,6 +444,7 @@ impl Checker {
             instantiations: self.instantiation_count,
             diagnostics: self.diagnostics.count,
             suggestions: self.suggestion_diagnostics.count,
+            deferred: self.deferred_diagnostic_callbacks.len(),
             flow_loop_cache: self.flow_loop_cache.len(),
             flow_node_reachable: self.flow_node_reachable.len(),
             flow_type_cache: self.flow_type_cache.len(),
@@ -560,9 +582,13 @@ impl Checker {
             let memo = &mut self.flow_memo;
             memo.region_max_depth = memo.region_max_depth.max(depth);
         }
+        // A frame at serialization level 1 or more can make errors that Go
+        // drops (`add_diagnostic` at level 2), so it neither consults nor
+        // stores (M7).
         let memo = self.inline_level == 0
             && !reduce
             && !self.flow_analysis_disabled
+            && self.serialization_level == 0
             && self.flow_memo.region == 0;
         let frame = Frame {
             start: self.flow_memo.next_serial(),
@@ -571,12 +597,16 @@ impl Checker {
             total_instantiations: self.total_instantiation_count,
             created: self.flow_memo_created(),
             diagnostics: self.diagnostics.count,
+            suggestions: self.suggestion_diagnostics.count,
+            deferred: self.deferred_diagnostic_callbacks.len(),
             in_instantiation: !self.active_mappers.is_empty(),
             entry: flow,
             entry_depth: depth,
             memo,
             checkpoints: self.flow_memo.checkpoints.len() as u32,
             resolutions: self.type_resolutions.len() as u32,
+            contexts: self.contextual_infos.len() as u32,
+            inferences: self.inference_context_infos.len() as u32,
             own_steps: 0,
             steps: self.flow_memo.stats[S::steps as usize],
             hit: None,
@@ -644,6 +674,14 @@ impl Checker {
             Some(S::blocked_impure)
         } else if entry_depth + i32::from(slot.height) >= DEPTH_LIMIT {
             Some(S::blocked_height)
+        } else if self.flow_analysis_disabled {
+            // A nested walk reached the depth limit in this frame: Go's walk
+            // from here gets errorType from every nested walk (M1).
+            Some(S::blocked_disabled)
+        } else if slot.context
+            && !(self.contextual_infos.is_empty() && self.inference_context_infos.is_empty())
+        {
+            Some(S::blocked_context)
         } else {
             None
         };
@@ -705,6 +743,8 @@ impl Checker {
             || frame.in_instantiation
             || self.flow_memo_created() != frame.created
             || self.diagnostics.count != frame.diagnostics
+            || self.suggestion_diagnostics.count != frame.suggestions
+            || self.deferred_diagnostic_callbacks.len() != frame.deferred
         {
             self.flow_memo.regs.flags |= FLAG_EFFECTS;
         }
@@ -746,17 +786,7 @@ impl Checker {
             None
         };
         if let Some(problem) = problem {
-            let reference = f.borrow().reference;
-            let source_file = get_source_file_of_node(reference);
-            panic!(
-                "flowmemo verify: {} pos {} reference `{}` ({:?}) at flow node {:?} ({:?}): {problem}",
-                source_file_file_name(source_file),
-                reference.pos(),
-                get_text_of_node(reference),
-                reference.kind(),
-                hit.node,
-                hit.node.get_flow().flags,
-            );
+            self.flow_memo_panic(f, hit.node, &problem);
         }
         let memo = &mut self.flow_memo;
         let saved = memo.stats[S::steps as usize] - hit.steps;
@@ -776,7 +806,25 @@ impl Checker {
         if hit.slot.count_reset {
             regs.flags |= FLAG_COUNT_RESET;
         }
+        if hit.slot.context {
+            regs.flags |= FLAG_CONTEXT;
+        }
         memo.regs = regs;
+    }
+
+    /// Verify found a difference from Go at flow node `node`.
+    fn flow_memo_panic(&self, f: &Rc<RefCell<FlowState>>, node: FlowNodeId, problem: &str) -> ! {
+        let reference = f.borrow().reference;
+        let source_file = get_source_file_of_node(reference);
+        panic!(
+            "flowmemo verify: {} pos {} reference `{}` ({:?}) at flow node {:?} ({:?}): {problem}",
+            source_file_file_name(source_file),
+            reference.pos(),
+            get_text_of_node(reference),
+            reference.kind(),
+            node,
+            node.get_flow().flags,
+        );
     }
 
     /// Ends a keyed frame that returned a `sharedFlows` entry (index `i`):
@@ -802,7 +850,35 @@ impl Checker {
         let frame = self.flow_memo.frames.pop().expect("a flow memo frame");
         let meta = self.flow_memo.shared_meta[i];
         if meta.lost && self.flow_memo.region == 0 {
-            // An `on` mode walks this sub-graph again (or hits the memo).
+            // An `on` mode does not have this entry: this frame walks the
+            // node again. That walk equals the one Go's entry stands for only
+            // in the same state (W4): no reduce label (`getBranchLabelAntecedents`
+            // reads them, and a region has none), no loop analysis, the same
+            // `flowTypeCache` when the entry read it, room below the depth
+            // limit, and an entry that consumed no transient value and made
+            // nothing.
+            let problem = if !f.borrow().reduce_labels.is_empty() {
+                Some("a reduce label is active")
+            } else if !self.flow_loop_stack.is_empty() {
+                Some("loop analysis is active")
+            } else if meta.flags & FLAG_TYPE_CACHE != 0 && meta.epoch != self.flow_memo.epoch {
+                Some("the flowTypeCache is another one")
+            } else if frame.entry_depth + i32::from(meta.height) >= DEPTH_LIMIT {
+                Some("the depth limit is in reach")
+            } else if meta.transient != UNTAINTED {
+                Some("the entry consumed a transient value")
+            } else if meta.flags & FLAG_EFFECTS != 0 {
+                Some("the entry made something")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                self.flow_memo_panic(
+                    f,
+                    self.shared_flows[i].flow,
+                    &format!("Go answers from an entry that an `on` mode lacks, and {problem}"),
+                );
+            }
             let memo = &mut self.flow_memo;
             memo.shared_meta[i].lost = false;
             memo.bump(S::lost_shared, 1);
@@ -865,6 +941,7 @@ impl Checker {
                 flags: taint.flags,
                 lost,
                 steps: steps as u32,
+                epoch: memo.epoch,
             };
             if taint.transient != UNTAINTED {
                 f.borrow_mut().memo_impure += 1;
@@ -899,6 +976,7 @@ impl Checker {
                 t: t.t,
                 height,
                 count_reset: taint.flags & FLAG_COUNT_RESET != 0,
+                context: taint.flags & FLAG_CONTEXT != 0,
                 epoch: if taint.flags & FLAG_TYPE_CACHE != 0 {
                     memo.epoch
                 } else {
@@ -951,6 +1029,55 @@ impl Checker {
             let source = frame.start - 1;
             memo.taint(source);
         }
+    }
+
+    /// A read of the contextual (`inference` false) or inference stack that
+    /// found entry `found` or nothing (M6). The frames that began after that
+    /// entry was pushed read a value older than themselves: taint. The answer
+    /// also depends on the entries older than a frame not matching (the
+    /// contextual search starts at the oldest entry; an inference search
+    /// that finds nothing reads them all), so the frames get `FLAG_CONTEXT`.
+    /// The newest inference match reads no older entry.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn flow_memo_context_read(&mut self, inference: bool, found: Option<usize>) {
+        let memo = &mut self.flow_memo;
+        if memo.frames.is_empty() {
+            return;
+        }
+        memo.bump(S::context_reads, 1);
+        if !inference || found.is_none() {
+            memo.regs.flags |= FLAG_CONTEXT;
+        }
+        if let Some(j) = found {
+            let first = memo.frames.partition_point(|frame| {
+                (if inference {
+                    frame.inferences
+                } else {
+                    frame.contexts
+                }) as usize
+                    <= j
+            });
+            if let Some(frame) = memo.frames.get(first) {
+                let source = frame.start - 1;
+                memo.bump(S::context_found_old, 1);
+                memo.taint(source);
+            }
+        }
+    }
+
+    /// `getTypeOfInitializer` (flow.go:2264) found no link and computes the
+    /// type without caching it (M4). A later `checkExpressionCached` sets the
+    /// link, and a later walk reads that instead: every active frame is
+    /// tainted.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn flow_memo_initializer_fallback(&mut self) {
+        let memo = &mut self.flow_memo;
+        if !memo.frames.is_empty() {
+            memo.bump(S::init_fallback, 1);
+        }
+        memo.taint(0);
     }
 
     /// Taint by the newest flow loop stack entry (Go does not cache a

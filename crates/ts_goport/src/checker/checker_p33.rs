@@ -340,6 +340,8 @@ impl Checker {
                 // We can call checkExpressionCached because spread expressions never have a contextual type.
                 if is_spread_element(arg) {
                     if !self.flow_loop_stack.is_empty() {
+                        // flowmemo1: a choice by the loop stack (flow_memo.rs, M5).
+                        self.flow_memo_taint_loop_top();
                         spread_type = self.check_expression(arg.expression());
                     } else {
                         spread_type = self.check_expression_cached(arg.expression());

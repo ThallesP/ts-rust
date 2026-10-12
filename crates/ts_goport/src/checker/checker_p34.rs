@@ -63,13 +63,16 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31435 findContextualNode
-    pub fn find_contextual_node(&self, node: Node, include_caches: bool) -> i32 {
-        for (i, info) in self.contextual_infos.iter().enumerate() {
-            if node == info.node && (include_caches || !info.is_cache) {
-                return i as i32;
-            }
+    pub fn find_contextual_node(&mut self, node: Node, include_caches: bool) -> i32 {
+        let found = self
+            .contextual_infos
+            .iter()
+            .position(|info| node == info.node && (include_caches || !info.is_cache));
+        // flowmemo1: a read of the contextual stack (flow_memo.rs, M6).
+        if self.flow_memo.mode != FlowMemoMode::Off {
+            self.flow_memo_context_read(false, found);
         }
-        -1
+        found.map_or(-1, |i| i as i32)
     }
 
     // Go: checker/checker.go:31446 isContextSensitive
@@ -188,14 +191,19 @@ impl Checker {
     }
 
     // Go: checker/checker.go:31514 getInferenceContext
-    pub fn get_inference_context(&self, node: Node) -> InferenceContextId {
+    pub fn get_inference_context(&mut self, node: Node) -> InferenceContextId {
         // Go: `slices.Backward` (ts#63902).
-        for v in self.inference_context_infos.iter().rev() {
-            if is_node_descendant_of(node, v.node) {
-                return v.context;
-            }
+        let found = self
+            .inference_context_infos
+            .iter()
+            .rposition(|v| is_node_descendant_of(node, v.node));
+        // flowmemo1: a read of the inference stack (flow_memo.rs, M6).
+        if self.flow_memo.mode != FlowMemoMode::Off {
+            self.flow_memo_context_read(true, found);
         }
-        InferenceContextId::NIL
+        found.map_or(InferenceContextId::NIL, |i| {
+            self.inference_context_infos[i].context
+        })
     }
 
     // Go: checker/checker.go:31523 getTypeFacts
