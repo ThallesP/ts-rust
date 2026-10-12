@@ -281,9 +281,21 @@ impl Checker {
         self.get_type_at_flow_node_impl::<false>(f, flow, depth)
     }
 
+    // The off mode's branch to the memo copy is cold; the copy itself is
+    // optimized as hot code (`on` mode runs most walks there).
     #[cold]
     #[inline(never)]
     fn get_type_at_flow_node_memo(
+        &mut self,
+        f: &Rc<RefCell<FlowState>>,
+        flow: FlowNodeId,
+        depth: i32,
+    ) -> FlowType {
+        self.get_type_at_flow_node_memo_body(f, flow, depth)
+    }
+
+    #[inline(never)]
+    fn get_type_at_flow_node_memo_body(
         &mut self,
         f: &Rc<RefCell<FlowState>>,
         flow: FlowNodeId,

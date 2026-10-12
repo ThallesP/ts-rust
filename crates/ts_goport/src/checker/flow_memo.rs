@@ -694,7 +694,8 @@ impl Checker {
 
     /// Begins a frame of a keyed walk (`get_type_at_flow_node`, after the
     /// depth check). `depth` is the walk depth before this call.
-    #[cold]
+    // Not `#[cold]`: in `on` mode these run at every step and frame of a
+    // keyed walk (`get_type_at_flow_node_memo_body`).
     #[inline(never)]
     pub(crate) fn flow_memo_begin(
         &mut self,
@@ -756,7 +757,8 @@ impl Checker {
     /// returns the type: when the node ends the iteration, Go's last shared
     /// node of the iteration is known and gets its entry; a hit in the middle
     /// of an iteration pushes none. In verify, Go's walk runs on.
-    #[cold]
+    // Not `#[cold]`: in `on` mode these run at every step and frame of a
+    // keyed walk (`get_type_at_flow_node_memo_body`).
     #[inline(never)]
     pub(crate) fn flow_memo_turn(
         &mut self,
@@ -1015,7 +1017,8 @@ impl Checker {
 
     /// Ends a keyed frame that returned a `sharedFlows` entry (index `i`):
     /// the frame consumed what that entry's computation consumed.
-    #[cold]
+    // Not `#[cold]`: in `on` mode these run at every step and frame of a
+    // keyed walk (`get_type_at_flow_node_memo_body`).
     #[inline(never)]
     pub(crate) fn flow_memo_end_shared(&mut self, f: &Rc<RefCell<FlowState>>, i: usize) {
         if f.borrow().memo_key == KEYLESS {
@@ -1100,7 +1103,8 @@ impl Checker {
     /// Ends a keyed frame that computed `t` at `last` (the node that ended
     /// its iteration). `shared` is the index of the `sharedFlows` entry the
     /// frame pushed, if any. Stores the result when the store rule holds.
-    #[cold]
+    // Not `#[cold]`: in `on` mode these run at every step and frame of a
+    // keyed walk (`get_type_at_flow_node_memo_body`).
     #[inline(never)]
     pub(crate) fn flow_memo_end(
         &mut self,
