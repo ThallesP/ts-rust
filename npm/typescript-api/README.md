@@ -69,12 +69,14 @@ Options that TypeScript 7 removed:
 | `target: ES3`/`ES5`, `module: None`/`AMD`/`UMD`/`System`, `outFile`, `moduleResolution: classic` | tsc-rs reports TS5108/TS5102 ("has been removed"), which `ignoreDeprecations` does not silence. |
 | `keyofStringsOnly` and the other options TypeScript 5.5 removed | TS5102, as in TypeScript 6.0. |
 
+The language service is TypeScript 6.0's own services code on tsc-rs's checker. Diagnostics,
+`getEmitOutput`, quick info, signature help, go to definition, find references and completion
+details give TypeScript 6.0's text (names inside printed types come as plain text parts, not
+`className` and the like).
+
 Not supported, with a `tsc-rs: ... is not supported` error rather than a wrong answer:
 
-- Language service features run TypeScript 6.0's own services code on tsc-rs's checker. Diagnostics,
-  `getEmitOutput`, quick info, signature help, go to definition, find references and completion
-  details give TypeScript 6.0's text (names inside printed types come as plain text parts, not
-  `className` and the like). A feature that needs a checker member tsc-rs cannot answer throws.
+- Language service features that need a checker member tsc-rs cannot answer.
 - A few TypeChecker members tsc-rs cannot answer: `getStringLiteralType`,
   `getNumberLiteralType`, `getBigIntLiteralType`, `getSymbolOfExpando`, and some argument forms of
   others. `symbolToString`, `signatureToString` and a few more are worked out in JS.
@@ -105,10 +107,10 @@ all of them until it returns.
 - `scripts/build.mjs` turns seven functions of TypeScript 6.0.3's bundle into hook points:
   `createProgram`, `createBuilderProgram`, `readBuilderProgram`, `createTypeChecker`,
   `createCompilerHostWorker`, `transpileWorker` and `createLanguageService`. Each calls
-  `__tsrsHooks.<name>` when it is set. `src/index.js` sets them when the bundle loads. The build
-  also copies TypeScript 6.0.3's tsserver, typingsInstaller and locale files and writes `lib/tsc.js`. Because the
+  `__tsrsHooks.<name>` when it is set. `src/index.js` sets them when the bundle loads. Because the
   hooks are inside the bundle, TypeScript 6.0's own callers (watch, the language service,
-  `ts.server`, `transpileModule`) reach them too.
+  `ts.server`, `transpileModule`) reach them too. The build also copies TypeScript 6.0.3's
+  tsserver, typingsInstaller and locale files and writes `lib/tsc.js`.
 - `crates/ts_napi` runs tsc-rs's API server (the server behind `tsgo --api`) on a thread of the
   Node process, with the same msgpack messages over in-memory pipes. A request blocks the JS
   thread; file system callbacks run on the JS thread during the request. `src/session.js` is the
@@ -162,9 +164,9 @@ Results on Linux x64, tsc-rs at the pin above:
 | TypeScript 6.0.3's compiler and conformance baselines (29,946) | 24,881 equal TypeScript 6.0's. Of the other 5,065, 1,360 equal TypeScript 7's own baselines, 3,678 use settings TypeScript 7 removed, 6 have no TypeScript 7 baseline and 21 differ |
 
 The 21: in 19, declaration emit reads `package.json` from the disk instead of the host's in-memory
-files, because tsc-rs runs emit on its checker threads, whose file system is the operating system's
-(a change in `crates/ts_goport`); in 2, a circularity error sits at another node, as with tsc-rs's
-own command line.
+files, because tsc-rs runs emit on its checker threads, whose file system is the operating
+system's; the fix is in `crates/ts_goport`. In 2, a circularity error sits at another node, as it
+does with tsc-rs's own command line.
 
 Speed, the same calls through typescript@6.0.3 and through the package (one run each on a shared
 10-core host, so rough):
