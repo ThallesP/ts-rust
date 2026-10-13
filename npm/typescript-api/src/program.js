@@ -12,17 +12,23 @@ const maxCachedPaths = 65536;
 // Past this many, the paths tsc-rs found missing are forgotten and it reads everything again.
 const maxMissingProbes = 131072;
 
-// The programs that have each SourceFile, newest last. A language service or a ts.server project
-// shares unchanged SourceFiles between its programs, as TS 6.0 does, and an older program's
-// compiler state can be released (see NativeProgram). A program leaves these lists when a program
-// made from it replaces it, so that the SourceFiles a host keeps do not keep old programs (and their
-// tsc-rs snapshots) alive. No WeakRef: one keeps its program alive until the end of the current job,
-// and a synchronous loop of programs would keep them all.
+// WeakRefs of the programs that have each SourceFile, newest last. A language service or a
+// ts.server project shares unchanged SourceFiles between its programs, as TS 6.0 does, and a host
+// may keep SourceFiles (a cache of lib files) for many fresh programs: the lists must not keep
+// those programs (and their tsc-rs snapshots) alive. Joining a list compares refs without
+// dereferencing them: a deref keeps an unreachable program alive to the end of the job.
 const programsOfSourceFiles = new WeakMap();
+const maxProgramRefs = 64;
 
 function programOfSourceFile(sourceFile) {
-    const programs = programsOfSourceFiles.get(sourceFile);
-    return programs?.findLast(program => !program.released);
+    const refs = programsOfSourceFiles.get(sourceFile) ?? [];
+    for (let index = refs.length - 1; index >= 0; index--) {
+        const program = refs[index].deref();
+        if (program !== undefined && !program.released) {
+            return program;
+        }
+    }
+    return undefined;
 }
 
 // Native state a program holds: its snapshot and, with a custom module resolver, the resolver.
@@ -104,6 +110,7 @@ class NativeProgram {
             this[name] = this[name].bind(this);
         }
         this.ts = ts;
+        this.selfRef = new WeakRef(this);
         this.rootNames = rootNames;
         this.options = options;
         this.projectReferences = projectReferences;
@@ -247,22 +254,26 @@ class NativeProgram {
     }
 
     joinSourceFile(sourceFile) {
-        let programs = programsOfSourceFiles.get(sourceFile);
-        if (programs === undefined) {
-            programs = [];
-            programsOfSourceFiles.set(sourceFile, programs);
+        let refs = programsOfSourceFiles.get(sourceFile);
+        if (refs === undefined) {
+            refs = [];
+            programsOfSourceFiles.set(sourceFile, refs);
         }
-        if (programs.at(-1) !== this) {
-            removeItem(programs, this);
-            programs.push(this);
+        if (refs.at(-1) === this.selfRef) {
+            return;
         }
+        removeItem(refs, this.selfRef);
+        if (refs.length >= maxProgramRefs) {
+            refs.splice(0, refs.length - maxProgramRefs / 2);
+        }
+        refs.push(this.selfRef);
     }
 
     leaveSourceFiles() {
         const leave = sourceFile => {
-            const programs = sourceFile === undefined ? undefined : programsOfSourceFiles.get(sourceFile);
-            if (programs !== undefined) {
-                removeItem(programs, this);
+            const refs = sourceFile === undefined ? undefined : programsOfSourceFiles.get(sourceFile);
+            if (refs !== undefined) {
+                removeItem(refs, this.selfRef);
             }
         };
         this.hostSourceFiles.forEach(leave);

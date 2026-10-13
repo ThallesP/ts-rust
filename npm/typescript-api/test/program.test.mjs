@@ -1338,3 +1338,35 @@ test("a module resolver that a ts.server plugin gives its project answers module
     assert.deepEqual(actual, describe(ts6));
     assert.deepEqual(actual.files, ["shims/button-css.d.ts", "src/a.ts"]);
 });
+
+test("fresh programs whose host keeps the lib SourceFiles can be garbage collected", async () => {
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc");
+    const cache = new Map();
+    let collected = 0;
+    const registry = new FinalizationRegistry(() => collected++);
+    for (let index = 0; index < 24; index++) {
+        const text = `export const x${index}: number = ${index};\n`;
+        const host = ts.createCompilerHost({});
+        const getSourceFile = host.getSourceFile;
+        host.getSourceFile = (fileName, languageVersion) => {
+            if (fileName === "/t.ts") {
+                return ts.createSourceFile(fileName, text, languageVersion, true);
+            }
+            if (!cache.has(fileName)) {
+                cache.set(fileName, getSourceFile(fileName, languageVersion));
+            }
+            return cache.get(fileName);
+        };
+        host.fileExists = fileName => fileName === "/t.ts" || ts.sys.fileExists(fileName);
+        const program = ts.createProgram(["/t.ts"], { strict: true }, host);
+        assert.equal(ts.getPreEmitDiagnostics(program).length, 0);
+        registry.register(program, index);
+        await new Promise(resolve => setImmediate(resolve));
+    }
+    for (let round = 0; round < 3; round++) {
+        gc();
+        await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok(collected >= 20, `${collected} of 24 programs collected`);
+});
