@@ -177,21 +177,33 @@ impl Checker {
     }
 
     // Go: checker/checker.go:12474 isInParameterInitializerBeforeContainingFunction
+    // PERF: parentname1. Each step reads the parent and its kind once
+    // through a view (`NodeRef`), as Go loads `node.Parent` and its `Kind`.
+    // The walk had 4 to 5 `parent()` reads per step, each a registry
+    // lookup (checkline1). The tests and their order are Go's.
     pub fn is_in_parameter_initializer_before_containing_function(&self, node: Node) -> bool {
-        let mut node = node;
+        let mut node = NodeRef::new(node);
         let mut in_binding_initializer = false;
-        while node.parent().is_some() && !is_function_like(node.parent()) {
-            if is_parameter_declaration(node.parent()) {
-                if in_binding_initializer || node.parent().initializer() == node {
-                    return true;
-                }
+        loop {
+            let parent = node.parent();
+            if parent.is_nil() {
+                break;
+            }
+            let parent_kind = parent.kind();
+            if is_function_like_kind(parent_kind) {
+                break;
+            }
+            if parent_kind == SyntaxKind::Parameter
+                && (in_binding_initializer || parent.initializer() == node.node())
+            {
+                return true;
             }
 
-            if is_binding_element(node.parent()) && node.parent().initializer() == node {
+            if parent_kind == SyntaxKind::BindingElement && parent.initializer() == node.node() {
                 in_binding_initializer = true;
             }
 
-            node = node.parent();
+            node = parent;
         }
 
         false

@@ -300,6 +300,15 @@ Root decision of 2026-10-11 (state note `tbxperf0-result-2026-10-11`; data in `t
 - Emit: `perf.sh` runs `tsgo -p` with emit, and the read-only inputs refuse the writes. The emit is about 25% of
   the effect instructions. For checker work add `-- --noEmit`: R190 against R189 on effect, st, is +9.39% with
   emit and +12.80% with `--noEmit` (+4.17 G instructions both ways).
+- Hono configuration: a timing report names the Hono configuration it ran (bin, tsconfig, args, emit or
+  `--noEmit`, exit code and error count), so its counts are not read as the gate result. `perf.sh` and the
+  timing output checks run `tsgo -p target/project-inputs/hono/source/tsconfig.build.json` on the read-only
+  input. The input refuses the tsbuildinfo write (TS5033, also with `--noEmit`). With `--noEmit` they give 3
+  errors and exit 1. With emit the run ends in a nil-dereference panic, exit 2 and no diagnostics, as Go at the
+  pin does: the TS5033 has no file and `diagnosticToStringBuilder` (Go snapshot.go:405, port
+  `execute/incremental/snapshot.rs`) reads its file name. So a Hono timing with emit times a run that panics in
+  the emit. The gate item `measure/hono` and the bound runs run `goport -p` on the same tsconfig: exit 2 with the
+  2 TS7031 errors, Go's answer at the pin (honorec1).
 - Host line: CPU family/model and name, microcode, kernel, perf version, THP and the virtio balloon free page
   reporting state (`perf.sh host`). `perf.sh compare <base> <new>` (bin0 of base against each bin of new;
   instructions and RSS, no wall) refuses two runs with different host lines, tsgo args or env. Fresh testboxes gave

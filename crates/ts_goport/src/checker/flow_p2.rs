@@ -67,7 +67,9 @@ impl Checker {
         name_type: TypeId,
         assume_true: bool,
     ) -> TypeId {
-        let name = self.get_property_name_from_type(name_type);
+        // PERF: namekeys1. The interned name, so the lookup in each
+        // constituent (`is_type_presence_possible`) goes by id.
+        let name = self.get_property_name_from_type_as_name(name_type);
         let is_known_property = self.some_type(t, &mut |c: &mut Checker, t: TypeId| {
             c.is_type_presence_possible(t, &name, true /*assumeTrue*/)
         });
@@ -100,7 +102,7 @@ impl Checker {
     pub fn is_type_presence_possible(
         &mut self,
         t: TypeId,
-        prop_name: &str,
+        prop_name: &Name,
         assume_true: bool,
     ) -> bool {
         let prop = self.get_property_of_type(t, prop_name);
@@ -1346,7 +1348,7 @@ impl Checker {
                 if is_access_expression(target) {
                     let (target_property_name, ok) = self.get_accessed_property_name(target);
                     if ok {
-                        return source.right().text() == target_property_name
+                        return source.right().text_is(&target_property_name)
                             && self.is_matching_reference(source.left(), target.expression());
                     }
                 }
@@ -1530,17 +1532,21 @@ impl Checker {
     }
 
     // Go: checker/flow.go:1727 getAccessedPropertyName
-    // PERF: returns a `Cow`. Node text lives for the program, so identifier
-    // and literal names borrow it; only computed names allocate.
-    pub fn get_accessed_property_name(&mut self, access: Node) -> (Cow<'static, str>, bool) {
+    // PERF: namekeys1. Returns the interned `Name` of Go's string, so the
+    // callers look properties up by id (`TableKey::Name`) and compare names
+    // by id. A property access reads the name that its store node keeps
+    // (`text_name`); other names are interned here.
+    pub fn get_accessed_property_name(&mut self, access: Node) -> (Name, bool) {
         if is_property_access_expression(access) {
-            return (Cow::Borrowed(access.name().text()), true);
+            return (access.name().text_name(), true);
         }
         if is_element_access_expression(access) {
-            return self.try_get_element_access_expression_name(access);
+            let (name, ok) = self.try_get_element_access_expression_name(access);
+            return (Name::from(name.as_ref()), ok);
         }
         if is_binding_element(access) {
-            return self.get_destructuring_property_name(access);
+            let (name, ok) = self.get_destructuring_property_name(access);
+            return (Name::from(name.as_ref()), ok);
         }
         if is_parameter_declaration(access) {
             let index = access
@@ -1550,9 +1556,9 @@ impl Checker {
                 .iter()
                 .position(|&p| p == access)
                 .map_or(-1, |i| i as i32);
-            return (Cow::Owned(index.to_string()), true);
+            return (Name::from(index.to_string()), true);
         }
-        (Cow::Borrowed(""), false)
+        (Name::default(), false)
     }
 
     // Go: checker/flow.go:1743 tryGetElementAccessExpressionName

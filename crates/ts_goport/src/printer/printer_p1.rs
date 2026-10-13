@@ -637,6 +637,10 @@ fn get_literal_text_of_node_worker(
 // Go: printer/printer.go:230 getTextOfNode
 // PORT: free function form of the Printer method. See
 // `get_literal_text_of_node_worker`.
+// `Printer::write_factory_name_text` takes the `node.Text()` return of the
+// Identifier arm for a factory name. It uses the same two tests
+// (`has_auto_generate_info` and `can_use_source_file`). A change to this
+// function must change it too.
 fn get_text_of_node_worker(
     generator: &mut NameGenerator,
     state: NodeTextState<'_>,
@@ -648,15 +652,10 @@ fn get_text_of_node_worker(
     // `IsStringLiteral` and the switch. A factory node reads its kind in
     // the thread's arena, so the port reads it once.
     let kind = node.kind();
-    if matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier) {
-        // PERF: no hash lookup while the map is empty.
-        let auto_generated = {
-            let auto_generate = emit_context.auto_generate.borrow();
-            !auto_generate.is_empty() && auto_generate.contains_key(&node)
-        };
-        if auto_generated {
-            return Cow::Owned(generator.generate_name(node));
-        }
+    if matches!(kind, SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier)
+        && emit_context.has_auto_generate_info(node)
+    {
+        return Cow::Owned(generator.generate_name(node));
     }
 
     if kind == SyntaxKind::StringLiteral {
@@ -667,12 +666,12 @@ fn get_text_of_node_worker(
     }
 
     let current_source_file = state.current_source_file;
-    let can_use_source_file =
-        current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node);
 
     match kind {
         SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier | SyntaxKind::JsxNamespacedName => {
-            if !can_use_source_file || get_source_file_of_node(node) != state.current_original {
+            if !can_use_source_file(current_source_file, node)
+                || get_source_file_of_node(node) != state.current_original
+            {
                 return Cow::Borrowed(node.text());
             }
         }
@@ -699,6 +698,13 @@ fn get_text_of_node_worker(
         include_trivia,
         state.skip_trivia_memo,
     )
+}
+
+/// Go `canUseSourceFile` of `getTextOfNode` (printer.go:241): the text of
+/// `node` can come from `current_source_file`. `get_text_of_node_worker`
+/// and `Printer::write_factory_name_text` both use it.
+fn can_use_source_file(current_source_file: Node, node: Node) -> bool {
+    current_source_file.is_some() && node.parent().is_some() && !node_is_synthesized(node)
 }
 
 /// Go `scanner.GetSourceTextOfNodeFromSourceFile` that borrows the source
@@ -1957,18 +1963,15 @@ impl Printer {
     // PERF: printfast1. `Node::text` of a factory name interns the text of
     // its node data at each read (`scoped_node_text`). Go reads a field.
     // Type text (`typeToString`) prints its names here.
+    // PORT: the tests are the ones of the Identifier arm of
+    // `get_text_of_node_worker` (`has_auto_generate_info`,
+    // `can_use_source_file`), so the two cannot differ.
     fn write_factory_name_text(&mut self, node: Node) -> bool {
         if !matches!(
             node.kind(),
             SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
         ) || self.emit_context.has_auto_generate_info(node)
-        {
-            return false;
-        }
-        // Go `canUseSourceFile`: then the text can come from the source file.
-        if self.current_source_file.is_some()
-            && node.parent().is_some()
-            && !node_is_synthesized(node)
+            || can_use_source_file(self.current_source_file, node)
         {
             return false;
         }

@@ -145,6 +145,30 @@ impl Checker {
         (Cow::Borrowed(""), false)
     }
 
+    /// `get_effective_property_name_for_property_name_node` as the interned
+    /// `Name` of Go's string, or `None` when Go's `ok` is false. Equal texts
+    /// give equal names, so `a`, `"a"`, `["a"]` and a computed name whose
+    /// type is the literal "a" give one key, as Go's string does.
+    // PERF: parentname1. An Identifier or PrivateIdentifier reads the name
+    // interned with its store slot (`text_name`): no text read and no
+    // intern. The other names intern Go's string.
+    pub fn get_effective_property_name_key(&mut self, node: Node) -> Option<Name> {
+        if matches!(
+            node.kind(),
+            SyntaxKind::Identifier | SyntaxKind::PrivateIdentifier
+        ) {
+            // PORT: Go tests the text against `InternalSymbolNameMissing`
+            // first. An identifier's text never has its U+FDD0 (not an
+            // identifier character; a missing identifier has the text ""),
+            // so the identifier name is always Go's `(name, true)`.
+            let name = node.text_name();
+            debug_assert_ne!(name.as_str(), INTERNAL_SYMBOL_NAME_MISSING);
+            return Some(name);
+        }
+        let (text, ok) = self.get_effective_property_name_for_property_name_node(node);
+        ok.then(|| Name::from(text.as_ref()))
+    }
+
     // Go: checker/checker.go:19129 tryGetNameFromType
     pub fn try_get_name_from_type(&mut self, t: TypeId) -> (String, bool) {
         let flags = self.ty(t).flags;
@@ -2149,7 +2173,7 @@ type T9 = string;
     /// `a.ts`, and calls `f` on its checker with the codes of its
     /// diagnostics and the types of its type aliases. Each call writes its
     /// files in a temp dir of its own.
-    fn with_checked_a<R: Send + 'static>(
+    pub(super) fn with_checked_a<R: Send + 'static>(
         files: &[(&str, String)],
         options: &str,
         f: impl FnOnce(&mut Checker, Vec<i32>, Vec<TypeId>) -> R + Send + 'static,
@@ -2893,5 +2917,79 @@ export = o.s;
         // in `y.ts` only TS7053 for `missingY`.
         assert_eq!(a_codes, [2671, 2671]);
         assert_eq!(y_codes, [7053]);
+    }
+}
+
+#[cfg(test)]
+mod object_literal_name_tests {
+    use super::augment_filter_tests::with_checked_a;
+    use super::*;
+
+    /// Duplicate names in object literals (`check_grammar_object_literal_expression`
+    /// keyed by `get_effective_property_name_key`): an identifier, a string,
+    /// a numeric name, a computed literal, a computed const name and a
+    /// unique symbol with one text are one key, with up to 8 names inline
+    /// (o11) and after the ninth name (o12).
+    #[test]
+    fn object_literal_duplicate_names_are_one_key() {
+        let a = r#"const K = "c";
+const K2 = "k8";
+declare const sym: unique symbol;
+const h = 1;
+export const o1 = { a: 1, "a": 2 };
+export const o2 = { "b": 1, ["b"]: 2 };
+export const o3 = { c: 1, [K]: 2 };
+export const o4 = { 1: 0, "1": 0, [1]: 0 };
+export const o5 = { get d() { return 1; }, set "d"(v: number) {} };
+export const o6 = { get ["e"]() { return 1; }, get e() { return 2; } };
+export const o7 = { f() {}, ["f"]() {} };
+export const o8 = { g: 1, get "g"() { return 1; } };
+export const o9 = { [sym]: 1, [sym]: 2 };
+export const o10 = { h, h };
+export const o11 = { m0: 0, m1: 0, m2: 0, m3: 0, m4: 0, m5: 0, m6: 0, m7: 0, "m0": 0 };
+export const o12 = { k0: 0, k1: 0, k2: 0, k3: 0, k4: 0, k5: 0, k6: 0, k7: 0, k8: 0, k9: 0, "k2": 0, [K2]: 0 };
+"#;
+        let files = [("a.ts", a.to_string())];
+        let options = r#""strict": true, "noEmit": true, "target": "es2022", "module": "commonjs""#;
+        let lines = with_checked_a(&files, options, |c, _, _| {
+            let file = c
+                .files
+                .iter()
+                .copied()
+                .find(|&file| source_file_file_name(file).ends_with("/a.ts"))
+                .expect("a.ts is not in the program");
+            let ctx = crate::gostd::context::background();
+            let diags = crate::program::get_semantic_diagnostics_with_checker(&ctx, c, file);
+            crate::program::sort_and_deduplicate_diagnostics(diags)
+                .iter()
+                .map(|d| {
+                    let text = crate::program::format_diagnostic(d);
+                    text[text.find("a.ts(").expect("a.ts diagnostic")..]
+                        .trim_end()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+        });
+        // Go: `tsgo-oracle-fed0bf24149f -p tsconfig.json --pretty false` on
+        // a.ts with these options.
+        let go = [
+            "a.ts(5,27): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(6,29): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(7,27): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(8,27): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(8,35): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(10,25): error TS2300: Duplicate identifier '[\"e\"]'.",
+            "a.ts(10,52): error TS1118: An object literal cannot have multiple get/set accessors with the same name.",
+            "a.ts(10,52): error TS2300: Duplicate identifier 'e'.",
+            "a.ts(11,21): error TS2300: Duplicate identifier 'f'.",
+            "a.ts(11,29): error TS2300: Duplicate identifier '[\"f\"]'.",
+            "a.ts(12,31): error TS1119: An object literal cannot have property and accessor with the same name.",
+            "a.ts(13,31): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(14,25): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(15,78): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(16,92): error TS1117: An object literal cannot have multiple properties with the same name.",
+            "a.ts(16,101): error TS1117: An object literal cannot have multiple properties with the same name.",
+        ];
+        assert_eq!(lines, go);
     }
 }

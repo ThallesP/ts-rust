@@ -340,7 +340,8 @@ impl Printer {
         let mut previous_sibling = Node::NIL;
         // PERF: printfast1. `previous_sibling.End()`, read with its `Pos`
         // before its emit. Go reads its `Loc` again; a factory node reads
-        // it in the thread's arena. The printer moves no list node.
+        // it in the thread's arena. The printer moves no list node: a debug
+        // build asserts that the emit kept the end.
         let mut previous_end = 0;
         let mut should_decrease_indent_after_emit = false;
         for &child in children {
@@ -417,6 +418,11 @@ impl Printer {
             let child_loc = child.loc();
             self.next_list_element_pos = child_loc.pos();
             emit(self, child);
+            debug_assert_eq!(
+                child.end(),
+                child_loc.end(),
+                "the emit of a list child moved its end"
+            );
 
             if should_decrease_indent_after_emit {
                 self.decrease_indent();

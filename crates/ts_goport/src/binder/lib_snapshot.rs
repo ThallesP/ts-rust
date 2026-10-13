@@ -31,6 +31,10 @@
 //! ```
 //!
 //! `snapshot_matches_live_bind` fails while the blob is stale.
+//!
+//! A snapshot lib must have no private class member: a private name holds
+//! a hash of the lib's file name (`private_name_key`), and the key does not
+//! hold the file name. `generate_lib_bind_snapshot` fails on one.
 //! `GOPORT_LIB_SNAPSHOT=0` turns the snapshot off (for A/B timing), and
 //! `GOPORT_LIB_SNAPSHOT=trace` writes one line per lib file to stderr.
 //!
@@ -1250,6 +1254,15 @@ mod tests {
                 unported_report(),
                 unported,
                 "{lib}: the live bind hit unported code, which a load would skip"
+            );
+            let private: Vec<Name> = live.1.private_names().collect();
+            assert!(
+                private.is_empty(),
+                "{lib}: the lib has private class members ({private:?}). A private name holds a \
+                 hash of the lib's file name (`private_name_key`), and the snapshot key does not \
+                 hold the file name, so a load at another lib path (a noembed build, another lib \
+                 dir) would give the old path's names. Put the file name in the key first, or \
+                 key private names by something that does not depend on the path"
             );
             let key = SnapshotKey::of(file).unwrap_or_else(|| panic!("{lib}: no key"));
             let section =

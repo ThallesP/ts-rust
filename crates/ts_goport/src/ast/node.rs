@@ -295,6 +295,24 @@ macro_rules! match_data {
     }};
 }
 
+/// True when `$k`, the kind of a published store node, fits none of the
+/// data variants `$v`: `kind_lacks_data!` on a kind that the caller read.
+macro_rules! kind_lacks_variants {
+    ($k:expr, [$($v:ident),+]) => {{
+        let kind: SyntaxKind = $k;
+        kind != SyntaxKind::Unknown $(&& !variant_has_kind!($v, kind))+
+    }};
+}
+
+/// `read_ast_node_miss` with the nil check of `with_data!`: the node data
+/// read of a node that is not a published store node with node data
+/// (`FrozenNode::data`).
+#[inline]
+pub(crate) fn read_data_miss<R>(n: Node, read: impl FnOnce(NodeData<'_>) -> R) -> R {
+    assert!(n.is_some(), "nil node dereference");
+    crate::ast::synthetic::read_ast_node_miss(n, read)
+}
+
 /// Go field read by node data variant. Each arm lists `NodeData` variants,
 /// binds the variant data to `$d` and the node's file to `$file`, and
 /// evaluates `$e`. Other variants give `$def`.
@@ -302,16 +320,67 @@ macro_rules! match_data {
 /// PERF: a published store node whose kind fits no listed variant gives `$def`
 /// from its node record (`kind_lacks_data!`), without the pointer
 /// chase to its astdata node and data.
+// PERF: noderead2. The kind test and the node data read share one registry
+// lookup (`FrozenNode`). They were two (`frozen_store_kind`, then
+// `with_data!`), and the `OnceLock` acquire load of each stops LLVM from
+// merging them. Go reads `n.Kind` and `n.data` from one struct.
 macro_rules! by_data {
     ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$file:ident, $d:ident| $e:expr),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
-            $def
-        } else {
-            with_data!(node, |d| {
-                match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
-            })
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => {
+                debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
+                $def
+            }
+            _ => match frozen.and_then(FrozenNode::data) {
+                Some(d) => match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+),
+                None => read_data_miss(node, |d| {
+                    match_data!(node.file_index(), d, $def, $([$($v),+] => |$file, $d| $e),+)
+                }),
+            },
+        }
+    }};
+}
+
+/// `by_data!` for arms that read child nodes: each arm binds `$ids`, the
+/// `ChildIds` of the node, in place of its file. A published store node
+/// gives its kind, node data and child ids from one registry lookup.
+// PERF: noderead2. `by_data!` and then `Node::new` for the child were two
+// registry lookups (three before `by_data!` shared one).
+macro_rules! by_child_ids {
+    ($n:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$ids:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let node: Node = $n;
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => {
+                debug_assert!(!with_data!(node, |d| matches!(d, $($(NodeData::$v(_))|+)|+)));
+                $def
+            }
+            _ => match frozen.and_then(|f| Some((f.data()?, f.ids()))) {
+                Some((d, ids)) => {
+                    match_ids!(ChildIds::Frozen(ids), d, $def, $([$($v),+] => |$ids, $d| $e),+)
+                }
+                None => read_data_miss(node, |d| {
+                    let ids = ChildIds::File(node.file_index());
+                    match_ids!(ids, d, $def, $([$($v),+] => |$ids, $d| $e),+)
+                }),
+            },
+        }
+    }};
+}
+
+/// The data match of `by_child_ids!`: `match_data!` with the `ChildIds`
+/// `$ids_in` in place of the file.
+macro_rules! match_ids {
+    ($ids_in:expr, $data:expr, $def:expr, $([$($v:ident),+ $(,)?] => |$ids:ident, $d:ident| $e:expr),+ $(,)?) => {{
+        let ids: ChildIds = $ids_in;
+        match $data {
+            $($(NodeData::$v($d) => {
+                let $ids = ids;
+                $e
+            })+)+
+            _ => $def,
         }
     }};
 }
@@ -320,20 +389,125 @@ macro_rules! by_data {
 /// variants and the field (`req`, `opt` or `mods`, see `sel_field!`).
 /// `$of` is `list_of` or `modifiers_of`. Other variants give `$def`. The
 /// `kind_lacks_data!` shortcut is the same as in `by_data!`.
+// PERF: noderead2. One registry lookup for the kind test, the node data and
+// the list table, as in `by_data!`.
 macro_rules! list_by_data {
     ($n:expr, $of:ident, $def:expr, $([$($v:ident),+ $(,)?] => $how:ident $field:ident),+ $(,)?) => {{
         let node: Node = $n;
-        if kind_lacks_data!(node, [$($($v),+),+]) {
-            $def
-        } else {
-            $of!(node, |d| match d {
+        let frozen = frozen_store_node(node);
+        match frozen {
+            Some(f) if kind_lacks_variants!(f.kind(), [$($($v),+),+]) => $def,
+            _ => frozen_list_of!($of, node, frozen, |d| match d {
                 $($(NodeData::$v(d) => Some(sel_field!($how, d.$field)),)+)+
                 _ => None,
             })
-            .unwrap_or($def)
+            .unwrap_or($def),
         }
     }};
 }
+
+/// `list_of!` (or `modifiers_of!`, `$of`) on node `$n`, whose
+/// `frozen_store_node` the caller already read as `$frozen`: the node data
+/// and the list table of a published store node come from that lookup. Any
+/// other node reads through `$of!`.
+macro_rules! frozen_list_of {
+    (list_of, $n:expr, $frozen:expr, |$d:ident| $body:expr) => {
+        frozen_list_of!(@read list_of, $n, $frozen, |$d| $body, NodeList, nodes)
+    };
+    (modifiers_of, $n:expr, $frozen:expr, |$d:ident| $body:expr) => {
+        frozen_list_of!(@read modifiers_of, $n, $frozen, |$d| $body, ModifierList, modifiers)
+    };
+    (@read $of:ident, $n:expr, $frozen:expr, |$d:ident| $body:expr, $list:ident, $as:ident) => {{
+        let n__: Node = $n;
+        let frozen__: Option<FrozenNode> = $frozen;
+        match frozen__.and_then(|f| Some((f.data()?, f.lists()))) {
+            Some((data__, lists__)) => {
+                let $d: NodeData<'static> = data__;
+                let found: Option<Option<crate::ast::synthetic::AnyList<'static>>> = $body;
+                found.map(|l| {
+                    $list::from_table(
+                        n__.file_index(),
+                        lists__,
+                        l.map(crate::ast::synthetic::AnyList::$as),
+                    )
+                })
+            }
+            None => $of!(n__, |$d| $body),
+        }
+    }};
+}
+
+/// How the child ids in the node data of one node become handles
+/// (`Node::new(file, id)`): from the registry block that the data read
+/// already looked up (`FrozenIds`), or through `Node::new` for a node that
+/// is not a published store node with node data.
+#[derive(Clone, Copy)]
+pub(crate) enum ChildIds {
+    Frozen(FrozenIds),
+    File(usize),
+}
+
+impl ChildIds {
+    /// `Node::new(file, id)`.
+    #[inline(always)]
+    pub(crate) fn node(self, id: crate::astdata::NodeId) -> Node {
+        match self {
+            ChildIds::Frozen(ids) => {
+                let n = ids.node(id);
+                #[cfg(debug_assertions)]
+                {
+                    let (FrozenIds::Direct { base } | FrozenIds::Records { base, .. }) = ids;
+                    debug_assert_eq!(n, Node::new((base >> 32) as usize, id), "ChildIds");
+                }
+                n
+            }
+            ChildIds::File(file) => Node::new(file, id),
+        }
+    }
+
+    /// Go `nil` for an optional child, else `node`.
+    #[inline(always)]
+    pub(crate) fn opt(self, id: Option<crate::astdata::NodeId>) -> Node {
+        match id {
+            Some(id) => self.node(id),
+            None => Node::NIL,
+        }
+    }
+}
+
+/// The node data and the child ids of published store node `n`, from one
+/// registry lookup, or `None` for any other node (read it with the
+/// accessors). For a hot site that reads a few fields of one node.
+#[inline]
+#[must_use]
+pub fn frozen_data_ids(n: Node) -> Option<(NodeData<'static>, FrozenIds)> {
+    let f = frozen_store_node(n)?;
+    Some((f.data()?, f.ids()))
+}
+
+/// `with_data!` that also binds `$ids`, the `ChildIds` of node `$n`: a
+/// published store node gives its node data and child ids from one registry
+/// lookup. The Go field accessors of `fields.rs` read through it.
+// PERF: noderead2. `with_data!` and then `Node::new` for the child were
+// two registry lookups for a Go `n.AsX().Field` read.
+macro_rules! with_child_ids {
+    ($n:expr, |$d:ident, $ids:ident| $body:expr) => {{
+        let n__: $crate::core::Node = $n;
+        match $crate::ast::frozen_store_node(n__).and_then(|f| Some((f.data()?, f.ids()))) {
+            Some((data__, ids__)) => {
+                let $d: $crate::astdata::NodeData<'_> = data__;
+                let $ids = $crate::ast::ChildIds::Frozen(ids__);
+                $body
+            }
+            None => $crate::ast::read_data_miss(n__, |data__| {
+                let $d: $crate::astdata::NodeData<'_> = data__;
+                let $ids = $crate::ast::ChildIds::File(n__.file_index());
+                $body
+            }),
+        }
+    }};
+}
+pub(crate) use with_child_ids;
 
 /// True when `d` is the data of parsed node `n` (the `_in` debug checks).
 fn is_data_of(d: NodeData<'_>, n: Node) -> bool {
@@ -798,10 +972,18 @@ macro_rules! other_column_match {
 }
 
 /// `Node::name_data` and `Node::name_data_in`: Go `Name()` from the node
-/// data, over the `name_arms!` arms.
+/// data, over the `name_arms!` arms. `name_data` is not inlined, so
+/// `Node::name` stays small enough to inline.
+// PERF (followups57): noderead2 made `by_data!` larger, and the R207 PGO
+// builds inlined `name_data` into `Node::name` (1,067 bytes), which then no
+// longer inlined into its callers. The Effect plugin calls it often: effect
+// st instructions:u +0.29%, 56M in `Node::name` alone. The R206 builds
+// called `name_data` out of line too. A published store node takes the
+// store column and never calls it.
 macro_rules! name_data_accessor {
     ($($arms:tt)*) => {
         data_accessor! {
+            #[inline(never)]
             fn name_data, name_data_in(n) -> Node {
                 Node::NIL,
                 // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.
@@ -2222,9 +2404,11 @@ impl Node {
     /// Go `node.Flags & mask` for a `mask` without a binder-added bit
     /// (`BINDER_ADDED_FLAGS`). For such a mask the binder bits do not
     /// matter, so a published store node reads only its record flags.
-    // PERF: U4 (CH7). `Node::flags` loads the binder data of the file
-    // (`Node::bind`) for every test, also of a parser-only bit such as
-    // `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`.
+    // PERF: U4 (CH7). When this was added, `Node::flags` loaded the binder
+    // data of the file (`Node::bind`) for every test, also of a parser-only
+    // bit such as `AMBIENT`, `OPTIONAL_CHAIN` or `HAS_JS_DOC`. Since AST
+    // node records step 2a the bind ORs its flags into the record, so this
+    // is now the same read as `Node::flags() & mask`.
     #[inline]
     #[must_use]
     pub fn parser_flags(self, mask: NodeFlags) -> NodeFlags {
@@ -2744,7 +2928,7 @@ impl Node {
     // has no generated accessor.
     #[must_use]
     pub fn body(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -2754,12 +2938,12 @@ impl Node {
                 SetAccessorDeclaration,
                 ConstructorDeclaration,
                 ModuleDeclaration,
-            ] => |f, d| opt(f, d.body),
+            ] => |ids, d| ids.opt(d.body),
             [
                 FunctionExpression,
                 ArrowFunction,
                 ClassStaticBlockDeclaration,
-            ] => |f, d| req(f, d.body),
+            ] => |ids, d| ids.node(d.body),
         )
     }
 
@@ -3185,7 +3369,7 @@ impl Node {
     // Go: ast.go:805 TagName
     #[must_use]
     pub fn tag_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3213,17 +3397,17 @@ impl Node {
                 JsDocSatisfiesTag,
                 JsDocThrowsTag,
                 JsDocImportTag,
-            ] => |f, d| req(f, d.tag_name),
+            ] => |ids, d| ids.node(d.tag_name),
         )
     }
 
     // Go: ast.go:859 PropertyName
     #[must_use]
     pub fn property_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [ImportSpecifier, ExportSpecifier, BindingElement] => |f, d| opt(f, d.property_name),
+            [ImportSpecifier, ExportSpecifier, BindingElement] => |ids, d| ids.opt(d.property_name),
         )
     }
 
@@ -3308,17 +3492,17 @@ impl Node {
     // generated accessor.
     #[must_use]
     pub fn attributes(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [JsxOpeningElement, JsxSelfClosingElement] => |f, d| req(f, d.attributes),
+            [JsxOpeningElement, JsxSelfClosingElement] => |ids, d| ids.node(d.attributes),
             [
                 ModuleDeclaration,
                 ImportDeclaration,
                 ExportDeclaration,
                 ImportTypeNode,
                 JsDocImportTag,
-            ] => |f, d| opt(f, d.attributes),
+            ] => |ids, d| ids.opt(d.attributes),
         )
     }
 
@@ -3348,17 +3532,17 @@ impl Node {
     // Go: ast.go:1000 ImportClause
     #[must_use]
     pub fn import_clause(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [ImportDeclaration, JsDocImportTag] => |f, d| opt(f, d.import_clause),
+            [ImportDeclaration, JsDocImportTag] => |ids, d| ids.opt(d.import_clause),
         )
     }
 
     // Go: ast.go:1010 Statement
     #[must_use]
     pub fn statement(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3368,7 +3552,7 @@ impl Node {
                 ForInOrOfStatement,
                 WithStatement,
                 LabeledStatement,
-            ] => |f, d| req(f, d.statement),
+            ] => |ids, d| ids.node(d.statement),
         )
     }
 
@@ -3503,7 +3687,7 @@ impl Node {
     // Go: ast.go:1112 QuestionDotToken
     #[must_use]
     pub fn question_dot_token(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3511,7 +3695,7 @@ impl Node {
                 PropertyAccessExpression,
                 CallExpression,
                 TaggedTemplateExpression,
-            ] => |f, d| opt(f, d.question_dot_token),
+            ] => |ids, d| ids.opt(d.question_dot_token),
         )
     }
 
@@ -3520,7 +3704,7 @@ impl Node {
     // `TypeExpression` fields have no generated accessor.
     #[must_use]
     pub fn type_expression(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
             [
@@ -3528,24 +3712,24 @@ impl Node {
                 JsDocReturnTag,
                 JsDocTypedefTag,
                 JsDocThrowsTag,
-            ] => |f, d| opt(f, d.type_expression),
+            ] => |ids, d| ids.opt(d.type_expression),
             [
                 JsDocTypeTag,
                 JsDocCallbackTag,
                 JsDocSatisfiesTag,
                 JsDocThisTag,
                 JsDocOverloadTag,
-            ] => |f, d| req(f, d.type_expression),
+            ] => |ids, d| ids.node(d.type_expression),
         )
     }
 
     // Go: ast.go:1146 ClassName
     #[must_use]
     pub fn class_name(self) -> Node {
-        by_data!(
+        by_child_ids!(
             self,
             Node::NIL,
-            [JsDocAugmentsTag, JsDocImplementsTag] => |f, d| req(f, d.class_name),
+            [JsDocAugmentsTag, JsDocImplementsTag] => |ids, d| ids.node(d.class_name),
         )
     }
 
@@ -5746,8 +5930,16 @@ fn access_kind_ref(node: NodeRef) -> AccessKind {
         SyntaxKind::ParenthesizedExpression | SyntaxKind::ArrayLiteralExpression => {
             access_kind_ref(parent)
         }
+        // PERF: noderead2. The operator and the left operand come from one
+        // node data read of the parent (`NodeRef::data`, `frozen_data_ids`),
+        // and the operator token kind is read once. Go reads the fields.
         SyntaxKind::PrefixUnaryExpression | SyntaxKind::PostfixUnaryExpression => {
-            let operator = parent.node().operator();
+            let operator = match parent.data() {
+                Some(NodeData::PrefixUnaryExpression(d)) => d.operator,
+                Some(NodeData::PostfixUnaryExpression(d)) => d.operator,
+                _ => parent.node().operator(),
+            };
+            debug_assert_eq!(operator, parent.node().operator());
             if operator == SyntaxKind::PlusPlusToken || operator == SyntaxKind::MinusMinusToken {
                 AccessKind::READ_WRITE
             } else {
@@ -5755,11 +5947,16 @@ fn access_kind_ref(node: NodeRef) -> AccessKind {
             }
         }
         SyntaxKind::BinaryExpression => {
-            let parent = parent.node();
-            if parent.left() == node.node() {
-                let operator = parent.operator_token();
-                if is_assignment_operator(operator.kind()) {
-                    if operator.kind() == SyntaxKind::EqualsToken {
+            let (left, operator_token) = match frozen_data_ids(parent.node()) {
+                Some((NodeData::BinaryExpression(d), ids)) => {
+                    (ids.node(d.left), ids.node(d.operator_token))
+                }
+                _ => (parent.node().left(), parent.node().operator_token()),
+            };
+            if left == node.node() {
+                let operator = operator_token.kind();
+                if is_assignment_operator(operator) {
+                    if operator == SyntaxKind::EqualsToken {
                         return AccessKind::WRITE;
                     }
                     return AccessKind::READ_WRITE;

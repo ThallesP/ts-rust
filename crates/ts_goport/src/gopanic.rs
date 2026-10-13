@@ -441,6 +441,51 @@ fn retry_on_eagain<H>(
     }
 }
 
+/// Starts a scoped thread named `name` that runs `f`, for port-only work
+/// that the calling thread can do itself (not work Go runs on goroutines:
+/// use `GoThread` for that). `None` when the OS refuses the thread: the
+/// caller then does the work, and the result is the same.
+// PORT: not in Go. The same fallback as the resolve and config prefetch
+// workers (followups58: the serialgap1 threads).
+pub fn helper_thread<'scope, 'env, F, T>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: F,
+) -> Option<std::thread::ScopedJoinHandle<'scope, T>>
+where
+    F: FnOnce() -> T + Send + 'scope,
+    T: Send + 'scope,
+{
+    if REFUSE_HELPER_THREADS.get() {
+        return None;
+    }
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn_scoped(scope, f)
+        .ok()
+}
+
+thread_local! {
+    /// While set, `helper_thread` on this thread starts no thread
+    /// (`refuse_helper_threads`).
+    static REFUSE_HELPER_THREADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as if the OS refused every `helper_thread` that this thread
+/// starts, so a test reaches the fallback. Not `cfg(test)`: the tests of
+/// goport_core use it, and `cfg(test)` is per crate.
+#[doc(hidden)]
+pub fn refuse_helper_threads<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            REFUSE_HELPER_THREADS.set(self.0);
+        }
+    }
+    let _restore = Restore(REFUSE_HELPER_THREADS.replace(true));
+    f()
+}
+
 /// `go_panic` with the Go runtime text for a nil pointer dereference, at a
 /// site where the pinned Go dereferences nil on the same input. It is cold
 /// and out of line, so the nil check at a hot site is one compare.

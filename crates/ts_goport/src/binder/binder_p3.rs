@@ -265,12 +265,21 @@ impl Binder {
         let then_label = self.create_branch_label();
         let else_label = self.create_branch_label();
         let post_if_label = self.create_branch_label();
+        // PERF: noderead2. Both branches from one node data read (Go
+        // `node.AsIfStatement()` fields).
+        let (then_statement, else_statement) = match frozen_data_ids(node) {
+            Some((NodeData::IfStatement(d), ids)) => (
+                ids.node(d.then_statement),
+                d.else_statement.map_or(Node::NIL, |id| ids.node(id)),
+            ),
+            _ => (node.then_statement(), node.else_statement()),
+        };
         self.bind_condition(node.expression(), then_label, else_label);
         self.current_flow = self.finish_flow_label(then_label);
-        self.bind(node.then_statement());
+        self.bind(then_statement);
         self.add_antecedent(post_if_label, self.current_flow);
         self.current_flow = self.finish_flow_label(else_label);
-        self.bind(node.else_statement());
+        self.bind(else_statement);
         self.add_antecedent(post_if_label, self.current_flow);
         self.current_flow = self.finish_flow_label(post_if_label);
     }

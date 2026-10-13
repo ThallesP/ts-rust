@@ -443,7 +443,9 @@ impl Checker {
                                 prop = self.get_property_of_type(t, &prop_name);
                             }
                         } else {
-                            prop = self.get_property_of_type(t, name.text());
+                            // PERF: namekeys1. By the name's id, as
+                            // `check_property_access_expression`.
+                            prop = self.get_property_of_type(t, &name.text_name());
                         }
                         if prop.is_some() {
                             return self.get_explicit_type_of_symbol(prop, diagnostic);

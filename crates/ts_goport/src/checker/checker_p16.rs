@@ -1712,20 +1712,28 @@ impl Checker {
 // ported as a shared module (options.rs keeps a private copy), so this file
 // keeps its own private copy with the same logic.
 // Go: tspath/extension.go:121 GetDeclarationFileExtension
-fn tspath_get_declaration_file_extension(file_name: &str) -> String {
+// PERF: namekeys1. Returns a slice of `file_name` or a constant, as Go does,
+// not a `String`. The ".d." search finds each '.' with `memchr`: `str::find`
+// built a `StrSearcher` on every call (about 70 M cycles of VS Code check,
+// one call per ES import through `is_only_importable_as_default`).
+fn tspath_get_declaration_file_extension(file_name: &str) -> &str {
     let base = tspath_get_base_file_name(file_name);
     // Go: tspath.SupportedDeclarationExtensions
     for ext in [".d.ts", ".d.cts", ".d.mts"] {
         if base.ends_with(ext) {
-            return ext.to_string();
+            return ext;
         }
     }
     if base.ends_with(".ts") {
-        if let Some(index) = base.find(".d.") {
-            return base[index..].to_string();
+        let bytes = base.as_bytes();
+        // Go: strings.Index(base, ".d.")
+        if let Some(index) =
+            memchr::memchr_iter(b'.', bytes).find(|&i| bytes[i + 1..].starts_with(b"d."))
+        {
+            return &base[index..];
         }
     }
-    String::new()
+    ""
 }
 
 // PORT: Go `tspath.GetBaseFileName` for the absolute, normalized file names

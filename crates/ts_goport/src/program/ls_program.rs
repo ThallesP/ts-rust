@@ -958,7 +958,8 @@ pub fn get_checker_association_weights(base_weights: &[i64], import_counts: &[i6
 
 /// The checker index of each file of `program.files`, in file order: the
 /// association part of Go `checkerPool.createCheckers` (#4313). The compile
-/// path pool (`program::create_checkers`) uses it too.
+/// path pool (`program::create_checkers`) uses it too, through
+/// `take_checker_associations`.
 // Go: compiler/checkerpool.go:367 (*checkerPool).createCheckers (the associations)
 #[must_use]
 pub fn get_checker_associations(program: &NewProgram, checker_count: usize) -> Vec<usize> {
@@ -966,21 +967,52 @@ pub fn get_checker_associations(program: &NewProgram, checker_count: usize) -> V
     if checker_count <= 1 {
         return vec![0; files.len()];
     }
-    let mut base_weights: Vec<i64> = Vec::with_capacity(files.len());
-    let mut import_counts: Vec<i64> = Vec::with_capacity(files.len());
-    let mut is_declaration_file: Vec<bool> = Vec::with_capacity(files.len());
+    let sizes: Vec<SplitSize> = files.iter().map(|file| SplitSize::of(file)).collect();
+    checker_associations_of(&sizes, &get_import_adjacency(program), checker_count)
+}
+
+/// What the checker split reads of a file: Go `NodeCount`, `len(Text())`,
+/// `len(Imports())` and `IsDeclarationFile`.
+#[derive(Clone, Copy)]
+struct SplitSize {
+    node_count: i64,
+    text_len: i64,
+    imports: i64,
+    is_declaration_file: bool,
+}
+
+impl SplitSize {
+    fn of(file: &ParsedSourceFile) -> Self {
+        SplitSize {
+            node_count: file.node_count as i64,
+            text_len: file.text.len() as i64,
+            imports: file.imports.len() as i64,
+            is_declaration_file: file.is_declaration_file,
+        }
+    }
+}
+
+/// The associations of `get_checker_associations` for files of sizes
+/// `sizes` with the import graph `adjacent_files` (`get_import_adjacency`).
+fn checker_associations_of(
+    sizes: &[SplitSize],
+    adjacent_files: &[Vec<usize>],
+    checker_count: usize,
+) -> Vec<usize> {
+    let mut base_weights: Vec<i64> = Vec::with_capacity(sizes.len());
+    let mut import_counts: Vec<i64> = Vec::with_capacity(sizes.len());
+    let mut is_declaration_file: Vec<bool> = Vec::with_capacity(sizes.len());
     let mut total_base_weight: i64 = 0;
     let mut declaration_base_weight: i64 = 0;
-    for file in files {
-        let base_weight =
-            get_checker_association_base_weight(file.node_count as i64, file.text.len() as i64);
+    for size in sizes {
+        let base_weight = get_checker_association_base_weight(size.node_count, size.text_len);
         total_base_weight += base_weight;
-        if file.is_declaration_file {
+        if size.is_declaration_file {
             declaration_base_weight += base_weight;
         }
         base_weights.push(base_weight);
-        import_counts.push(file.imports.len() as i64);
-        is_declaration_file.push(file.is_declaration_file);
+        import_counts.push(size.imports);
+        is_declaration_file.push(size.is_declaration_file);
     }
     let policy =
         get_checker_association_policy(total_base_weight, declaration_base_weight, checker_count);
@@ -994,7 +1026,6 @@ pub fn get_checker_associations(program: &NewProgram, checker_count: usize) -> V
         }
     }
     let file_weights = get_checker_association_weights(&base_weights, &import_counts);
-    let adjacent_files = get_import_adjacency(program);
     let file_order = get_checker_association_order(
         &file_weights,
         &is_declaration_file,
@@ -1002,11 +1033,199 @@ pub fn get_checker_associations(program: &NewProgram, checker_count: usize) -> V
     );
     get_checker_associations_in_order(
         &file_weights,
-        &adjacent_files,
+        adjacent_files,
         file_order.as_deref(),
         checker_count,
         policy.balance_penalty_multiplier,
     )
+}
+
+/// What `start_checker_associations` copied of a program to make its split
+/// on another thread.
+struct SplitInputs {
+    sizes: Vec<SplitSize>,
+    /// The path of each program file.
+    paths: Vec<String>,
+    /// The program file index of each other path of `files_by_path` (the
+    /// package dedup redirects), or None for a file that is not a program
+    /// file.
+    redirects: Vec<(String, Option<usize>)>,
+    resolved_modules: Arc<FxHashMap<tspath::Path, module::ModeAwareCache<Arc<ResolvedModule>>>>,
+    checker_count: usize,
+}
+
+impl SplitInputs {
+    /// Copies what the split of `program` with `checker_count` checkers
+    /// reads. The program has no project reference redirects
+    /// (`start_checker_associations`).
+    fn of(program: &NewProgram, checker_count: usize) -> SplitInputs {
+        let files = &program.files;
+        let by_path = program.files_by_path();
+        // Every program file path is in `files_by_path` (`collect_files`), so
+        // with as many paths as files there is no other path.
+        let redirects = if by_path.len() > files.len() {
+            let file_indices: FxHashMap<usize, usize> = files
+                .iter()
+                .enumerate()
+                .map(|(i, file)| (file.store, i))
+                .collect();
+            by_path
+                .iter()
+                .map(|(path, file)| (path.0.clone(), file_indices.get(&file.store).copied()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        SplitInputs {
+            sizes: files.iter().map(|file| SplitSize::of(file)).collect(),
+            paths: files.iter().map(|file| file.path().0.clone()).collect(),
+            redirects,
+            resolved_modules: Arc::clone(&program.processed_files.resolved_modules),
+            checker_count,
+        }
+    }
+
+    /// `get_checker_associations` of the program that these inputs were
+    /// copied from.
+    fn associations(&self) -> Vec<usize> {
+        checker_associations_of(&self.sizes, &self.adjacency(), self.checker_count)
+    }
+
+    /// `get_import_adjacency` of the program that these inputs were copied
+    /// from, with the same lists in the same order.
+    fn adjacency(&self) -> Vec<Vec<usize>> {
+        let mut index_by_path: FxHashMap<&str, Option<usize>> = FxHashMap::with_capacity_and_hasher(
+            self.paths.len() + self.redirects.len(),
+            Default::default(),
+        );
+        for (i, path) in self.paths.iter().enumerate() {
+            index_by_path.insert(path, Some(i));
+        }
+        for (path, index) in &self.redirects {
+            index_by_path.insert(path, *index);
+        }
+        let mut adjacent_files: Vec<Vec<usize>> = vec![Vec::new(); self.paths.len()];
+        for (file_index, path) in self.paths.iter().enumerate() {
+            let Some(resolved_modules) = self.resolved_modules.get(path.as_str()) else {
+                continue;
+            };
+            for resolved in resolved_modules.values() {
+                if !resolved.is_resolved() {
+                    continue;
+                }
+                // A path that is not in `files_by_path` finds no file
+                // (`get_source_file_for_resolved_module`): the program has no
+                // project reference redirects (`start_checker_associations`).
+                let Some(&imported_index) = index_by_path.get(resolved.resolved_path.as_str())
+                else {
+                    continue;
+                };
+                let Some(imported_index) = imported_index else {
+                    continue;
+                };
+                if imported_index == file_index {
+                    continue;
+                }
+                adjacent_files[file_index].push(imported_index);
+                adjacent_files[imported_index].push(file_index);
+            }
+        }
+        adjacent_files
+    }
+}
+
+/// A checker split that a thread makes ahead of the checker pool
+/// (`start_checker_associations`).
+struct PendingSplit {
+    /// The resolutions of the program, which identify it.
+    resolved_modules: Arc<FxHashMap<tspath::Path, module::ModeAwareCache<Arc<ResolvedModule>>>>,
+    files: usize,
+    checker_count: usize,
+    split: std::thread::JoinHandle<Vec<usize>>,
+}
+
+thread_local! {
+    /// The split that `start_checker_associations` started on this thread.
+    static PENDING_SPLIT: RefCell<Option<PendingSplit>> = const { RefCell::new(None) };
+}
+
+/// Starts `get_checker_associations` of `program` with the checker count of
+/// the pool on a thread of its own, from copies of what it reads, so that the split is ready when
+/// the checker pool asks for it (`take_checker_associations`). Go makes the
+/// split after the checkers (checkerpool.go:382), and so does the pool; the
+/// split reads only the program files and their resolutions, which are
+/// known when the load ends.
+// PERF (serialgap1): `build_program` starts it for the program of a
+// one-program process, so the split runs beside the build and the bind:
+// VS Code 27 ms, Sentry 23 ms of the loading thread after the bind. Not
+// when the program has project reference redirects: a resolution that is
+// not a program file path can then name a program file, and only the
+// program finds it.
+pub(super) fn start_checker_associations(program: &NewProgram) {
+    let files = &program.files;
+    // The count of `program::checker_count`. Fast mode picks its own.
+    if program.single_threaded()
+        || crate::fast_mode::enabled()
+        || crate::fast_mode::cost_split_enabled()
+        || cfg!(target_family = "wasm")
+    {
+        return;
+    }
+    let checker_count = program
+        .options()
+        .checkers
+        .map_or(4, i64::from)
+        .min(files.len() as i64)
+        .min(256)
+        .max(1) as usize;
+    if checker_count <= 1 {
+        return;
+    }
+    {
+        let mapper = program.mapper();
+        if !mapper.source_to_project_reference.is_empty()
+            || !mapper.output_dts_to_project_reference.is_empty()
+            || !mapper.realpath_dts_to_source.borrow().is_empty()
+        {
+            return;
+        }
+    }
+    let inputs = SplitInputs::of(program, checker_count);
+    let pending = PendingSplit {
+        resolved_modules: Arc::clone(&inputs.resolved_modules),
+        files: files.len(),
+        checker_count,
+        split: match std::thread::Builder::new()
+            .name("goport-split".to_string())
+            .spawn(move || inputs.associations())
+        {
+            Ok(split) => split,
+            Err(_) => return,
+        },
+    };
+    PENDING_SPLIT.with(|slot| *slot.borrow_mut() = Some(pending));
+}
+
+/// `get_checker_associations(program, checker_count)`: the split that
+/// `start_checker_associations` started for the same program and count,
+/// else made now.
+#[must_use]
+pub fn take_checker_associations(program: &NewProgram, checker_count: usize) -> Vec<usize> {
+    let pending = PENDING_SPLIT.with(|slot| slot.borrow_mut().take());
+    if let Some(pending) = pending
+        && Arc::ptr_eq(
+            &pending.resolved_modules,
+            &program.processed_files.resolved_modules,
+        )
+        && pending.files == program.files.len()
+        && pending.checker_count == checker_count
+    {
+        return pending
+            .split
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    }
+    get_checker_associations(program, checker_count)
 }
 
 // Go: compiler/checkerpool.go:425 (*checkerPool).getImportAdjacency
@@ -1803,4 +2022,49 @@ pub fn is_global_typings_file(p: &NewProgram, file_name: &str) -> bool {
         file_name,
         &p.case_sensitivity(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // followups58 (R208 reviewer): the early split of a program with a
+    // package dedup redirect path (`files_by_path` has more paths than the
+    // program has files) is the split that the checker pool makes after the
+    // bind (`get_checker_associations`). The import of b's copy of pkg goes
+    // through the redirect path to a's copy, an edge of both graphs.
+    #[test]
+    fn early_split_with_package_redirects_is_the_split_after_the_bind() {
+        let _scope = crate::core::enter_program(None);
+        let np = super::super::go_frontend::tests::redirect_group_program("goport-early-split");
+        assert!(np.files_by_path().len() > np.files.len());
+        let index_of = |name: &str| {
+            np.files
+                .iter()
+                .position(|file| file.file_name().ends_with(name))
+                .unwrap_or_else(|| panic!("no {name}"))
+        };
+        let b = index_of("/node_modules/b/index.d.ts");
+        let pkg = index_of("/node_modules/a/node_modules/pkg/index.d.ts");
+        for checker_count in 2..=4 {
+            let inputs = SplitInputs::of(&np, checker_count);
+            let adjacency = inputs.adjacency();
+            assert!(adjacency[b].contains(&pkg), "no edge through the redirect");
+            assert_eq!(adjacency, get_import_adjacency(&np));
+            assert_eq!(
+                inputs.associations(),
+                get_checker_associations(&np, checker_count)
+            );
+        }
+        // The way of a one-program process: started at the build, taken by
+        // the pool.
+        start_checker_associations(&np);
+        let checker_count = PENDING_SPLIT
+            .with(|slot| slot.borrow().as_ref().map(|pending| pending.checker_count))
+            .expect("the early split did not start");
+        assert_eq!(
+            take_checker_associations(&np, checker_count),
+            get_checker_associations(&np, checker_count)
+        );
+    }
 }

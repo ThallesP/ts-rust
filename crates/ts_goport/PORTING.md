@@ -443,9 +443,14 @@ methods reach the AST through it.
   about 6 instructions). So a stale read of those gives the values of
   that node while its block waits, and the new owner's data after a
   reuse, never undefined behavior. A plain kind column is never reused,
-  so a stale kind read gives the old kind; pooled kinds (past the budget,
-  edleak1) give the new owner's kind after a reuse. Its store, `GoFile`, extras, flow,
-  node data and list reads panic. Every holder of a node of a version
+  so a stale kind read gives the old kind. A node shell with no leaked
+  node column and no foreign parents takes the `BlockFile` of its pooled
+  block (edleak1 part 2), and each shell that takes the block sets its
+  facts and root (`node_shell`). So after a reuse a stale read of the
+  pooled kinds (past the budget), of the facts (`block_resolve_slot`,
+  `frozen_store_facts`) or of the root (`frozen_source_file_of_node`)
+  gives the new owner's value too. Reads of the version's store,
+  `GoFile`, extras, flow, node data and lists panic. Every holder of a node of a version
   holds the version, so a correct reader never sees a reuse. No standing
   run has debug assertions: the protected tests run `--release`
   (`build-goport-tests.sh`), and the corpus, editor and oracle runs use

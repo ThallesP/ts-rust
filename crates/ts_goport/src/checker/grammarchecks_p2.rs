@@ -1,9 +1,51 @@
 //! Port of typescript-go `internal/checker/grammarchecks.go` lines 952-1857.
 
 use crate::prelude::*;
-use std::borrow::Cow;
+use smallvec::SmallVec;
 
 use crate::diagnostics::Message;
+
+/// Go's `seen := make(map[string]DeclarationMeaning)` of
+/// `checkGrammarObjectLiteralExpression`, keyed by the interned name
+/// (`get_effective_property_name_key`). The first 8 names stay inline and
+/// are found by id, as Go's small map holds up to 8 keys without a table.
+/// The ninth name moves them all to the hash map.
+// PERF: parentname1. The map had `Cow<str>` keys, hashed byte by byte, and
+// a new table that grew from empty for each object literal (checkline1).
+#[derive(Default)]
+struct SeenPropertyNames {
+    small: SmallVec<[(Name, DeclarationMeaning); 8]>,
+    /// Empty until the ninth name; then it holds every name.
+    map: FxHashMap<Name, DeclarationMeaning>,
+}
+
+impl SeenPropertyNames {
+    /// Go `seen[name]`: the empty meaning for a name not seen.
+    fn get(&self, name: &Name) -> DeclarationMeaning {
+        if self.map.is_empty() {
+            self.small
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or_else(DeclarationMeaning::default, |&(_, m)| m)
+        } else {
+            self.map.get(name).copied().unwrap_or_default()
+        }
+    }
+
+    /// Go `seen[name] = meaning`.
+    fn set(&mut self, name: Name, meaning: DeclarationMeaning) {
+        if !self.map.is_empty() {
+            self.map.insert(name, meaning);
+        } else if let Some(slot) = self.small.iter_mut().find(|(n, _)| *n == name) {
+            slot.1 = meaning;
+        } else if self.small.len() < self.small.inline_size() {
+            self.small.push((name, meaning));
+        } else {
+            self.map.extend(self.small.drain(..));
+            self.map.insert(name, meaning);
+        }
+    }
+}
 
 impl Checker {
     // Go: checker/grammarchecks.go:935 checkGrammarInterfaceDeclaration
@@ -134,7 +176,7 @@ impl Checker {
         node: Node,
         in_destructuring: bool,
     ) -> bool {
-        let mut seen: FxHashMap<Cow<'static, str>, DeclarationMeaning> = FxHashMap::default();
+        let mut seen = SeenPropertyNames::default();
 
         // PORT: Go reads `node.Properties.Nodes` with a nil check; `properties()`
         // is empty for a nil list.
@@ -297,15 +339,13 @@ impl Checker {
             }
 
             if !in_destructuring {
-                let (effective_name, ok) =
-                    self.get_effective_property_name_for_property_name_node(name);
-                if !ok {
+                let Some(effective_name) = self.get_effective_property_name_key(name) else {
                     continue;
-                }
+                };
 
-                let existing_kind = seen.get(&effective_name).copied().unwrap_or_default();
+                let existing_kind = seen.get(&effective_name);
                 if existing_kind.is_empty() {
-                    seen.insert(effective_name, current_kind);
+                    seen.set(effective_name, current_kind);
                 } else if current_kind.intersects(DeclarationMeaning::METHOD)
                     && existing_kind.intersects(DeclarationMeaning::METHOD)
                 {
@@ -328,7 +368,7 @@ impl Checker {
                     if existing_kind != DeclarationMeaning::GET_OR_SET_ACCESSOR
                         && current_kind != existing_kind
                     {
-                        seen.insert(effective_name, current_kind | existing_kind);
+                        seen.set(effective_name, current_kind | existing_kind);
                     } else {
                         return self.grammar_error_on_node(
                             name,
