@@ -4,7 +4,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { httpRequest, runCommand, startService, freePort, portIsOpen } from "./proc.mjs";
+import { freePort, httpRequest, portIsOpen, runCommand, scaledTimeout, startService } from "./proc.mjs";
 import {
     cachedLockFile,
     dropTypescriptFromLock,
@@ -54,7 +54,9 @@ export class ScenarioContext {
         return path.join(this.outDir, "logs", `${index}-${name}.log`);
     }
 
-    async step(name, cmd, args, { cwd = this.appDir, timeoutMs = 10 * minute, install = false, env = {}, required = true } = {}) {
+    // expectExit: the exit code that counts as ok, or "nonzero" (a build that must fail on a type
+    // error).
+    async step(name, cmd, args, { cwd = this.appDir, timeoutMs = 10 * minute, install = false, env = {}, required = true, expectExit = 0 } = {}) {
         const logFile = this.logFile(name);
         const result = await runCommand({ cmd, args, cwd, env: this.env({ install, extra: env }), logFile, timeoutMs });
         const step = {
@@ -66,7 +68,8 @@ export class ScenarioContext {
             timedOut: result.timedOut,
             spawnError: result.spawnError,
             ms: result.ms,
-            ok: result.exitCode === 0,
+            ok: expectExit === "nonzero" ? result.exitCode !== 0 && result.exitCode !== null : result.exitCode === expectExit,
+            expectExit: expectExit === 0 ? undefined : expectExit,
             required,
             log: path.relative(this.outDir, logFile),
         };
@@ -97,8 +100,10 @@ export class ScenarioContext {
     }
 
     // Output of a build step with paths, times and durations replaced, kept as an artifact.
-    saveStepOutput(name, step) {
-        this.saveText(name, this.normalize(this.stepOutput(step)));
+    saveStepOutput(name, step, transform = (text) => text) {
+        const text = transform(this.normalize(this.stepOutput(step)));
+        this.saveText(name, text);
+        return text;
     }
 
     saveTree(name, fromRel) {
@@ -177,15 +182,31 @@ export class ScenarioContext {
             `--outputFile.json=${raw}`,
             "--maxWorkers=4",
         ], options);
-        const summary = summarizeVitest(raw, this.appDir);
+        return { step, summary: this.recordTests(suite, raw) };
+    }
+
+    // Runs a jest command with its JSON report (the same shape as vitest's) and keeps the map.
+    // --no-cache: jest keeps transforms in the OS temp dir keyed by the typescript version string,
+    // which is "6.0.3" for both packages, so a cached stock transform would hide the package.
+    async jest(suite, cmd, args, options = {}) {
+        const raw = path.join(this.outDir, "tests", `${suite}.jest.json`);
+        fs.mkdirSync(path.dirname(raw), { recursive: true });
+        const step = await this.step(`test-${suite}`, cmd, [...args, "--no-cache", "--json", `--outputFile=${raw}`, "--maxWorkers=2"], options);
+        return { step, summary: this.recordTests(suite, raw) };
+    }
+
+    recordTests(suite, raw) {
+        const summary = summarizeTestReport(raw, this.appDir);
         this.tests[suite] = { path: `tests/${suite}.json`, ...summary.counts, reportMissing: summary.missing };
         writeJson(path.join(this.outDir, "tests", `${suite}.json`), summary);
-        return { step, summary };
+        return summary;
     }
 
     // Starts a long-running command (an app or watch mode) on a free port; `use` gets the
     // service and the base URL. The service is always stopped and its port checked closed.
-    async withService(name, cmd, args, { env = {}, ready, readyTimeoutMs = 2 * minute }, use) {
+    // waitPort: also wait until the port accepts connections (Nest logs "successfully started"
+    // before listen() has bound it).
+    async withService(name, cmd, args, { env = {}, ready, readyTimeoutMs = 2 * minute, waitPort = false }, use) {
         const port = await freePort();
         const logFile = this.logFile(name);
         const service = startService({
@@ -209,6 +230,9 @@ export class ScenarioContext {
         try {
             if (ready !== undefined) {
                 step.readyMs = await service.waitFor(ready, { timeoutMs: readyTimeoutMs });
+            }
+            if (waitPort) {
+                await waitPortOpen(service, port, readyTimeoutMs);
             }
             await use(service, base);
             step.ok = true;
@@ -265,6 +289,19 @@ export class ScenarioContext {
     }
 }
 
+async function waitPortOpen(service, port, timeoutMs) {
+    const deadline = Date.now() + scaledTimeout(timeoutMs);
+    while (!(await portIsOpen(port))) {
+        if (service.exit !== undefined) {
+            throw new Error(`process exited (${service.exit.exitCode ?? service.exit.signal}) before port ${port} opened`);
+        }
+        if (Date.now() > deadline) {
+            throw new Error(`port ${port} not open after ${scaledTimeout(timeoutMs)} ms`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+}
+
 function parseJson(text) {
     try {
         return JSON.parse(text);
@@ -273,8 +310,8 @@ function parseJson(text) {
     }
 }
 
-// vitest's JSON report -> { counts, tests: { "<file> > <suite> > <test>": status } }.
-function summarizeVitest(rawFile, appDir) {
+// A vitest or jest JSON report -> { counts, tests: { "<file> > <suite> > <test>": status } }.
+function summarizeTestReport(rawFile, appDir) {
     if (!fs.existsSync(rawFile)) {
         return { missing: true, counts: { total: 0, passed: 0, failed: 0, skipped: 0 }, tests: {}, failedFiles: [] };
     }

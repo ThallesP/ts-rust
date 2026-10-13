@@ -8,6 +8,9 @@
 // - after and afterDeclarations: each emitted text is parsed by TS 6.0, transformed and, when the
 //   tree changed, printed back.
 // Source maps are composed, so they still point at the original source.
+// Module specifiers that transformers only replaced (the nest-cli tsconfig-paths hook) are written
+// into the output text instead: tsc-rs emits the file from its original text, as TS 6.0 names
+// import variables after the original specifier.
 
 const sourceMappingUrl = "//# sourceMappingURL=";
 const inlineSourceMap = "data:application/json;base64,";
@@ -18,13 +21,15 @@ const keptStatementMarker = "__tsrs_kept_statement_";
 // Runs the custom transformers over the outputs of `files` ({ sourceFile, nativeFileName,
 // outputs: [{ fileName, text }] }), replacing outputs in place. `reemit(texts)` emits the JS of
 // changed files from their new source texts (Map nativeFileName -> text) and returns
-// Map nativeFileName -> outputs.
-function transformOutputs(ts, { options, emitHost, files, customTransformers, reemit, cancellationToken }) {
+// Map nativeFileName -> outputs. `directory` is the absolute directory that relative output and
+// source names are relative to.
+function transformOutputs(ts, { options, emitHost, files, customTransformers, reemit, cancellationToken, directory }) {
     const before = customTransformers?.before ?? [];
     const after = customTransformers?.after ?? [];
     const afterDeclarations = customTransformers?.afterDeclarations ?? [];
+    const context = { options, emitHost, directory: directory ?? emitHost.getCurrentDirectory() };
     if (before.length !== 0) {
-        transformSources(ts, { options, emitHost, files, factories: before, reemit, cancellationToken });
+        transformSources(ts, { ...context, files, factories: before, reemit, cancellationToken });
     }
     if (after.length === 0 && afterDeclarations.length === 0) {
         return;
@@ -33,18 +38,18 @@ function transformOutputs(ts, { options, emitHost, files, customTransformers, re
         cancellationToken?.throwIfCancellationRequested();
         for (const output of [...file.outputs]) {
             if (after.length !== 0 && isScriptOutput(ts, output.fileName)) {
-                const diagnostics = transformEmittedText(ts, { options, emitHost, file, output, factories: after, kind: "script" });
+                const diagnostics = transformEmittedText(ts, { ...context, file, output, factories: after, kind: "script" });
                 file.scriptDiagnostics = [...file.scriptDiagnostics ?? [], ...diagnostics];
             }
             else if (afterDeclarations.length !== 0 && isDeclarationOutput(ts, output.fileName)) {
-                const diagnostics = transformEmittedText(ts, { options, emitHost, file, output, factories: afterDeclarations, kind: "declaration" });
+                const diagnostics = transformEmittedText(ts, { ...context, file, output, factories: afterDeclarations, kind: "declaration" });
                 file.declarationDiagnostics = [...file.declarationDiagnostics ?? [], ...diagnostics];
             }
         }
     }
 }
 
-function transformSources(ts, { options, emitHost, files, factories, reemit, cancellationToken }) {
+function transformSources(ts, { options, emitHost, directory, files, factories, reemit, cancellationToken }) {
     const changed = [];
     for (const file of files) {
         // TS 6.0 runs the script transformers on every file it writes JS (or JSON) for.
@@ -56,6 +61,9 @@ function transformSources(ts, { options, emitHost, files, factories, reemit, can
         file.scriptDiagnostics = change.diagnostics;
         if (change.splice !== undefined) {
             changed.push({ file, change });
+        }
+        else if (change.specifiers !== undefined) {
+            rewriteScriptSpecifiers(ts, file.outputs, change.specifiers);
         }
     }
     if (changed.length === 0) {
@@ -76,13 +84,17 @@ function transformSources(ts, { options, emitHost, files, factories, reemit, can
             if (change.splice.keepAlive !== undefined) {
                 removeKeepAlive(ts, output, mapOutput, change.splice.keepAlive);
             }
-            rewriteSourceMap(ts, output, mapOutput, json => composeWithSplice(json, change.splice, file.sourceFile.text));
+            const sources = new ExtraSources(ts, { options, emitHost, directory, sourceFile: file.sourceFile, outputFileName: output.fileName, recorded: change.splice.sources });
+            rewriteSourceMap(ts, output, mapOutput, json => composeWithSplice(json, change.splice, file.sourceFile.text, sources));
             file.outputs.push(output);
             if (mapOutput !== undefined) {
                 file.outputs.push(mapOutput);
             }
+            if (change.specifiers !== undefined) {
+                rewriteScriptSpecifiers(ts, [output, ...mapOutput === undefined ? [] : [mapOutput]], change.specifiers);
+            }
             if (change.helpers.length !== 0) {
-                insertHelpers(ts, { options, emitHost, file, output, helpers: change.helpers });
+                insertHelpers(ts, { options, emitHost, directory, file, output, helpers: change.helpers });
             }
         }
     }
@@ -115,25 +127,332 @@ function transformSource(ts, { options, emitHost, sourceFile, factories }) {
         if (ts.isJsonSourceFile(sourceFile)) {
             throw new Error(`tsc-rs: a custom 'before' transformer that changes a JSON source file is not supported (${sourceFile.fileName})`);
         }
+        const printAll = state.printerHooks || sourceFileHasOwnEmitNode(sourceFile, result);
+        const specifiers = printAll ? undefined : findSpecifierChanges(ts, { file: sourceFile, originalStatements, result, dirty: dirtyStatements(sourceFile), options });
+        if (specifiers !== undefined && helpers.length === 0 && keepsOriginalText(ts, sourceFile, originalStatements, result, specifiers)) {
+            return { diagnostics: transform.diagnostics, helpers: [], specifiers: specifiers.edits };
+        }
         const splice = printSpliced(ts, {
             file: sourceFile,
             originalStatements,
             result,
             transform,
             printerOptions: { ...scriptPrinterOptions(ts, options), removeComments: false, noEmitHelpers: true },
-            printAll: state.printerHooks || sourceFileHasOwnEmitNode(sourceFile, result),
+            printAll,
+            keptAs: specifiers?.statements,
             keepAlive: true,
         });
-        return { diagnostics: transform.diagnostics, helpers: helpers.filter(helper => !helper.scoped), splice };
+        return { diagnostics: transform.diagnostics, helpers: helpers.filter(helper => !helper.scoped), splice, specifiers: specifiers?.edits };
     }
     finally {
         transform.dispose();
     }
 }
 
+// Whether the transformed file is the original one with only module specifiers replaced, so that
+// tsc-rs's emit of the original text plus the new specifiers is the output.
+function keepsOriginalText(ts, sourceFile, originalStatements, result, specifiers) {
+    const statements = result.statements;
+    return annotatedNodes(sourceFile).length === 0
+        && !mutatedInPlace(ts, sourceFile, originalStatements)
+        && !ts.positionIsSynthesized(statements.pos)
+        && statements.length === originalStatements.length
+        && statements.every((statement, index) => statement === originalStatements[index] || specifiers.statements.get(statement) === originalStatements[index]);
+}
+
+// Top-level statements of `result` that are statements of `file` with only module specifier
+// literals replaced: { statements: Map transformed -> original, edits: Map original specifier
+// text -> { text, mapped }, pairs }. `inPlace` (the after transformers) edits the parsed text at
+// the specifiers themselves; otherwise tsc-rs emits the original specifiers and every one of them
+// in the output gets its new text, so a specifier text that also stays unchanged somewhere, or
+// that the emit makes itself, is left to the printer.
+function findSpecifierChanges(ts, { file, originalStatements, result, dirty, options, inPlace = false }) {
+    if (!inPlace && options.rewriteRelativeImportExtensions) {
+        return undefined;
+    }
+    const originals = new Set(originalStatements);
+    const candidates = [];
+    for (const statement of result.statements) {
+        if (originals.has(statement)) {
+            continue;
+        }
+        const original = originalIn(statement, originals);
+        if (original === undefined || dirty.has(original) || !isPristine(ts, original)) {
+            continue;
+        }
+        const pairs = [];
+        if (onlySpecifiersChanged(ts, statement, original, pairs) && pairs.length !== 0 && printsAsOriginal(ts, file, statement, original, pairs)) {
+            candidates.push({ statement, original, pairs });
+        }
+    }
+    if (candidates.length === 0) {
+        return undefined;
+    }
+    const printer = ts.createPrinter();
+    for (const { pairs } of candidates) {
+        for (const pair of pairs) {
+            // TS 6.0 maps a synthesized specifier only when it got a text range.
+            pair.edit = { text: printer.printNode(ts.EmitHint.Unspecified, pair.literal, file), mapped: ts.getSourceMapRange(pair.literal).pos >= 0 };
+        }
+    }
+    const excluded = inPlace ? new Set() : ambiguousSpecifiers(ts, result, candidates);
+    const statements = new Map();
+    const edits = new Map();
+    const pairs = [];
+    for (const candidate of candidates) {
+        if (candidate.pairs.some(pair => excluded.has(pair.originalLiteral.text))) {
+            continue;
+        }
+        statements.set(candidate.statement, candidate.original);
+        for (const pair of candidate.pairs) {
+            edits.set(pair.originalLiteral.text, pair.edit);
+            pairs.push(pair);
+        }
+    }
+    return statements.size === 0 ? undefined : { statements, edits, pairs };
+}
+
+// Whether `node` is the parse tree node `original` (or an update of it) with nothing changed but
+// module specifier literals, which go to `pairs`.
+function onlySpecifiersChanged(ts, node, original, pairs) {
+    if (node === original) {
+        return true;
+    }
+    if (node.kind !== original.kind || !madeFrom(node, original) || node.emitNode !== undefined) {
+        return false;
+    }
+    const slot = specifierSlotOf(ts, node);
+    const originalSlot = specifierSlotOf(ts, original);
+    const same = (child, originalChild) => {
+        if (child === originalChild) {
+            return true;
+        }
+        if (child === slot && originalChild === originalSlot) {
+            return addSpecifierPair(ts, slot, originalSlot, pairs);
+        }
+        return onlySpecifiersChanged(ts, child, originalChild, pairs);
+    };
+    const children = childEntries(ts, node);
+    const originalChildren = childEntries(ts, original);
+    if (children.length !== originalChildren.length) {
+        return false;
+    }
+    for (let index = 0; index < children.length; index++) {
+        const child = children[index];
+        const originalChild = originalChildren[index];
+        if (child === originalChild) {
+            continue;
+        }
+        if (!Array.isArray(child) || !Array.isArray(originalChild)) {
+            if (Array.isArray(child) || Array.isArray(originalChild) || !same(child, originalChild)) {
+                return false;
+            }
+            continue;
+        }
+        if (child.length !== originalChild.length || !child.every((element, at) => same(element, originalChild[at]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function addSpecifierPair(ts, slot, originalSlot, pairs) {
+    const literal = slotLiteral(ts, slot);
+    const originalLiteral = slotLiteral(ts, originalSlot);
+    if (literal === undefined || originalLiteral === undefined || slot.kind !== originalSlot.kind) {
+        return false;
+    }
+    // A parse tree node or one with emit data prints differently from the new literal TS 6.0 writes.
+    if (!(literal.flags & ts.NodeFlags.Synthesized) || literal.emitNode !== undefined || (slot !== literal && slot.emitNode !== undefined)) {
+        return false;
+    }
+    pairs.push({ slot, originalSlot, literal, originalLiteral });
+    return true;
+}
+
+// The node of `originals` that `node` was made from (transformers may clear the Synthesized flag of
+// an update, so this follows `original` as TS 6.0's getNodeForGeneratedName does).
+function originalIn(node, originals) {
+    let current = node;
+    while (current !== undefined && !originals.has(current)) {
+        current = current.original;
+    }
+    return current;
+}
+
+function madeFrom(node, original) {
+    for (let current = node; current !== undefined; current = current.original) {
+        if (current === original) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function childEntries(ts, node) {
+    const entries = [];
+    ts.forEachChild(node, child => {
+        entries.push(child);
+    }, children => {
+        entries.push(children);
+    });
+    return entries;
+}
+
+// What the module specifier of an import or export declaration, an external module reference, an
+// import type or an import()/require() call is.
+function specifierSlotOf(ts, node) {
+    switch (node.kind) {
+        case ts.SyntaxKind.ImportDeclaration:
+        case ts.SyntaxKind.ExportDeclaration:
+            return node.moduleSpecifier;
+        case ts.SyntaxKind.ExternalModuleReference:
+            return node.expression;
+        case ts.SyntaxKind.ImportType:
+            return node.argument;
+        case ts.SyntaxKind.CallExpression:
+            return node.arguments.length !== 0 && isImportOrRequire(ts, node.expression) ? node.arguments[0] : undefined;
+        default:
+            return undefined;
+    }
+}
+
+function isImportOrRequire(ts, expression) {
+    return expression.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(expression) && expression.escapedText === "require");
+}
+
+function slotLiteral(ts, slot) {
+    const literal = slot !== undefined && ts.isLiteralTypeNode(slot) ? slot.literal : slot;
+    return literal !== undefined && ts.isStringLiteralLike(literal) ? literal : undefined;
+}
+
+// The printer's text of the statement with its new specifiers swapped back is the original's.
+function printsAsOriginal(ts, file, statement, original, pairs) {
+    const originals = new Map(pairs.map(pair => [pair.slot, pair.originalSlot]));
+    const swapped = ts.createPrinter({}, { substituteNode: (_hint, node) => originals.get(node) ?? node });
+    return swapped.printNode(ts.EmitHint.Unspecified, statement, file) === ts.createPrinter().printNode(ts.EmitHint.Unspecified, original, file);
+}
+
+// Specifier texts that cannot be told apart in the output: ones that also stay unchanged
+// elsewhere in the file, get two different new texts, or that the emit writes itself (helpers,
+// the JSX runtime).
+function ambiguousSpecifiers(ts, result, candidates) {
+    const edits = new Map();
+    const pairLiterals = new Set();
+    const excluded = new Set();
+    for (const { pairs } of candidates) {
+        for (const pair of pairs) {
+            const text = pair.originalLiteral.text;
+            const known = edits.get(text);
+            if (generatedSpecifier.test(text) || (known !== undefined && (known.text !== pair.edit.text || known.mapped !== pair.edit.mapped))) {
+                excluded.add(text);
+            }
+            edits.set(text, pair.edit);
+            pairLiterals.add(pair.literal);
+        }
+    }
+    const visit = node => {
+        const literal = slotLiteral(ts, specifierSlotOf(ts, node));
+        if (literal !== undefined && !pairLiterals.has(literal) && edits.has(literal.text)) {
+            excluded.add(literal.text);
+        }
+        ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(result, visit);
+    return excluded;
+}
+
+const generatedSpecifier = /^tslib$|\/jsx(-dev)?-runtime$/;
+
+// Writes the new specifiers (`edits`: original text -> { text, mapped }) into JS that tsc-rs
+// emitted from the original specifiers, and moves the maps.
+function rewriteScriptSpecifiers(ts, outputs, edits) {
+    for (const output of outputs) {
+        if (!isScriptOutput(ts, output.fileName)) {
+            continue;
+        }
+        const mapOutput = outputs.find(candidate => candidate.fileName === `${output.fileName}.map`);
+        const { body } = splitSourceMappingUrl(output.text.startsWith(byteOrderMark) ? output.text.slice(1) : output.text);
+        const scriptKind = ts.fileExtensionIs(output.fileName, ts.Extension.Jsx) ? ts.ScriptKind.JSX : ts.ScriptKind.JS;
+        const parsed = ts.createSourceFile(output.fileName, body, ts.ScriptTarget.Latest, /*setParentNodes*/ false, scriptKind);
+        const changes = [];
+        const visit = node => {
+            const literal = slotLiteral(ts, specifierSlotOf(ts, node));
+            if (literal !== undefined && edits.has(literal.text)) {
+                changes.push(specifierEdit(ts, parsed, literal, edits.get(literal.text)));
+            }
+            ts.forEachChild(node, visit);
+        };
+        ts.forEachChild(parsed, visit);
+        applyTextEdits(ts, output, mapOutput, changes);
+    }
+}
+
+function specifierEdit(ts, parsed, literal, edit) {
+    return { start: literal.getStart(parsed), end: literal.end, text: edit.text, mapped: edit.mapped };
+}
+
+// Replaces ranges ({ start, end, text, mapped }) of an output's text and moves its map: mappings
+// after a range on its line shift; the ones at its ends stay only when `mapped`.
+function applyTextEdits(ts, output, mapOutput, changes) {
+    if (changes.length === 0) {
+        return;
+    }
+    const hasByteOrderMark = output.text.startsWith(byteOrderMark);
+    const { body, url } = splitSourceMappingUrl(hasByteOrderMark ? output.text.slice(1) : output.text);
+    const lineStarts = ts.computeLineStarts(body);
+    const byLine = new Map();
+    let text = "";
+    let last = 0;
+    for (const change of [...changes].sort((a, b) => a.start - b.start)) {
+        const start = ts.computeLineAndCharacterOfPosition(lineStarts, change.start);
+        const end = ts.computeLineAndCharacterOfPosition(lineStarts, change.end);
+        // A literal with a line continuation keeps its text.
+        if (start.line !== end.line || change.start < last) {
+            continue;
+        }
+        text += body.slice(last, change.start) + change.text;
+        last = change.end;
+        const edits = byLine.get(start.line) ?? [];
+        edits.push({ start: start.character, end: end.character, delta: change.text.length - (change.end - change.start), mapped: change.mapped });
+        byLine.set(start.line, edits);
+    }
+    text += body.slice(last);
+    const move = json => ({ ...json, mappings: encodeMappings(shiftColumns(decodeMappings(ts, json.mappings), byLine)) });
+    const prefix = hasByteOrderMark ? byteOrderMark : "";
+    if (url?.startsWith(inlineSourceMap)) {
+        output.text = prefix + text + sourceMappingUrl + toInlineSourceMap(move(fromInlineSourceMap(url)));
+        return;
+    }
+    if (url !== undefined && mapOutput !== undefined) {
+        mapOutput.text = JSON.stringify(move(JSON.parse(mapOutput.text)));
+    }
+    output.text = prefix + text + (url === undefined ? "" : sourceMappingUrl + url);
+}
+
+function shiftColumns(lines, byLine) {
+    for (const [line, edits] of byLine) {
+        lines[line] = lines[line]?.flatMap(segment => {
+            let shift = 0;
+            for (const edit of edits) {
+                if (segment[0] < edit.start || (segment[0] === edit.start && edit.mapped)) {
+                    break;
+                }
+                if (segment[0] > edit.end || (segment[0] === edit.end && edit.mapped)) {
+                    shift += edit.delta;
+                    continue;
+                }
+                return [];
+            }
+            return [[segment[0] + shift, ...segment.slice(1)]];
+        });
+    }
+    return lines;
+}
+
 // Parses an emitted JS or declaration text, runs `factories` on it, and when the tree changed,
 // prints it back into `output` (and its map).
-function transformEmittedText(ts, { options, emitHost, file, output, factories, kind }) {
+function transformEmittedText(ts, { options, emitHost, directory, file, output, factories, kind }) {
     const hasByteOrderMark = output.text.startsWith(byteOrderMark);
     const { body, url } = splitSourceMappingUrl(hasByteOrderMark ? output.text.slice(1) : output.text);
     const scriptKind = kind === "declaration" ? ts.ScriptKind.TS : ts.fileExtensionIs(output.fileName, ts.Extension.Jsx) ? ts.ScriptKind.JSX : ts.ScriptKind.JS;
@@ -161,16 +480,25 @@ function transformEmittedText(ts, { options, emitHost, file, output, factories, 
         if (result === parsed && !state.printerHooks && annotatedNodes(parsed).length === 0 && !mutatedInPlace(ts, parsed, originalStatements)) {
             return transform.diagnostics;
         }
+        const printAll = state.printerHooks || sourceFileHasOwnEmitNode(parsed, result);
+        const extraHeader = kind === "declaration" ? addedReferenceDirectives(ts, parsed, result, ts.getNewLineCharacter(options)) : "";
+        const specifiers = printAll || extraHeader !== "" ? undefined : findSpecifierChanges(ts, { file: parsed, originalStatements, result, dirty: dirtyStatements(parsed), options, inPlace: true });
+        if (specifiers !== undefined && keepsOriginalText(ts, parsed, originalStatements, result, specifiers)) {
+            const mapOutput = file.outputs.find(candidate => candidate.fileName === `${output.fileName}.map`);
+            applyTextEdits(ts, output, mapOutput, specifiers.pairs.map(pair => specifierEdit(ts, parsed, pair.originalLiteral, pair.edit)));
+            return transform.diagnostics;
+        }
         const splice = printSpliced(ts, {
             file: parsed,
             originalStatements,
             result,
             transform,
             printerOptions: kind === "declaration" ? declarationPrinterOptions(options) : scriptPrinterOptions(ts, options),
-            printAll: state.printerHooks || sourceFileHasOwnEmitNode(parsed, result),
-            extraHeader: kind === "declaration" ? addedReferenceDirectives(ts, parsed, result, ts.getNewLineCharacter(options)) : "",
+            printAll,
+            extraHeader,
         });
-        replaceOutputText(ts, file, output, splice, { hasByteOrderMark, url });
+        const sources = new ExtraSources(ts, { options, emitHost, directory, sourceFile: file.sourceFile, outputFileName: output.fileName, recorded: splice.sources });
+        replaceOutputText(ts, file, output, splice, { hasByteOrderMark, url, sources });
         return transform.diagnostics;
     }
     finally {
@@ -180,7 +508,7 @@ function transformEmittedText(ts, { options, emitHost, file, output, factories, 
 
 // Helpers that `before` transformers requested go into the JS output after its prologue, as
 // TS 6.0's printer writes them; helpers tsc-rs already wrote are not repeated.
-function insertHelpers(ts, { options, emitHost, file, output, helpers }) {
+function insertHelpers(ts, { options, emitHost, directory, file, output, helpers }) {
     const missing = helpers.filter(helper => helper.importName === undefined || !output.text.includes(`var ${helper.importName} = `));
     if (missing.length === 0) {
         return;
@@ -189,17 +517,17 @@ function insertHelpers(ts, { options, emitHost, file, output, helpers }) {
         ts.addEmitHelpers(sourceFile, missing);
         return sourceFile;
     };
-    transformEmittedText(ts, { options, emitHost, file, output, factories: [addHelpers], kind: "script" });
+    transformEmittedText(ts, { options, emitHost, directory, file, output, factories: [addHelpers], kind: "script" });
 }
 
-function replaceOutputText(ts, file, output, splice, { hasByteOrderMark, url }) {
+function replaceOutputText(ts, file, output, splice, { hasByteOrderMark, url, sources }) {
     let text = splice.text;
     if (url !== undefined) {
         if (!/[\r\n]$/.test(text)) {
             text += "\n";
         }
         const mapOutput = file.outputs.find(candidate => candidate.fileName === `${output.fileName}.map`);
-        const remap = json => ({ ...json, mappings: encodeMappings(splice.remap(decodeMappings(ts, json.mappings))) });
+        const remap = json => sources.addTo({ ...json, mappings: encodeMappings(splice.remap(decodeMappings(ts, json.mappings), sources, json.sources.length)) });
         if (url.startsWith(inlineSourceMap)) {
             text += sourceMappingUrl + toInlineSourceMap(remap(fromInlineSourceMap(url)));
         }
@@ -239,20 +567,82 @@ function toInlineSourceMap(json) {
     return inlineSourceMap + Buffer.from(JSON.stringify(json), "utf8").toString("base64");
 }
 
-// The map that tsc-rs made for the printed source, moved onto the original source.
-function composeWithSplice(json, splice, originalText) {
-    const lines = splice.decode(json.mappings).map(segments => segments?.map(segment => {
+// The map that tsc-rs made for the printed source, moved onto the original source. Text that only
+// the printer made (synthesized nodes) maps nowhere, as in TS 6.0.
+function composeWithSplice(json, splice, originalText, sources) {
+    const lines = splice.decode(json.mappings).map(segments => segments?.flatMap(segment => {
         if (segment.length === 1) {
-            return segment;
+            return [];
         }
         const original = splice.originalPosition(segment[2], segment[3]);
-        return original === undefined ? [segment[0]] : [segment[0], segment[1], original.line, original.character, segment[4]];
+        if (original === undefined) {
+            return [];
+        }
+        const source = original.source === 0 ? segment[1] : sources.index(original.source, json.sources.length);
+        return [[segment[0], source, original.line, original.character, segment[4]]];
     }));
     const composed = { ...json, mappings: encodeMappings(lines) };
     if (Array.isArray(json.sourcesContent)) {
         composed.sourcesContent = json.sourcesContent.map((content, index) => index === 0 ? originalText : content);
     }
-    return composed;
+    return sources.addTo(composed);
+}
+
+// Sources other than the transformed file that transformers mapped synthesized nodes to
+// (setSourceMapRange with a `source`), named as TS 6.0 names them in a map.
+class ExtraSources {
+    constructor(ts, { options, emitHost, directory, sourceFile, outputFileName, recorded }) {
+        this.ts = ts;
+        this.options = options;
+        this.emitHost = emitHost;
+        this.directory = directory;
+        this.sourceFile = sourceFile;
+        this.outputFileName = outputFileName;
+        this.recorded = recorded ?? { names: [], contents: [] };
+        this.used = [];
+    }
+
+    // The index in the composed map (after its `count` own sources) of source `recordedIndex` of
+    // the printer's recording.
+    index(recordedIndex, count) {
+        let at = this.used.indexOf(recordedIndex);
+        if (at < 0) {
+            at = this.used.push(recordedIndex) - 1;
+        }
+        return count + at;
+    }
+
+    addTo(json) {
+        if (this.used.length === 0) {
+            return json;
+        }
+        const sources = [...json.sources, ...this.used.map(index => this.sourceName(this.recorded.names[index]))];
+        const result = { ...json, sources };
+        if (Array.isArray(json.sourcesContent)) {
+            result.sourcesContent = [...json.sourcesContent, ...this.used.map(index => this.recorded.contents[index] ?? null)];
+        }
+        return result;
+    }
+
+    // TS 6.0: src/compiler/sourcemap.ts addSource with the directory of
+    // src/compiler/emitter.ts getSourceMapDirectory
+    sourceName(fileName) {
+        const { ts, options, emitHost, directory } = this;
+        let mapDirectory;
+        if (options.sourceRoot) {
+            mapDirectory = emitHost.getCommonSourceDirectory();
+        }
+        else if (options.mapRoot) {
+            mapDirectory = ts.getDirectoryPath(ts.getSourceFilePathInNewDir(this.sourceFile.fileName, emitHost, ts.normalizeSlashes(options.mapRoot)));
+            if (ts.getRootLength(mapDirectory) === 0) {
+                mapDirectory = ts.combinePaths(emitHost.getCommonSourceDirectory(), mapDirectory);
+            }
+        }
+        else {
+            mapDirectory = ts.getDirectoryPath(ts.normalizePath(this.outputFileName));
+        }
+        return ts.getRelativePathToDirectoryOrUrl(mapDirectory, fileName, directory, emitHost.getCanonicalFileName, /*isAbsolutePathAnUrl*/ true);
+    }
 }
 
 // TS 6.0: src/compiler/transformer.ts wrapScriptTransformerFactory
@@ -388,7 +778,9 @@ function addedReferenceDirectives(ts, parsed, result, newLine) {
 // changed statements go through the printer; the file header (shebang, copyright comments,
 // reference directives) and the end of the file keep their text too. All changed statements print
 // in one pass, as TS 6.0 prints a file, so generated names do not collide.
-function printSpliced(ts, { file, originalStatements, result, transform, printerOptions, printAll, extraHeader = "", keepAlive = false }) {
+// `keptAs` maps transformed statements whose text stays the original statement's (only their
+// module specifiers changed) to that statement.
+function printSpliced(ts, { file, originalStatements, result, transform, printerOptions, printAll, keptAs, extraHeader = "", keepAlive = false }) {
     const text = file.text;
     // TS 6.0: src/compiler/emitter.ts emitBodyWithDetachedComments prints the detached comments and
     // the comments at the end of the file only when the statement list kept its text range; a
@@ -405,12 +797,13 @@ function printSpliced(ts, { file, originalStatements, result, transform, printer
     const kept = [];
     const prologueCount = countPrologue(ts, result.statements);
     const statements = result.statements.map((statement, index) => {
-        const original = originalIndex.get(statement);
-        if (dirty === undefined || original === undefined || index < prologueCount || dirty.has(statement) || used.has(statement) || !isPristine(ts, statement)) {
+        const source = keptAs?.get(statement) ?? statement;
+        const original = originalIndex.get(source);
+        if (dirty === undefined || original === undefined || index < prologueCount || dirty.has(source) || used.has(source) || !isPristine(ts, source)) {
             return statement;
         }
-        used.add(statement);
-        kept.push(keptRange(ts, file, statement, original, headerEnd));
+        used.add(source);
+        kept.push(keptRange(ts, file, source, original, headerEnd));
         return ts.factory.createExpressionStatement(ts.factory.createIdentifier(`${marker}${kept.length - 1}`));
     });
     const keepAliveMarker = keepAlive ? `${marker}keep_alive` : undefined;
@@ -433,10 +826,16 @@ function printSpliced(ts, { file, originalStatements, result, transform, printer
         substituteNode: transform.substituteNode,
     });
     const writer = ts.createTextWriter(ts.getNewLineCharacter(printerOptions));
-    printer.writeFile(synthetic, writer, recorder);
+    const unmark = markSynthesizedNodes(ts, synthetic.statements);
+    try {
+        printer.writeFile(synthetic, writer, recorder);
+    }
+    finally {
+        unmark();
+    }
     const printed = writer.getText().replace(/[\r\n]+$/, "");
 
-    const builder = new SpliceBuilder(ts, text, printed, recorder.lines);
+    const builder = new SpliceBuilder(ts, text, printed, recorder);
     builder.original(0, headerEnd);
     builder.inserted(extraHeader);
     let cursor = 0;
@@ -459,6 +858,36 @@ function printSpliced(ts, { file, originalStatements, result, transform, printer
     }
     return builder.finish(keepAliveNames.length === 0 ? undefined : keepAliveMarker);
 }
+
+// Gives every node without a source map position one in a stand-in source while the printer
+// runs, so that the recording shows where synthesized nodes start and end (TS 6.0 maps nothing
+// there).
+function markSynthesizedNodes(ts, statements) {
+    const marked = [];
+    const visit = node => {
+        if (ts.getSourceMapRange(node).pos < 0) {
+            const existing = node.emitNode;
+            const emitNode = existing ?? (node.emitNode = {});
+            marked.push({ node, emitNode, created: existing === undefined, range: emitNode.sourceMapRange });
+            emitNode.sourceMapRange = synthesizedRange;
+        }
+        ts.forEachChild(node, visit);
+    };
+    statements.forEach(visit);
+    return () => {
+        for (const { node, emitNode, created, range } of marked) {
+            if (created) {
+                node.emitNode = undefined;
+            }
+            else {
+                emitNode.sourceMapRange = range;
+            }
+        }
+    };
+}
+
+const synthesizedSourceName = "\0tsc-rs synthesized";
+const synthesizedRange = { pos: 0, end: 0, source: { fileName: synthesizedSourceName, text: "", skipTrivia: pos => pos } };
 
 // TS 6.0 never elides an import that a transformer created (src/compiler/checker.ts emit resolver
 // isReferencedAliasDeclaration answers true for a node with no parse tree node); tsc-rs elides
@@ -658,11 +1087,11 @@ function blank(text, start, end) {
 // Builds the spliced text out of pieces of the original text and of the printed text, and maps
 // positions of the result back.
 class SpliceBuilder {
-    constructor(ts, originalText, printedText, printedMappings) {
+    constructor(ts, originalText, printedText, recorder) {
         this.ts = ts;
         this.originalText = originalText;
         this.printedText = printedText;
-        this.printedMappings = printedMappings;
+        this.recorder = recorder;
         this.text = "";
         this.pieces = [];
     }
@@ -688,12 +1117,12 @@ class SpliceBuilder {
     // `keepAlive` is the marker of the statement that keeps synthesized imports (see
     // synthesizedImportNames), if the text has one.
     finish(keepAlive) {
-        return new SplicedText(this.ts, this.text, this.pieces, this.originalText, this.printedText, this.printedMappings, keepAlive);
+        return new SplicedText(this.ts, this.text, this.pieces, this.originalText, this.printedText, this.recorder, keepAlive);
     }
 }
 
 class SplicedText {
-    constructor(ts, text, pieces, originalText, printedText, printedMappings, keepAlive) {
+    constructor(ts, text, pieces, originalText, printedText, recorder, keepAlive) {
         this.ts = ts;
         this.text = text;
         this.pieces = pieces;
@@ -703,7 +1132,11 @@ class SplicedText {
         this.lineStarts = ts.computeLineStarts(text);
         this.originalLineStarts = ts.computeLineStarts(originalText);
         this.printedLineStarts = ts.computeLineStarts(printedText);
-        this.printedMappings = printedMappings;
+        this.printedMappings = recorder.lines;
+        // Sources of the printer's mappings: 0 is the file itself, others come from transformers,
+        // except the stand-in for synthesized nodes.
+        this.sources = { names: recorder.sources, contents: recorder.contents };
+        this.synthesizedSource = recorder.sources.indexOf(synthesizedSourceName);
     }
 
     decode(mappings) {
@@ -750,26 +1183,31 @@ class SplicedText {
 
     originalPositionIn(piece, position) {
         if (piece.kind === "original") {
-            return lineAndCharacter(this.ts, this.originalLineStarts, piece.source + position - piece.start);
+            return { source: 0, ...lineAndCharacter(this.ts, this.originalLineStarts, piece.source + position - piece.start) };
         }
-        // From the printer's last mapping on the line, only through text copied from the original:
-        // text the printer made up (synthesized nodes) maps nowhere, as in TS 6.0.
+        // From the printer's last mapping on the line, only through text copied from the original
+        // (the character at the position too, unless the line ends there): text the printer made up
+        // (synthesized nodes) maps nowhere, as in TS 6.0.
         const printedPosition = piece.source + position - piece.start;
         const printed = lineAndCharacter(this.ts, this.printedLineStarts, printedPosition);
-        const segment = findSegment(this.printedMappings, printed.line, printed.character);
-        if (segment === undefined) {
+        const segment = findPrintedSegment(this.printedMappings, printed.line, printed.character, this.synthesizedSource);
+        if (segment === undefined || segment[1] === this.synthesizedSource) {
             return undefined;
         }
         const distance = printed.character - segment[0];
+        if (segment[1] !== 0) {
+            return distance === 0 ? { source: segment[1], line: segment[2], character: segment[3] } : undefined;
+        }
         const source = this.originalLineStarts[segment[2]] + segment[3];
         if (distance !== 0 && this.printedText.substr(printedPosition - distance, distance) !== this.originalText.substr(source, distance)) {
             return undefined;
         }
-        return { line: segment[2], character: segment[3] + distance };
+        return { source: 0, line: segment[2], character: segment[3] + distance };
     }
 
-    // `mappings` (decoded, from the original text to some source) moved onto this text.
-    remap(mappings) {
+    // `mappings` (decoded, from the original text to some source) moved onto this text; mappings
+    // the printer made to other sources go to `sources` (ExtraSources).
+    remap(mappings, sources, sourceCount) {
         const result = [];
         const add = (position, segment) => {
             const { line, character } = lineAndCharacter(this.ts, this.lineStarts, position);
@@ -792,6 +1230,13 @@ class SplicedText {
                         add(piece.start + position - piece.source, segment);
                         continue;
                     }
+                    if (segment[1] === this.synthesizedSource) {
+                        continue;
+                    }
+                    if (segment[1] !== 0) {
+                        add(piece.start + position - piece.source, [segment[0], sources.index(segment[1], sourceCount), segment[2], segment[3]]);
+                        continue;
+                    }
                     const source = findSegment(mappings, segment[2], segment[3]);
                     if (source !== undefined) {
                         add(piece.start + position - piece.source, source);
@@ -808,6 +1253,23 @@ class SplicedText {
 
 function lineAndCharacter(ts, lineStarts, position) {
     return ts.computeLineAndCharacterOfPosition(lineStarts, position);
+}
+
+// The printer's segment for a position of the printed text: at the position itself, the last one
+// of a node that is not synthesized, if any (a synthesized child starts where its parent does);
+// before it, the last one.
+function findPrintedSegment(mappings, line, character, synthesizedSource) {
+    let found;
+    for (const segment of mappings[line] ?? []) {
+        if (segment[0] > character) {
+            break;
+        }
+        if (segment[0] === character && found?.[0] === character && segment[1] === synthesizedSource && found[1] !== synthesizedSource) {
+            continue;
+        }
+        found = segment;
+    }
+    return found;
 }
 
 // The last mapped segment of `line` at or before `character`.
@@ -828,18 +1290,28 @@ function findSegment(mappings, line, character) {
     return found;
 }
 
-// A source map generator for the printer that keeps the mappings of its own source, by
-// generated line: [column, sourceIndex, sourceLine, sourceCharacter].
+// A source map generator for the printer that keeps its mappings by generated line:
+// [column, sourceIndex, sourceLine, sourceCharacter]. Source 0 is the printed file; others are
+// sources that transformers gave synthesized nodes.
 function createMappingRecorder() {
     const lines = [];
-    let sources = 0;
+    const sources = [];
+    const contents = [];
     return {
         lines,
-        addSource: () => sources++,
-        setSourceContent() {},
+        sources,
+        contents,
+        // TS 6.0: src/compiler/sourcemap.ts addSource (one index per file name)
+        addSource(fileName) {
+            const index = sources.indexOf(fileName);
+            return index < 0 ? sources.push(fileName) - 1 : index;
+        },
+        setSourceContent(index, content) {
+            contents[index] = content;
+        },
         addMapping(generatedLine, generatedCharacter, sourceIndex, sourceLine, sourceCharacter) {
-            if (sourceIndex === 0) {
-                (lines[generatedLine] ??= []).push([generatedCharacter, 0, sourceLine, sourceCharacter]);
+            if (sourceIndex !== undefined) {
+                (lines[generatedLine] ??= []).push([generatedCharacter, sourceIndex, sourceLine, sourceCharacter]);
             }
         },
     };

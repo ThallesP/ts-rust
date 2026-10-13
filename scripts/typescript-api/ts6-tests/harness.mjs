@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { commandTriage, TRIAGE_USAGE } from "./triage.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../../..");
@@ -42,10 +43,12 @@ const USAGE = `usage: run.sh <command> ...
       category (default 30, 0 = all); --json writes every name. Exits 1 when a base pass is lost or absent.
       Tests that pass settings TS 7 removed (ts7-removed.json, tier1 only) are marked [TS7-removed: ...].
       Only suites present in both runs are compared; the others are listed as unrun.
+${TRIAGE_USAGE}
 
 Environment: TS6_TESTS_CACHE (cache checkout), TS6_TESTS_GIT (clone source),
 TS6_TESTS_MEMORY_MAX (systemd cap, default 12G), TS6_TESTS_SYSTEMD=0 (no systemd-run wrapper),
-TS6_TESTS_PROCESS_TIMEOUT (seconds per mocha process, default 3600; a killed process counts as crashed).
+TS6_TESTS_PROCESS_TIMEOUT (seconds per mocha process, default 3600; a killed process counts as crashed),
+TS6_TESTS_TS7 (triage: the TS 7 tsc/ directory).
 The systemd unit gets PATH, HOME and every TS6_TESTS_* and TSRS_* variable, nothing else.`;
 
 let harnessLog;
@@ -750,6 +753,14 @@ switch (command) {
         break;
     case "compare":
         process.exitCode = commandCompare(rest);
+        break;
+    case "triage":
+        try {
+            process.exitCode = commandTriage(rest);
+        }
+        catch (error) {
+            fail(`triage: ${error.message}`);
+        }
         break;
     default:
         fail(`unknown command ${command}\n\n${USAGE}`);

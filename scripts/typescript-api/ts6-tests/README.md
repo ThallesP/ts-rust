@@ -9,6 +9,8 @@ scripts/typescript-api/ts6-tests/run.sh help
 scripts/typescript-api/ts6-tests/run.sh setup        # optional: run does it when needed
 scripts/typescript-api/ts6-tests/run.sh run npm/typescript-api target/typescript-api/runs/pkg --suite all
 scripts/typescript-api/ts6-tests/run.sh compare target/typescript-api/ts6-baselines/stock-6.0.3 target/typescript-api/runs/pkg
+scripts/typescript-api/ts6-tests/run.sh triage target/typescript-api/runs/pkg   # compiler failures against TS 7's baselines
+node scripts/typescript-api/ts6-tests/repro.mjs list                            # minimal repros of the triage clusters
 ```
 
 ## Build (cached)
@@ -110,6 +112,87 @@ marked `[TS7-removed: ...]` and counted in the "Lost (TS7-removed)" column: `ts7
 the 689 tier1 tests that the R-tests.md probe (a typescript@6.0.3 wrapper that recorded the options
 each test passed in, `/work/scratch/research/ts-api-tests/probe-removed.json`) flagged; 610 of them
 are services Transpile tests, whose harness defaults to ES5.
+
+## Triage
+
+`triage <out-dir> [--ts7 DIR] [--limit N]` classifies every failing compiler-suite test of a run
+(`results.json` and the local baselines under `ws/compiler-*/tests/baselines/local/`) against TS 7's
+own baseline of the same name: the Go harness's `testdata/baselines/reference/{compiler,conformance}/`
+in the `tsc/` directory DIR of a microsoft/TypeScript checkout at the tsc-rs pin (default
+`/work/scratch/repos/ts71/tsc`, `TS6_TESTS_TS7` overrides; fed0bf24149f on 2026-10-13). tsc-rs is a
+port of that code, so the package's answers should equal those baselines. It writes
+`<out-dir>/triage.json` (every failing test with its class, reason, TS 7 case and baseline paths)
+and `<out-dir>/triage.md` (counts per class and check, the D list grouped by cause, the suspicious
+passing tests), reads nothing else outside the run, the TS 6.0 cache and DIR, and can be run again.
+
+Classes, in this order of precedence:
+
+- **A**, equals TS 7's baseline after the normalizations below: expected TS 7 behavior. Also when
+  TS 7 edited only the case's directives (`directives-changed`), and when only the order of the
+  emitted files differs (the Go harness lists some declaration files in another order than the tsc-rs
+  CLI, the package and TS 6.0 write them; nodeNextPackageSelfNameWithOutDirDeclDirCompositeNestedDirs).
+- **B**, uses a setting TS 7 removed, read from the TS 6.0 case's directives, its `tsconfig*.json` /
+  `jsconfig*.json` units and the variation in the test name: target es3/es5, module
+  none/amd/umd/system, `outFile`/`out`, moduleResolution classic/node10/node, `baseUrl`,
+  `downlevelIteration` (any value), `esModuleInterop`/`allowSyntheticDefaultImports`/`alwaysStrict`
+  false (TS 7: `compiler/program.go` "Removed in TS7"). For errors tests, `ts6Difference` says whether
+  ours differs from TS 6.0's baseline only in removed/deprecated option diagnostics (TS5101, 5102,
+  5107, 5108). `ts7` says what TS 7 does with the configuration (below).
+- **C**, no comparable TS 7 baseline: `case-removed` (no such case in `testdata/tests/cases`),
+  `case-skipped` (`skippedTests` in `internal/testrunner/compiler_runner.go`), `emit-skipped` (JS
+  output of a case in `skippedEmitTests`), `variant-dropped` (the TS 7 case no longer lists this
+  value or no longer varies the option), `variant-skipped` (the Go harness skips or rejects the
+  configuration: `harnessutil.go` `SkipUnsupportedCompilerOptions`), `case-changed` (TS 7 edited the
+  case's text, not only directives), or a directive value that ends with `;` (TS 6.0's harness reads
+  `@declaration: true;` as false, the Go harness as true).
+- **D**, differs from TS 7's baseline: a candidate bug in the package (or in tsc-rs). The cause
+  label lists, for errors, diagnostics extra, missing, at another position or with another text (by
+  code), else a related-information or file-section difference; for JS, emitted files extra, missing
+  or different (by kind: js, d.ts, source map, declaration diagnostics). "output shows the real
+  working directory" marks outputs that contain the repository or run path.
+
+Passing side: a passing test equals TS 6.0's baseline; when TS 7 runs the same configuration and its
+baseline differs from TS 6.0's (after normalization), the test is listed in `passingSuspicious`
+with a reason (removed setting, case changed, TS 7's own known bug from `submoduleTriaged.txt`, or
+"TS 7 baseline differs"). `ts7-vs-ts6` marks baselines that TS 7 lists in `submoduleAccepted.txt` or
+`submoduleTriaged.txt`.
+
+Normalizations: only what the two harnesses format differently, each found in real pairs.
+
+- Case files are read without a byte order mark (TS 6.0's `IO.readFile` drops it; 844 cases start with one).
+- TS 7 renamed promoted cases that collided with its own (`testdata/promotedTestCollisions.txt`,
+  `X.ts` -> `X_promoted.ts`): the TS 7 baseline of `X_promoted` is used, with `X_promoted` read as `X`.
+  The repository merge also rewrote `github.com/microsoft/typescript-go/` links in promoted cases to
+  `github.com/microsoft/TypeScript/tsc/`; TS 7's case and baseline text are read with the old link.
+- `==== ./a.ts (N errors) ====`: the Go harness drops a leading `./` from unit names and joins `//`
+  (TS 6.0 prints the `@filename` as written). Seen in typeSatisfactionWithDefaultExport,
+  jsDeclarationEmitExportedClassWithExtends.
+- `@pretty` baselines: TS 6.0's `formatDiagnosticsWithColorAndContext` (JS, which the package keeps)
+  against the Go diagnosticwriter. TS 7 puts a related message on its location line (TS 6.0 after the
+  snippet), ends every diagnostic block with an empty line, draws one `~` for an empty span, ends the
+  summary with an empty line and writes CRLF in the "Errors  Files" table (TS 6.0 LF). Both sides are
+  rewritten to TS 6.0's layout with LF, and a lone `~` in a snippet is dropped on both sides (the
+  plain section of the baseline still checks spans). Seen in duplicateIdentifierRelatedSpans1-7,
+  manyCompilerErrorsInTheTwoFiles, prettyContextNotDebugAssertion.
+- Error markers under a source line with astral characters: TS 6.0 draws them in UTF-16 units, the
+  Go harness in code points (`tsbaseline/error_baseline.go`); TS 6.0-side markers are redrawn in code
+  points. Seen in regularExpressionCharacterClassRangeOrder, unicodeEscapesInNames02.
+- Diagnostics without a file come first in both harnesses, ordered by code in TS 6.0's
+  `compareDiagnostics` but by their internal location first in TS 7's `ast.CompareDiagnostics`; both
+  sides order them by code, in the summary and in the `!!! error` block before the first file.
+  Seen in arrayIterationLibES5TargetDifferent (TS5053 before or after TS2318).
+- Lib files need none: both harnesses print `lib.es5.d.ts:--:--`; line endings are CRLF on both sides.
+
+## Repros
+
+`node scripts/typescript-api/ts6-tests/repro.mjs list | <case>... | all [--pkg DIR] [--ts6 DIR] [--tsgo BIN]`
+runs a tiny program per triage cluster through the package (default `npm/typescript-api`),
+typescript@6.0.3 (default `/work/scratch/consumers/node_modules/typescript`) and the `tsgo` command
+line (default `target/release/tsgo`), and prints the diagnostics and declaration files of each next
+to TS 7's expected answer. Fixtures go to `target/typescript-api/ts6-repro/<case>/`. Hosts: `disk`
+(`ts.createCompilerHost`), `memory` (an in-memory CompilerHost under `/ts6-repro-virtual/`, like the
+TS 6.0 harness's virtual file system), `other-cwd` (relative names and `getCurrentDirectory()` point at
+the fixture while the process runs elsewhere).
 
 ## Resources
 

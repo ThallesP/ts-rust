@@ -32,6 +32,7 @@ function emit(program, targetSourceFile, writeFile, cancellationToken, emitOnly,
             customTransformers: transformers,
             reemit: texts => reemitScripts(program, texts),
             cancellationToken,
+            directory: nativeDirectoryOf(program),
         });
     }
     return writeEmitted(program, emitted, writeFile, cancellationToken, targetSourceFile === undefined && !skipBuildInfo);
@@ -358,10 +359,11 @@ class OutputNames {
     }
 
     get(sourceFile, nativeFileName) {
-        const { ts, currentDirectory } = this.program;
+        const { ts } = this.program;
         if (!this.relativeOptions && ts.isRootedDiskPath(sourceFile.fileName)) {
             return nativeFileName;
         }
+        const directory = nativeDirectoryOf(this.program);
         let paths = this.byFile.get(sourceFile);
         if (paths === undefined) {
             this.host ??= createEmitHost(this.program);
@@ -369,20 +371,28 @@ class OutputNames {
             paths = [names.jsFilePath, names.sourceMapFilePath, names.declarationFilePath, names.declarationMapPath].filter(name => name !== undefined);
             this.byFile.set(sourceFile, paths);
         }
-        return paths.find(name => ts.getNormalizedAbsolutePath(name, currentDirectory) === nativeFileName) ?? nativeFileName;
+        return paths.find(name => ts.getNormalizedAbsolutePath(name, directory) === nativeFileName) ?? nativeFileName;
     }
+}
+
+// The absolute directory tsc-rs resolves the program's relative names against (a host's current
+// directory may be "").
+function nativeDirectoryOf(program) {
+    return program.nativeDirectory ?? program.currentDirectory;
 }
 
 // TS 6.0: src/compiler/program.ts isEmitBlocked. TS 6.0 blocks outputs that would overwrite a
 // program file.
 function isEmitBlocked(program, fileName) {
     const { ts } = program;
+    const directory = nativeDirectoryOf(program);
+    const toPath = name => ts.toPath(ts.getNormalizedAbsolutePath(name, directory), directory, program.getCanonicalFileName);
     let paths = sourcePaths.get(program);
     if (paths === undefined) {
-        paths = new Set(program.nativeFileNames.map(name => program.toPath(program.toJsFileName(name))));
+        paths = new Set(program.nativeFileNames.map(name => toPath(program.toJsFileName(name))));
         sourcePaths.set(program, paths);
     }
-    return paths.has(program.toPath(ts.getNormalizedAbsolutePath(fileName, program.currentDirectory)));
+    return paths.has(toPath(fileName));
 }
 
 const sourcePaths = new WeakMap();

@@ -1,8 +1,8 @@
 "use strict";
 
-// One tsc-rs API session per process. Programs are snapshots in it. The session asks the JS side
-// for every file system operation; the innermost entry of `fileSystems` answers, and an operation
-// it does not handle (or no entry at all) goes to the operating system.
+// One tsc-rs API session per process and case sensitivity. Programs are snapshots in it. The
+// session asks the JS side for every file system operation; the innermost entry of `fileSystems`
+// answers, and an operation it does not handle (or no entry at all) goes to the operating system.
 
 const fileSystemCallbacks = ["readFile", "fileExists", "directoryExists", "getAccessibleEntries", "realpath", "stat", "writeFile", "removeFile"];
 const useOS = JSON.stringify({ kind: "useOS" });
@@ -23,15 +23,22 @@ const done = JSON.stringify({ kind: "value" });
 const encoder = new TextEncoder();
 const { loadAddon } = require("./native/addon.js");
 
-let session;
+const sessions = new Map();
 
-function getSession(ts) {
-    session ??= new Session(ts);
+// tsc-rs compares file names the way its session was started; a host whose case sensitivity
+// differs from ts.sys (TS 6.0's own tests use case-insensitive in-memory hosts) gets its own.
+function getSession(ts, useCaseSensitiveFileNames = ts.sys.useCaseSensitiveFileNames) {
+    const key = !!useCaseSensitiveFileNames;
+    let session = sessions.get(key);
+    if (session === undefined) {
+        session = new Session(ts, key);
+        sessions.set(key, session);
+    }
     return session;
 }
 
 class Session {
-    constructor(ts) {
+    constructor(ts, useCaseSensitiveFileNames) {
         const { createChannel } = require("./native/channel.js");
         this.fileSystems = [];
         // An exception thrown by a host callback while tsc-rs waits for its answer. The callback
@@ -43,7 +50,7 @@ class Session {
             "--api",
             "--cwd",
             ts.sys.getCurrentDirectory(),
-            `--useCaseSensitiveFileNames=${ts.sys.useCaseSensitiveFileNames}`,
+            `--useCaseSensitiveFileNames=${useCaseSensitiveFileNames}`,
             `--callbacks=${fileSystemCallbacks.join(",")}`,
         ]);
         for (const name of fileSystemCallbacks) {

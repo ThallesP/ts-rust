@@ -16,8 +16,9 @@ import { formatMs, hashTree, isoNow, manifestHash, readJson, removePath, sha256F
 function usage() {
     return [
         "usage: nest.sh run <typescript-package-dir|tgz> <out-dir> [options]",
-        "  --scenario a,b,...   letters or ids (default: all): a=nest-cli-unit b=swagger-sample c=cjs-paths",
-        "                       d=cjs-paths-watch e=swagger-swc f=graphql-sample",
+        "  --scenario a,b,...   letters or ids (default: all; g = g1,g2): a=nest-cli-unit b=swagger-sample",
+        "                       c=cjs-paths d=cjs-paths-watch e=swagger-swc f=graphql-sample g1=cjs-paths-webpack",
+        "                       g2=cjs-paths-webpack-swagger h1=nest-new-esm h2=nest-new-cjs i=ts-node",
         "  --env NAME=VALUE     extra environment for builds, tests and apps (not for npm); repeatable",
         "  --force              replace an existing <out-dir>",
     ].join("\n");

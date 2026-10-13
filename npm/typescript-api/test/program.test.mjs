@@ -705,3 +705,210 @@ test("project references give TS 6.0's resolved references and redirects; tsc-rs
     delete expected.files;
     assert.deepEqual(actual, expected);
 });
+
+// A compiler host over in-memory files, like TS 6.0's own tests use. Lib files come from the
+// package's lib directory unless `libs` is false.
+function memoryHost(anyTs, files, { currentDirectory = "/", caseSensitive = true, defaultLib, libs = true } = {}) {
+    const libDir = path.dirname(anyTs.getDefaultLibFilePath({}));
+    const key = fileName => {
+        const absolute = anyTs.normalizePath(anyTs.combinePaths(currentDirectory, fileName));
+        return caseSensitive ? absolute : absolute.toLowerCase();
+    };
+    const texts = new Map(Object.entries(files).map(([fileName, text]) => [key(fileName), text]));
+    const readFile = fileName => texts.get(key(fileName)) ?? (libs && fileName.startsWith(libDir) ? anyTs.sys.readFile(fileName) : undefined);
+    const requests = [];
+    return {
+        requests,
+        getSourceFile: (fileName, languageVersion) => {
+            requests.push(fileName);
+            const text = readFile(fileName);
+            return text === undefined ? undefined : anyTs.createSourceFile(fileName, text, languageVersion);
+        },
+        getDefaultLibFileName: options => defaultLib ?? path.join(libDir, anyTs.getDefaultLibFileName(options)),
+        writeFile: () => {},
+        getCurrentDirectory: () => currentDirectory,
+        getCanonicalFileName: fileName => (caseSensitive ? fileName : fileName.toLowerCase()),
+        getNewLine: () => "\n",
+        useCaseSensitiveFileNames: () => caseSensitive,
+        fileExists: fileName => readFile(fileName) !== undefined,
+        readFile,
+        getDirectories: () => [],
+    };
+}
+
+function messages(anyTs, diagnostics) {
+    return diagnostics.map(diagnostic => `${diagnostic.file?.fileName ?? "-"}:${diagnostic.start ?? "-"}:${diagnostic.code}:${anyTs.flattenDiagnosticMessageText(diagnostic.messageText, "\n")}`);
+}
+
+test("createProgram throws like TypeScript 6.0 on options read from tsconfig JSON without parsing", () => {
+    const host = memoryHost(ts, { "/a.ts": "export {};\n" });
+    assert.throws(() => ts.createProgram(["/a.ts"], { module: "nodenext" }, host), /^Error: module is a string value; tsconfig JSON must be parsed with parseJsonSourceFileConfigFileContent/);
+});
+
+test("missing files are the ones TypeScript 6.0 tried: each extension of a reference, and a default lib the host does not have", needsTs6, () => {
+    const describe = anyTs => {
+        const files = { "/p/main.ts": "/// <reference path=\"./gone\" />\n/// <reference path=\"./here\" />\n/// <reference path=\"other.ts\" />\nlet a: Array<number>;\n", "/p/here.tsx": "export {};\n" };
+        const host = memoryHost(anyTs, files, { currentDirectory: "/p", defaultLib: "lib.d.ts", libs: false });
+        const program = anyTs.createProgram(["main.ts"], { types: [] }, host);
+        return {
+            files: program.getSourceFiles().map(file => file.fileName),
+            missing: [...program.getMissingFilePaths().keys()].sort(),
+            options: messages(anyTs, program.getOptionsDiagnostics()),
+            noDefaultLibName: anyTs.createProgram(["/p/main.ts"], { types: [] }, memoryHost(anyTs, files, { defaultLib: "", libs: false })).getSourceFiles().length,
+        };
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a copy of a package found again under another path is a redirect to the first, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const packageJson = JSON.stringify({ name: "foo", version: "1.2.3" });
+        const host = memoryHost(anyTs, {
+            "/a.ts": "import * as bar from \"bar\"; import * as foo from \"foo\";\n",
+            "/node_modules/bar/index.d.ts": "import * as foo from \"foo\";\n",
+            "/node_modules/bar/node_modules/foo/package.json": packageJson,
+            "/node_modules/bar/node_modules/foo/index.d.ts": "export const x: number;\n",
+            "/node_modules/foo/package.json": packageJson,
+            "/node_modules/foo/index.d.ts": "export const x: number;\n",
+        });
+        const program = anyTs.createProgram(["/a.ts"], { types: [] }, host);
+        const copy = program.getSourceFile("/node_modules/foo/index.d.ts");
+        return {
+            copy: [copy.fileName, copy.path, copy.redirectInfo?.redirectTarget.fileName, copy.statements.length, program.isSourceFileFromExternalLibrary(copy)],
+            targets: [...program.redirectTargetsMap.entries()],
+            types: program.getSemanticDiagnostics().length,
+        };
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("the types of implements and interface extends clauses map to tsc-rs's TypeReference and QualifiedName nodes", () => {
+    const host = memoryHost(ts, { "/file.ts": "namespace N { export interface I { a: number } }\ninterface J extends N.I {}\nclass C implements N.I { a = 1; }\n" });
+    const program = ts.createProgram({ host, rootNames: ["/file.ts"], options: { types: [] } });
+    const checker = program.getTypeChecker();
+    const file = program.getSourceFile("/file.ts");
+    const [, j, c] = file.statements;
+    for (const heritage of [j.heritageClauses[0].types[0], c.heritageClauses[0].types[0]]) {
+        const type = checker.getTypeAtLocation(heritage.expression);
+        assert.equal(type.symbol?.name, "I");
+        assert.equal(type, checker.getTypeAtLocation(heritage.expression.name));
+        assert.equal(program.handleToNode(program.nodeToHandle(heritage)), heritage);
+        assert.equal(program.handleToNode(program.nodeToHandle(heritage.expression)), heritage.expression);
+    }
+});
+
+test("a cancelled language service request ends with OperationCanceledException, also where a feature is not supported", () => {
+    const files = { "a.ts": "function foo(x: number) { return x; }\nfoo(1);\n" };
+    const dir = writeFixture("cancel", files);
+    let cancelled = false;
+    const host = { ...languageServiceHost(ts, dir, files, { types: [] }).host, getCancellationToken: () => ({ isCancellationRequested: () => cancelled }) };
+    const service = ts.createLanguageService(host);
+    const file = path.join(dir, "a.ts");
+    const position = fs.readFileSync(file, "utf8").lastIndexOf("foo");
+    service.getSemanticDiagnostics(file);
+    cancelled = true;
+    for (const request of [() => service.getQuickInfoAtPosition(file, position), () => service.getSignatureHelpItems(file, position + 4, undefined), () => service.getSemanticDiagnostics(file)]) {
+        assert.throws(request, error => error instanceof ts.OperationCanceledException);
+    }
+    const checker = service.getProgram().getTypeChecker();
+    const token = {
+        isCancellationRequested: () => true,
+        throwIfCancellationRequested() {
+            throw new ts.OperationCanceledException();
+        },
+    };
+    assert.throws(() => checker.runWithCancellationToken(token, view => view.getTypeAtLocation(service.getProgram().getSourceFile(file))), error => error instanceof ts.OperationCanceledException);
+});
+
+test("a host's resolveModuleNames is not asked for the ambient modules a file declares, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const asked = [];
+        const host = memoryHost(anyTs, { "/app.d.ts": "declare module \"fs\" { export interface Stat { id: number } }\ndeclare module \"fs-client\" { import { Stat } from \"fs\"; import { Q } from \"q\"; export function foo(): Stat; }\n" });
+        host.resolveModuleNames = names => {
+            asked.push(...names);
+            return names.map(() => undefined);
+        };
+        const program = anyTs.createProgram(["/app.d.ts"], { types: [] }, host);
+        return { asked, diagnostics: messages(anyTs, program.getSemanticDiagnostics()) };
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a case-insensitive host gets case-insensitive file names on any system, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const host = memoryHost(anyTs, {
+            "/Src/Main.ts": "import { B } from \"./other\";\nimport c = require(\"D:/Src/c\");\nexport const a: B = { x: 1 };\n",
+            "/Src/Other.ts": "export interface B { x: number }\n",
+            "d:/Src/c.ts": "import d = require(\"./Other\");\nexport = 1;\n",
+        }, { caseSensitive: false });
+        const program = anyTs.createProgram(["/Src/Main.ts", "d:/src/c.ts"], { types: [], module: anyTs.ModuleKind.CommonJS, forceConsistentCasingInFileNames: true }, host);
+        const main = program.getSourceFile("/src/main.ts");
+        const checker = program.getTypeChecker();
+        const type = checker.getTypeAtLocation(main.statements[2].declarationList.declarations[0].name);
+        return {
+            files: program.getSourceFiles().map(file => file.fileName).filter(name => !name.includes("/lib.")),
+            declarations: type.symbol.declarations.map(declaration => declaration.getSourceFile().fileName),
+            diagnostics: messages(anyTs, [...program.getOptionsDiagnostics(), ...program.getSemanticDiagnostics()]),
+        };
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a host whose current directory is relative gets relative file names and messages, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const host = memoryHost(anyTs, { "moduleA.ts": "import { x } from \"./ModuleB\";\n", "moduleB.ts": "export var x;\n" }, { currentDirectory: "", caseSensitive: false });
+        const program = anyTs.createProgram(["moduleA.ts", "moduleB.ts"], { module: anyTs.ModuleKind.CommonJS, forceConsistentCasingInFileNames: true, noImplicitAny: true, types: [] }, host);
+        return {
+            files: program.getSourceFiles().map(file => file.fileName).filter(name => !name.includes("lib.")),
+            diagnostics: messages(anyTs, program.getSemanticDiagnostics()),
+            options: messages(anyTs, program.getOptionsDiagnostics()),
+        };
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a file first found through a relative reference keeps that relative name, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const host = memoryHost(anyTs, { "/a/b/c.ts": "/// <reference path=\"b.ts\"/>\n", "/a/b/b.ts": "var x;\n" }, { currentDirectory: "/a/b" });
+        const program = anyTs.createProgram(["c.ts", "/a/b/b.ts"], { types: [] }, host);
+        return program.getSourceFiles().map(file => file.fileName).filter(name => !name.includes("/lib."));
+    };
+    assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a program made from an oldProgram with nothing changed answers diagnostics without checking again", () => {
+    const dir = writeFixture("same-diagnostics", { "main.ts": "export const main: number = \"1\";\n" });
+    const options = { types: [] };
+    const { host } = editableHost(ts, dir, options);
+    const roots = [path.join(dir, "main.ts")];
+    const first = ts.createProgram(roots, options, host);
+    assert.deepEqual(first.getSemanticDiagnostics().map(diagnostic => diagnostic.code), [2322]);
+    first.getGlobalDiagnostics();
+    const second = ts.createProgram(roots, options, host, first);
+    const methods = [];
+    const request = second.session.request;
+    second.session.request = function countingRequest(method, params) {
+        methods.push(method);
+        return request.call(this, method, params);
+    };
+    try {
+        assert.deepEqual(second.getSemanticDiagnostics().map(diagnostic => [diagnostic.code, diagnostic.file === second.getSourceFile(roots[0])]), [[2322, true]]);
+        assert.deepEqual(second.getGlobalDiagnostics(), []);
+    }
+    finally {
+        delete second.session.request;
+    }
+    assert.deepEqual(methods.filter(method => method.endsWith("Diagnostics")), []);
+});
+
+// TS 7 behavior kept: tsc-rs compiles its own bundled lib files; a language service host's own
+// lib.d.ts with other text is not compiled (TS 6.0's languageService "detects program upto date"
+// tests), and the program lists tsc-rs's lib files.
+test("a host's own default lib with other text is not compiled: tsc-rs's lib files are", () => {
+    const host = memoryHost(ts, { "/project/root.ts": "let a: Array<number> = [];\n", "/lib/lib.d.ts": "interface Array<T> {}\n" }, { defaultLib: "/lib/lib.d.ts", libs: false });
+    const program = ts.createProgram(["/project/root.ts"], { types: [] }, host);
+    const names = program.getSourceFiles().map(file => file.fileName);
+    assert.ok(names.includes("/lib/lib.es5.d.ts"));
+    assert.ok(!names.includes("/lib/lib.d.ts") || program.getSourceFile("/lib/lib.d.ts").text !== "interface Array<T> {}\n");
+    assert.deepEqual(program.getSemanticDiagnostics(), []);
+});

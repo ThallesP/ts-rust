@@ -80,6 +80,12 @@ function excerpt(diff, maxLines) {
     return `${lines.slice(0, maxLines).join("\n")}\n... (${lines.length - maxLines} more diff lines)`;
 }
 
+// A .tsbuildinfo records the compiler's own file versions (lib file hashes, format): diffed, never
+// counted, also inside a tree (outDir holds it when rootDir is the project directory).
+function isBuildInfo(rel) {
+    return rel.endsWith(".tsbuildinfo");
+}
+
 // One artifact (a tree, a file or a JSON file) of one scenario in both runs.
 function compareArtifact(name, baseInfo, newInfo, baseDir, newDir, options) {
     const kind = (baseInfo ?? newInfo).kind;
@@ -109,10 +115,14 @@ function compareArtifact(name, baseInfo, newInfo, baseDir, newDir, options) {
             } else {
                 continue;
             }
+            if (isBuildInfo(rel)) {
+                file.informational = true;
+            }
             result.files.push(file);
         }
         result.same = all.length - result.files.length;
-        result.differs = result.files.length > 0;
+        result.differs = result.files.some((file) => !file.informational);
+        result.informationalFiles = result.files.filter((file) => file.informational).length;
         return result;
     }
     const baseFile = path.join(baseDir, baseInfo.path);
@@ -313,8 +323,10 @@ function markdown(report, options) {
                 lines.push(`- ${artifact.name}: ${artifact.differs ? `present in base ${artifact.presence.base}, in new ${artifact.presence.new}` : "absent in both"}`);
                 continue;
             }
+            const infoFiles = (artifact.files ?? []).filter((file) => file.informational);
+            const infoNote = infoFiles.length > 0 ? `; .tsbuildinfo differs (informational, not counted): ${infoFiles.map((file) => `${file.change} ${file.path}`).join(", ")}` : "";
             if (!artifact.differs) {
-                lines.push(`- ${artifact.name}: identical${artifact.kind === "tree" ? ` (${artifact.total} files)` : ""}`);
+                lines.push(`- ${artifact.name}: identical${artifact.kind === "tree" ? ` (${artifact.total - infoFiles.length}${infoFiles.length > 0 ? ` of ${artifact.total}` : ""} files)` : ""}${infoNote}`);
                 continue;
             }
             if (artifact.informational) {
@@ -322,19 +334,21 @@ function markdown(report, options) {
                 continue;
             }
             if (artifact.kind === "tree") {
-                const count = (change) => artifact.files.filter((file) => file.change === change).length;
-                lines.push(`- ${artifact.name}: ${artifact.same}/${artifact.total} files identical, ${count("differs")} differ, ${count("added")} only in new, ${count("removed")} only in base`);
-                for (const file of artifact.files.filter((f) => f.change !== "differs")) {
+                const counted = artifact.files.filter((file) => !file.informational);
+                const count = (change) => counted.filter((file) => file.change === change).length;
+                lines.push(`- ${artifact.name}: ${artifact.same}/${artifact.total} files identical, ${count("differs")} differ, ${count("added")} only in new, ${count("removed")} only in base${infoNote}`);
+                for (const file of counted.filter((f) => f.change !== "differs")) {
                     lines.push(`  - ${file.change}: ${file.path}`);
                 }
             } else {
                 const json = artifact.files[0]?.jsonEqual === undefined ? "" : artifact.files[0].jsonEqual ? " (bytes differ, JSON equal)" : " (JSON differs)";
                 lines.push(`- ${artifact.name}: differs${json}`);
             }
-            for (const file of artifact.files.filter((f) => f.diff !== undefined).slice(0, 15)) {
+            const diffed = artifact.files.filter((f) => f.diff !== undefined && !f.informational);
+            for (const file of diffed.slice(0, 15)) {
                 lines.push("", "```diff", excerpt(file.diff, options.maxDiffLines), "```");
             }
-            const more = artifact.files.filter((f) => f.diff !== undefined).length - 15;
+            const more = diffed.length - 15;
             if (more > 0) {
                 lines.push(`  ... ${more} more differing files`);
             }

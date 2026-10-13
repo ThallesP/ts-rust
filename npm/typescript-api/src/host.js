@@ -78,6 +78,8 @@ function fileSystemFor(ts, program) {
     if (program.usesDefaultHost) {
         return undefined;
     }
+    // tsc-rs asks with absolute names; the host gets the names TS 6.0 would use.
+    const name = path => program.jsNameOf(path);
     return {
         readFile(path) {
             if (path.startsWith(bundledPrefix)) {
@@ -86,7 +88,7 @@ function fileSystemFor(ts, program) {
             if (host.getSourceFile !== undefined && (isSourceFileName(ts, path) || program.rootNativeToJs.has(path))) {
                 return program.adoptHostSourceFile(path)?.text;
             }
-            return host.readFile(path);
+            return host.readFile(name(path));
         },
         fileExists(path) {
             if (path.startsWith(bundledPrefix)) {
@@ -96,14 +98,14 @@ function fileSystemFor(ts, program) {
             if (program.rootNativeToJs.has(path) && host.getSourceFile !== undefined) {
                 return program.adoptHostSourceFile(path) !== undefined;
             }
-            return host.fileExists(path);
+            return host.fileExists(name(path));
         },
         directoryExists(path) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
             // TS 6.0: src/compiler/moduleNameResolver.ts directoryProbablyExists
-            return host.directoryExists === undefined ? true : host.directoryExists(path);
+            return host.directoryExists === undefined ? true : host.directoryExists(name(path));
         },
         getAccessibleEntries(path) {
             if (path.startsWith(bundledPrefix) || host.getDirectories === undefined) {
@@ -111,23 +113,26 @@ function fileSystemFor(ts, program) {
             }
             const files = host.readDirectory === undefined
                 ? []
-                : host.readDirectory(path, undefined, undefined, undefined, 1).map(name => ts.getBaseFileName(name));
-            return { files, directories: host.getDirectories(path) };
+                : host.readDirectory(name(path), undefined, undefined, undefined, 1).map(fileName => ts.getBaseFileName(fileName));
+            return { files, directories: host.getDirectories(name(path)) };
         },
         realpath(path) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
-            return host.realpath === undefined ? path : host.realpath(path);
+            if (host.realpath === undefined) {
+                return path;
+            }
+            return ts.getNormalizedAbsolutePath(host.realpath(name(path)), program.nativeDirectory);
         },
         stat(path) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
-            if (host.fileExists(path) || (program.rootNativeToJs.has(path) && program.adoptHostSourceFile(path) !== undefined)) {
+            if (host.fileExists(name(path)) || (program.rootNativeToJs.has(path) && program.adoptHostSourceFile(path) !== undefined)) {
                 return { mode: 0o100644, size: 0, mtime: new Date(0) };
             }
-            if (host.directoryExists?.(path)) {
+            if (host.directoryExists?.(name(path))) {
                 return { mode: 0o40755, size: 0, mtime: new Date(0) };
             }
             return undefined;
@@ -149,9 +154,11 @@ class HostModuleResolver {
         this.program = program;
         // Directory path -> native names of the host files in it.
         this.filesByDirectory = new Map();
-        // The session keeps the callback; it must not keep the program alive.
-        const resolver = new WeakRef(this);
-        this.callbackName = program.session.registerCallback("resolveModuleName", params => resolver.deref()?.resolveForNative(params) ?? null);
+        // tsc-rs resolves while it builds the program's snapshot. The session keeps the callback, which
+        // must not keep the program alive after that (a WeakRef would until the end of the job).
+        const target = { resolver: this };
+        this.target = target;
+        this.callbackName = program.session.registerCallback("resolveModuleName", params => target.resolver?.resolveForNative(params) ?? null);
         this.id = program.session.request("createModuleResolver", { compilerOptions: program.nativeOptions, resolveModuleNameCallback: this.callbackName });
     }
 
@@ -203,10 +210,16 @@ class HostModuleResolver {
             return resolutions;
         }
         const containingFile = ts.getNormalizedAbsolutePath(sourceFile.originalFileName, program.currentDirectory);
-        const results = this.callHost(literals, containingFile, sourceFile);
-        literals.forEach((literal, index) => {
-            resolutions.set(literal.text, ts.getModeForUsageLocation(sourceFile, literal, options), results[index] ?? emptyResolution);
-        });
+        // TS 6.0: src/compiler/program.ts resolveNamesReusingOldState resolves a name that the file
+        // itself declares as an ambient module to that module, without asking the host.
+        const ownAmbient = name => sourceFile.ambientModuleNames.includes(name);
+        const unknown = literals.filter(literal => !ownAmbient(literal.text));
+        const results = unknown.length === 0 ? [] : this.callHost(unknown, containingFile, sourceFile);
+        let next = 0;
+        for (const literal of literals) {
+            const resolution = ownAmbient(literal.text) ? emptyResolution : results[next++] ?? emptyResolution;
+            resolutions.set(literal.text, ts.getModeForUsageLocation(sourceFile, literal, options), resolution);
+        }
         return resolutions;
     }
 
@@ -260,6 +273,7 @@ class HostModuleResolver {
             }
         }
         this.filesByDirectory.clear();
+        this.target.resolver = undefined;
     }
 
     // What releasing the resolver needs, without the program.

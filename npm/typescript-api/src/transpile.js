@@ -6,6 +6,8 @@ const { transformOutputs } = require("./transformers.js");
 
 // TS 6.0: src/services/transpile.ts optionsRedundantWithVerbatimModuleSyntax
 const optionsRedundantWithVerbatimModuleSyntax = new Set(["isolatedModules"]);
+const transpileDirectory = "/";
+const byteOrderMark = "\uFEFF";
 
 // TS 6.0: src/services/transpile.ts transpileWorker (transpileModule, transpileDeclaration and
 // transpile all come here). tsc-rs transpiles the text (its transpileModule and
@@ -41,7 +43,9 @@ function transpileWorker(ts, input, transpileOptions, declaration) {
     const inputFileName = transpileOptions.fileName || (transpileOptions.compilerOptions && transpileOptions.compilerOptions.jsx ? "module.tsx" : "module.ts");
     let sourceFile;
     const getSourceFile = () => sourceFile ??= createInputSourceFile(ts, input, inputFileName, options, transpileOptions);
-    const native = toNativeOptions(ts, options);
+    // tsc-rs roots the input file at "/" (TS 7: internal/transpile/transpile.go inputDirectory);
+    // relative path options go there too, where TS 6.0 keeps both relative to "".
+    const native = toNativeOptions(ts, options, { currentDirectory: transpileDirectory });
     const request = text => getSession(ts).request(declaration ? "transpileDeclaration" : "transpileModule", {
         input: text,
         options: { compilerOptions: native.options, fileName: inputFileName, reportDiagnostics: !!transpileOptions.reportDiagnostics },
@@ -68,6 +72,7 @@ function transpileWorker(ts, input, transpileOptions, declaration) {
             emitHost: createTranspileEmitHost(ts, options, getSourceFile()),
             files: [file],
             customTransformers: transformers,
+            directory: transpileDirectory,
             reemit: texts => {
                 const reemitted = request(texts.get(inputFileName));
                 const list = [{ fileName: outputFileName, text: reemitted.outputText }];
@@ -87,7 +92,9 @@ function transpileWorker(ts, input, transpileOptions, declaration) {
     if (declaration && transpileOptions.moduleName) {
         addAmdModuleDirective(ts, output, map, transpileOptions.moduleName, options);
     }
-    return { outputText: output.text, diagnostics, sourceMapText: map?.text };
+    // TS 6.0's transpile writeFile drops the byte order mark that emitBOM asks the host to write.
+    const outputText = output.text.startsWith(byteOrderMark) ? output.text.slice(1) : output.text;
+    return { outputText, diagnostics, sourceMapText: map?.text };
 }
 
 // TS 6.0: src/compiler/emitter.ts emitTripleSlashDirectives writes the module name of a

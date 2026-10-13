@@ -12,10 +12,10 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import v8 from "node:v8";
+import vm from "node:vm";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-
-// TEMPORARY: src/index.js installs the hooks only with this set, until root removes the gate.
 
 const require = createRequire(import.meta.url);
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -1353,4 +1353,131 @@ test("object fields are fetched once, on first read", () => {
     assert.equal(count(() => [property.name, property.escapedName, property.flags]), 0);
     assert.equal(count(() => checker.typeToString(box)), 1);
     assert.equal(count(() => checker.typeToString(box)), 0);
+});
+
+test("answers the checker already holds need no request: apparent types, index infos by kind, repeated questions", () => {
+    const dir = writeFixture("local-answers", {
+        "local.ts": "export const o = { a: 1 };\nexport const u: string | number[] = \"\";\nexport const r: Record<string, number> = {};\nexport const f = true as boolean;\n",
+    });
+    const fileName = path.join(dir, "local.ts");
+    const program = ts.createProgram([fileName], baseOptions);
+    const checker = program.getTypeChecker();
+    let requests = 0;
+    const request = program.request.bind(program);
+    program.request = (method, params) => {
+        requests++;
+        return request(method, params);
+    };
+    const count = read => {
+        const before = requests;
+        const value = read();
+        return [value, requests - before];
+    };
+    const names = Object.fromEntries(program.getSourceFile(fileName).statements.map(statement => statement.declarationList.declarations[0]).map(declaration => [declaration.name.text, declaration.name]));
+    const [o] = count(() => checker.getTypeAtLocation(names.o));
+    assert.deepEqual(count(() => checker.getApparentType(o)), [o, 0]);
+    const u = checker.getTypeAtLocation(names.u);
+    assert.deepEqual(count(() => checker.getApparentType(u)), [u, 0]);
+    // `boolean` is a union too, but its apparent type is the global Boolean interface.
+    const [apparentBoolean, booleanRequests] = count(() => checker.getApparentType(checker.getTypeAtLocation(names.f)));
+    assert.equal(checker.typeToString(apparentBoolean), "Boolean");
+    assert.ok(booleanRequests > 0);
+    const r = checker.getTypeAtLocation(names.r);
+    checker.getIndexInfosOfType(r);
+    const [stringIndex, indexRequests] = count(() => checker.getIndexInfoOfType(r, ts.IndexKind.String));
+    assert.equal(indexRequests, 0);
+    assert.equal(checker.typeToString(stringIndex.type), "number");
+    assert.deepEqual(count(() => checker.getIndexInfoOfType(r, ts.IndexKind.Number)), [undefined, 0]);
+    const [assignable] = count(() => checker.isTypeAssignableTo(o, r));
+    assert.deepEqual(count(() => checker.isTypeAssignableTo(o, r)), [assignable, 0]);
+    assert.deepEqual(count(() => checker.getTypeAtLocation(names.o)), [o, 0]);
+});
+
+// typescript-eslint's project service (packages/project-service/src/createProjectService.ts).
+function projectService() {
+    const noop = () => {};
+    const host = { ...ts.sys, clearImmediate, clearTimeout, setImmediate, setTimeout, watchDirectory: () => ({ close: noop }), watchFile: () => ({ close: noop }) };
+    const logger = { close: noop, endGroup: noop, getLogFileName: () => undefined, hasLevel: () => false, info: noop, loggingEnabled: () => false, msg: noop, perftrc: noop, startGroup: noop };
+    return new ts.server.ProjectService({
+        cancellationToken: ts.server.nullCancellationToken,
+        host,
+        logger,
+        session: undefined,
+        useInferredProjectPerProjectRoot: false,
+        useSingleInferredProject: false,
+        jsDocParsingMode: ts.JSDocParsingMode.ParseAll,
+    });
+}
+
+test("declarations in files programs share answer `symbol` from the newest program, and old programs can be collected", async () => {
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc");
+    const dir = writeFixture("shared-declarations", {
+        "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, target: "es2022", module: "commonjs", types: [] }, include: ["src"] }),
+        "src/dep.ts": "export interface Dep { a: number }\nexport function make(a: number): Dep { return { a }; }\nexport class Box { value = 1; }\n",
+        "src/file.ts": "",
+    });
+    const service = projectService();
+    const file = path.join(dir, "src/file.ts");
+    const programs = [];
+    let depFile;
+    for (let index = 0; index < 30; index++) {
+        service.openClientFile(file, `import { make, Box } from "./dep";\nconst x${index} = make(${index});\nconst box = new Box();\n`, undefined, dir);
+        const program = service.getDefaultProjectForFile(service.getScriptInfo(file).fileName, true).getLanguageService(true).getProgram();
+        const checker = program.getTypeChecker();
+        const [, made, box] = program.getSourceFile(file).statements.map(statement => statement.declarationList?.declarations[0]);
+        const declaration = checker.getResolvedSignature(made.initializer).declaration;
+        assert.equal(checker.typeToString(checker.getTypeOfSymbol(declaration.symbol)), "(a: number) => Dep");
+        const [value] = checker.getTypeAtLocation(box.name).getProperties();
+        assert.equal(value.declarations[0].symbol, checker.getSymbolAtLocation(value.declarations[0].name));
+        depFile ??= ts.getSourceFileOfNode(declaration);
+        assert.equal(ts.getSourceFileOfNode(declaration), depFile, "dep.ts is one SourceFile shared by every program");
+        programs.push(new WeakRef(program));
+    }
+    for (let round = 0; round < 2; round++) {
+        await new Promise(resolve => setImmediate(resolve));
+        gc();
+    }
+    const alive = programs.filter(reference => reference.deref() !== undefined).length;
+    assert.ok(alive <= 2, `${alive} of ${programs.length} programs are still alive`);
+});
+
+// typescript-eslint no-unnecessary-type-assertion typeContains: an unbounded walk through return
+// types, which never repeats a type here (each level instantiates a new one).
+function typeContains(checker, type, predicate, seen = new Set()) {
+    if (seen.has(type)) {
+        return false;
+    }
+    seen.add(type);
+    if (predicate(type)) {
+        return true;
+    }
+    if (type.isUnionOrIntersection()) {
+        return type.types.some(member => typeContains(checker, member, predicate, seen));
+    }
+    const typeArguments = type.aliasTypeArguments ?? (type.objectFlags & ts.ObjectFlags.Reference ? checker.getTypeArguments(type) : []);
+    const nested = [
+        ...typeArguments,
+        ...type.getCallSignatures().flatMap(signature => [signature.getReturnType(), ...signature.getParameters().map(parameter => checker.getTypeOfSymbol(parameter))]),
+    ];
+    return nested.some(member => typeContains(checker, member, predicate, seen));
+}
+
+test("an unbounded walk over instantiated types ends near the end of the stack, as TS 6.0's second walk does", () => {
+    const dir = writeFixture("recursive-method", {
+        "file.ts": "type RecursiveMethod<Options = {}> = (<NewOptions = {}>(options: NewOptions) => RecursiveMethod<Options & NewOptions>) & ((command: string) => Promise<void>);\ndeclare const recursiveMethod: RecursiveMethod;\ndeclare const value: object;\nvalue as unknown as typeof recursiveMethod;\n",
+    });
+    const program = ts.createProgram([path.join(dir, "file.ts")], { ...baseOptions, lib: ["lib.es2015.d.ts"], types: [] });
+    const checker = program.getTypeChecker();
+    const cast = checker.getTypeAtLocation(program.getSourceFile(path.join(dir, "file.ts")).statements[3].expression);
+    // TS 6.0 throws "Maximum call stack size exceeded" in the first walk and leaves the return type
+    // it was resolving on its resolution stack, so the second walk stops there and finds the type
+    // parameter. tsc-rs answers that circularity (errorType, no members) once less than 64 KB of
+    // stack is left, so neither walk throws; the first may end on the error type, which is `any`.
+    const containsAny = typeContains(checker, cast, type => (type.flags & ts.TypeFlags.Any) !== 0);
+    assert.equal(typeof containsAny, "boolean");
+    assert.equal(typeContains(checker, cast, type => (type.flags & (ts.TypeFlags.TypeVariable | ts.TypeFlags.Index)) !== 0), true);
+    const [signature] = cast.types[0].getCallSignatures();
+    assert.equal(checker.typeToString(signature.getReturnType()), "RecursiveMethod<{} & NewOptions>");
+    assert.equal(signature.getParameters().length, 1);
 });

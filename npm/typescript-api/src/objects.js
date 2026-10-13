@@ -15,6 +15,7 @@ const symbolOwnerFile = 0;
 let constructing = false;
 
 const classesByTs = new WeakMap();
+const modelsByChecker = new WeakMap();
 
 function classesFor(ts) {
     let classes = classesByTs.get(ts);
@@ -29,12 +30,18 @@ function own(object, name, value) {
     Object.defineProperty(object, name, { value, writable: true, enumerable: true, configurable: true });
 }
 
+// A list answered as a circularity near the end of the JS stack (checker.js hasStackRoom); a field
+// does not keep it.
+const circularList = Object.freeze([]);
+
 function lazy(prototype, name, load) {
     Object.defineProperty(prototype, name, {
         configurable: true,
         get() {
             const value = load(this);
-            own(this, name, value);
+            if (value !== circularList) {
+                own(this, name, value);
+            }
             return value;
         },
         set(value) {
@@ -112,7 +119,26 @@ function createClasses(ts) {
     }
     defineSymbolFields(ts, NativeSymbol);
     defineSignatureFields(ts, NativeSignature);
-    return { NativeType, NativeSymbol, NativeSignature, typeShapes: new Map() };
+    return { NativeType, NativeSymbol, NativeSignature, typeShapes: new Map(), declarationSymbolField: declarationSymbolField(ts) };
+}
+
+// The `symbol` field of a declaration node in a file programs share (ObjectModel withSymbolField).
+function declarationSymbolField(ts) {
+    return {
+        configurable: true,
+        enumerable: true,
+        get() {
+            const program = programOfSourceFile(ts.getSourceFileOfNode(this));
+            return program === undefined ? undefined : modelsByChecker.get(program.getTypeChecker())?.symbolOfNode(this);
+        },
+        set(value) {
+            own(this, "symbol", value);
+        },
+    };
+}
+
+function programOfSourceFile(sourceFile) {
+    return require("./program.js").programOfSourceFile(sourceFile);
 }
 
 // Symbol
@@ -183,7 +209,7 @@ function defineSignatureFields(ts, NativeSignature) {
     });
     lazy(prototype, "parameters", signature => {
         const { model, data } = native(signature);
-        return model.symbolList(data.parameters ?? [], "getParametersOfSignature", data.id);
+        return model.symbolList(data.parameters ?? [], "getParametersOfSignature", data.id, "list");
     });
     lazy(prototype, "thisParameter", signature => {
         const { model, data } = native(signature);
@@ -313,7 +339,7 @@ function typeClass(ts, classes, shape) {
     });
     lazy(prototype, "aliasTypeArguments", type => {
         const { model, data } = native(type);
-        return data.aliasTypeArguments === undefined ? undefined : model.typeList(data.aliasTypeArguments, "getAliasTypeArgumentsOfType", data.id);
+        return data.aliasTypeArguments === undefined ? undefined : model.typeList(data.aliasTypeArguments, "getAliasTypeArgumentsOfType", data.id, "list");
     });
     for (const group of shape.split(",")) {
         typeGroupFields[group]?.(ts, prototype, native);
@@ -360,7 +386,7 @@ const typeGroupFields = {
     types(ts, prototype, native) {
         lazy(prototype, "types", type => {
             const { model, data } = native(type);
-            return model.typeList(undefined, "getTypesOfType", data.id);
+            return model.typeList(undefined, "getTypesOfType", data.id, "list");
         });
     },
     freshable(ts, prototype, native) {
@@ -486,6 +512,8 @@ class ObjectModel {
         this.symbols = new Map();
         this.signatures = new Map();
         this.nodes = new Map();
+        this.declarationSymbols = new WeakMap();
+        modelsByChecker.set(checker, this);
     }
 
     request(method, params) {
@@ -508,19 +536,35 @@ class ObjectModel {
         return node;
     }
 
-    // TS 6.0's binder sets `symbol` on every declaration; services code reads it (findBaseOfDeclaration).
+    // A declaration of `symbol` (one of its declarations): a symbol that is not transient is the
+    // declaration's own, so the node needs no request for it.
     declaration(handle, symbol) {
         const node = this.node(handle);
-        if (node !== undefined && node.symbol === undefined) {
-            node.symbol = symbol;
+        if (node !== undefined && (symbol.flags & this.ts.SymbolFlags.Transient) === 0 && !this.declarationSymbols.has(node)) {
+            this.declarationSymbols.set(node, symbol);
         }
-        return node;
+        return this.withSymbolField(node);
     }
 
-    // A declaration whose symbol is not known yet gets it on first read.
     signatureDeclaration(handle) {
-        const node = this.node(handle);
-        if (node === undefined || node.symbol !== undefined) {
+        return this.withSymbolField(this.node(handle));
+    }
+
+    // TS 6.0's binder sets `symbol` on every declaration and services code reads it
+    // (findBaseOfDeclaration). A language service or a ts.server project shares unchanged
+    // SourceFiles between its programs, so the field asks the newest live program of the node's
+    // file: a field bound to this program would keep it, and its tsc-rs snapshot, alive and answer
+    // from it after newer programs. A file no program shares (shadowSourceFile) gets this one's.
+    withSymbolField(node) {
+        if (node === undefined) {
+            return undefined;
+        }
+        const descriptor = Object.getOwnPropertyDescriptor(node, "symbol");
+        if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.value !== undefined)) {
+            return node;
+        }
+        if (programOfSourceFile(this.ts.getSourceFileOfNode(node)) !== undefined) {
+            Object.defineProperty(node, "symbol", this.classes.declarationSymbolField);
             return node;
         }
         const model = this;
@@ -528,9 +572,7 @@ class ObjectModel {
             configurable: true,
             enumerable: true,
             get() {
-                const symbol = model.symbolOfDeclaration(node);
-                own(node, "symbol", symbol);
-                return symbol;
+                return model.symbolOfNode(node);
             },
             set(value) {
                 own(node, "symbol", value);
@@ -539,9 +581,25 @@ class ObjectModel {
         return node;
     }
 
+    // The symbol of a declaration node of this program, asked once per node.
+    symbolOfNode(node) {
+        if (this.declarationSymbols.has(node)) {
+            return this.declarationSymbols.get(node);
+        }
+        const symbol = this.symbolOfDeclaration(node);
+        this.declarationSymbols.set(node, symbol);
+        return symbol;
+    }
+
     // Set by the checker: the symbol of a declaration node.
     symbolOfDeclaration() {
         return undefined;
+    }
+
+    // Set by the checker: with `interrupted`, a resolution that answers as a circularity near the
+    // end of the JS stack (checker.js hasStackRoom).
+    interruptible(compute) {
+        return compute();
     }
 
     // Types
@@ -575,14 +633,14 @@ class ObjectModel {
     }
 
     // A list of types: from the known ids when all are known, else from the server.
-    typeList(ids, method, objectId) {
+    typeList(ids, method, objectId, interrupted) {
         if (ids !== undefined) {
             const known = ids.map(id => this.types.get(id));
             if (known.every(type => type !== undefined)) {
                 return known;
             }
         }
-        return (this.request(method, { objectId }) ?? []).map(data => this.type(data));
+        return this.interruptible(() => (this.request(method, { objectId }) ?? []).map(data => this.type(data)), interrupted);
     }
 
     // Symbols
@@ -623,12 +681,12 @@ class ObjectModel {
         return this.symbol(this.request(method, params));
     }
 
-    symbolList(compacts, method, objectId) {
+    symbolList(compacts, method, objectId, interrupted) {
         const known = compacts.map(compact => this.cachedSymbol(compact));
         if (known.every(symbol => symbol !== undefined)) {
             return known;
         }
-        return (this.request(method, { objectId }) ?? []).map(data => this.symbol(data));
+        return this.interruptible(() => (this.request(method, { objectId }) ?? []).map(data => this.symbol(data)), interrupted);
     }
 
     symbolTable(symbol, method, binderFlags) {
@@ -1125,4 +1183,4 @@ function decodeSyntheticNode(ts, bytes, { multilineObjectLiterals = false, singl
     return new SyntheticTree(ts, bytes, multilineObjectLiterals, singleQuote).build(1);
 }
 
-module.exports = { createObjectModel, decodeSyntheticNode };
+module.exports = { circularList, createObjectModel, decodeSyntheticNode };

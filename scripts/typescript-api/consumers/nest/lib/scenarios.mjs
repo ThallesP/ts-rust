@@ -4,12 +4,26 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+    appFile,
+    appRunning,
+    checkSchema,
+    exerciseCjsApp,
+    exists,
+    findAliasedSpecifiers,
+    minute,
+    npmInstall,
+    prepareCjsFixture,
+    preloadPort,
+    saveBuildInfo,
+    sourceFiles,
+} from "./common.mjs";
+import { runNestNewCjs, runNestNewEsm } from "./nest-new.mjs";
 import { ensureSource, pins, prepareAppDir } from "./sources.mjs";
-import { fixturesDir, harnessDir, listFiles, readJson, writeJson } from "./util.mjs";
+import { runTsNode } from "./ts-node.mjs";
+import { readJson, writeJson } from "./util.mjs";
+import { runWebpack, runWebpackSwagger } from "./webpack.mjs";
 
-const minute = 60_000;
-const preloadPort = path.join(harnessDir, "preload-port.cjs");
-const appRunning = /Application is running on: /;
 const foundZeroErrors = /Found 0 errors\. Watching for file changes\./;
 
 export const scenarios = [
@@ -49,44 +63,52 @@ export const scenarios = [
         title: "nestjs/nest sample/23-graphql-code-first: nest build (graphql plugin), run, schema.gql",
         run: runGraphqlSample,
     },
+    {
+        id: "cjs-paths-webpack",
+        letter: "g1",
+        title: "nest build --webpack on the CommonJS app without plugins: ts-loader transpileOnly + fork-ts-checker, run the bundle, a type error",
+        run: runWebpack,
+    },
+    {
+        id: "cjs-paths-webpack-swagger",
+        letter: "g2",
+        title: "nest build --webpack on the CommonJS app with the swagger plugin: ts-loader full mode (language service), run the bundle, a type error",
+        run: runWebpackSwagger,
+    },
+    {
+        id: "nest-new-esm",
+        letter: "h1",
+        title: "nest new (default ESM template, vitest): npm test, npm run test:e2e, nest build, run the app",
+        run: runNestNewEsm,
+    },
+    {
+        id: "nest-new-cjs",
+        letter: "h2",
+        title: "nest new, CommonJS template (jest + ts-jest, jest.config.ts through ts-node): npm test, npm run test:e2e, nest build, run the app",
+        run: runNestNewCjs,
+    },
+    {
+        id: "ts-node",
+        letter: "i",
+        title: "node -r ts-node/register on a script that imports TS modules: type-check and transpile-only modes, type and option errors",
+        run: runTsNode,
+    },
 ];
 
-// --scenario takes letters or ids.
+// --scenario takes letters or ids; a bare letter also takes its numbered scenarios (g = g1,g2).
 export function selectScenarios(list) {
     if (list === undefined) {
         return scenarios;
     }
-    return list.split(",").filter(Boolean).map((key) => {
-        const scenario = scenarios.find((candidate) => candidate.letter === key || candidate.id === key);
-        if (scenario === undefined) {
+    const selected = list.split(",").filter(Boolean).flatMap((key) => {
+        const matches = scenarios.filter((candidate) => candidate.letter === key || candidate.id === key
+            || (/^[a-z]$/.test(key) && new RegExp(`^${key}\\d+$`).test(candidate.letter)));
+        if (matches.length === 0) {
             throw new Error(`unknown scenario "${key}" (known: ${scenarios.map((s) => `${s.letter}=${s.id}`).join(", ")})`);
         }
-        return scenario;
+        return matches;
     });
-}
-
-function appFile(ctx, rel) {
-    return path.join(ctx.appDir, rel);
-}
-
-function exists(ctx, rel) {
-    return fs.existsSync(appFile(ctx, rel));
-}
-
-function sourceFiles(ctx) {
-    return new Set(listFiles(ctx.appDir, (rel, entry) => entry.name === "node_modules" || entry.name === ".git"));
-}
-
-async function npmInstall(ctx, { lockKey, legacyPeerDeps = false }) {
-    const args = ["install", `--before=${pins.npmBefore}`];
-    if (legacyPeerDeps) {
-        args.push("--legacy-peer-deps");
-    }
-    const step = await ctx.step("npm-install", "npm", args, { install: true, timeoutMs: 20 * minute });
-    if (step.ok && lockKey !== undefined) {
-        ctx.saveLock(lockKey);
-    }
-    return step.ok && ctx.verifyInstall();
+    return [...new Set(selected)];
 }
 
 // (a) nest-cli's own build and unit tests, the way its CI runs them (.circleci/config.yml:
@@ -152,58 +174,6 @@ async function runSwaggerSample(ctx) {
     });
 }
 
-// The plugin is the only source of the DTO schema properties (R-nest.md section 9).
-function checkSchema(ctx, text, schemaName, { required = [], properties = [] }) {
-    let schema;
-    try {
-        schema = JSON.parse(text).components?.schemas?.[schemaName];
-    } catch {
-        schema = undefined;
-    }
-    const names = Object.keys(schema?.properties ?? {});
-    const missing = [...required, ...properties].filter((name) => !names.includes(name));
-    const missingRequired = required.filter((name) => !(schema?.required ?? []).includes(name));
-    ctx.check(`api-json schema ${schemaName} has the plugin properties`, schema !== undefined && missing.length === 0 && missingRequired.length === 0,
-        `properties [${names.join(", ")}] required [${(schema?.required ?? []).join(", ")}]`);
-}
-
-// The .tsbuildinfo records the compiler's own file versions (lib file hashes, format), so it is
-// kept for inspection and diffed, not counted.
-function saveBuildInfo(ctx) {
-    for (const name of fs.readdirSync(ctx.appDir)) {
-        if (name.endsWith(".tsbuildinfo")) {
-            ctx.saveFile(name, name, "json", { informational: true });
-        }
-    }
-}
-
-const cjsFixture = path.join(fixturesDir, "nest-cjs-paths");
-
-async function prepareCjsFixture(ctx) {
-    prepareAppDir(cjsFixture, ctx.appDir);
-    ctx.useTarball();
-    return npmInstall(ctx, {});
-}
-
-// Module specifiers that tsconfig-paths.hook.ts must have rewritten to relative paths.
-function findAliasedSpecifiers(ctx) {
-    const hits = [];
-    const dist = appFile(ctx, "dist");
-    if (!fs.existsSync(dist)) {
-        return hits;
-    }
-    for (const rel of listFiles(dist)) {
-        if (!/\.(js|d\.ts)$/.test(rel)) {
-            continue;
-        }
-        const text = fs.readFileSync(path.join(dist, rel), "utf8");
-        for (const match of text.matchAll(/(?:require\(|from |import\()\s*["']((?:@app\/|@common|src\/)[^"']*)["']/g)) {
-            hits.push(`${rel}: ${match[1]}`);
-        }
-    }
-    return hits;
-}
-
 // (c) The committed CommonJS fixture: baseUrl + paths, ignoreDeprecations 6.0, swagger plugin.
 async function runCjsPaths(ctx) {
     if (!(await prepareCjsFixture(ctx))) {
@@ -220,28 +190,7 @@ async function runCjsPaths(ctx) {
         return;
     }
     await ctx.withService("app", "node", ["dist/main.js"], { ready: appRunning }, async (service, base) => {
-        const requests = [
-            ["root", "/", {}],
-            ["cats-list", "/cats?offset=0&limit=5", {}],
-            ["cats-one", "/cats/1", {}],
-            ["cats-missing", "/cats/99", {}],
-            ["cats-create", "/cats", { method: "POST", body: { name: "Tom", age: 4, breed: "Siamese", color: "black", size: 1, tags: ["x"] } }],
-            ["cats-invalid", "/cats", { method: "POST", body: { name: "Tom", age: "old", color: "green" } }],
-        ];
-        const results = {};
-        for (const [name, urlPath, options] of requests) {
-            results[name] = await ctx.get(base, urlPath, options);
-            ctx.saveHttp(name, results[name]);
-        }
-        ctx.check("GET / answers the v1 greeting", results.root.status === 200 && results.root.text === "Hello from nest-cjs-paths v1", results.root.text.slice(0, 200));
-        ctx.check("GET /cats answers 200", results["cats-list"].status === 200, `status ${results["cats-list"].status}`);
-        ctx.check("POST /cats answers 201", results["cats-create"].status === 201, `status ${results["cats-create"].status}`);
-        ctx.check("POST /cats with a bad body answers 400", results["cats-invalid"].status === 400, `status ${results["cats-invalid"].status}`);
-        const apiJson = await ctx.get(base, "/api-json");
-        ctx.saveText("api-json.json", apiJson.text, "json");
-        ctx.check("GET /api-json answers 200", apiJson.status === 200, `status ${apiJson.status ?? apiJson.error}`);
-        checkSchema(ctx, apiJson.text, "CreateCatDto", { required: ["name", "age", "breed", "color", "tags"], properties: ["size"] });
-        checkSchema(ctx, apiJson.text, "Cat", { required: ["id", "name", "age", "breed", "color", "tags", "createdAt"], properties: ["size", "nickname"] });
+        await exerciseCjsApp(ctx, base);
     });
 }
 

@@ -3,8 +3,9 @@
 // `node scripts/build.mjs`: `node --test test/emit.test.mjs`.
 // Most tests are differential: TypeScript 6.0.3 itself (given `stableTypeOrdering: true`, the
 // TS 7 ordering) emits the same fixture and the outputs must agree, except for the TS 7
-// differences named in each test. Source maps are compared by what they point at, not byte for
-// byte: tsc-rs maps lines slightly differently and leaves out `"sourceRoot":""`.
+// differences named in each test. Source maps are compared by what they point at, or mapping by
+// mapping against TS 6.0's where the plain emit (no transformers) maps alike: tsc-rs maps some
+// lines differently and leaves out `"sourceRoot":""` (TS 7 behavior).
 // The consumer tests (nest-cli's tsconfig-paths hook, @nestjs/swagger, ts-jest) use the installed
 // packages in TSRS_CONSUMERS (default /work/scratch/consumers/node_modules) and nest-cli's spec
 // fixtures in TSRS_NEST_CLI (default /work/scratch/repos/nest-cli); they skip when missing.
@@ -17,8 +18,6 @@ import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-
-// TEMPORARY: src/index.js installs the hooks only with this set, until root removes the gate.
 
 const require = createRequire(import.meta.url);
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -570,6 +569,241 @@ test("custom transformers on an emit of one file work like TS 6.0 (ts-loader)", 
     assert.deepEqual(texts(native.writes), texts(reference.writes));
 });
 
+// Outputs with maps, as text, with TS 6.0's `"sourceRoot":""` taken out (tsc-rs leaves it out).
+function withMaps(writes) {
+    return Object.fromEntries(writes.map(write => [write.fileName, write.fileName.endsWith(".map") ? write.text.replace('"sourceRoot":"",', "") : write.text]));
+}
+
+// The mappings that one emit has and the other has not, per output line: "<file>: <line>: +<ours>"
+// or "-<theirs>". String literals in the line count as `""`, so that a line keeps its key when a
+// transformer changed a module specifier.
+function mapDifferences(writes, referenceWrites) {
+    const outputs = withMaps(writes);
+    const references = withMaps(referenceWrites);
+    const differences = [];
+    for (const [fileName, text] of Object.entries(outputs)) {
+        if (!fileName.endsWith(".map") || references[fileName] === undefined) {
+            continue;
+        }
+        const map = JSON.parse(text);
+        const referenceMap = JSON.parse(references[fileName]);
+        const { mappings: _mappings, ...rest } = map;
+        const { mappings: _referenceMappings, ...referenceRest } = referenceMap;
+        if (JSON.stringify(rest) !== JSON.stringify(referenceRest)) {
+            differences.push(`${fileName}: ${JSON.stringify(rest)} | ${JSON.stringify(referenceRest)}`);
+        }
+        const lines = outputs[fileName.slice(0, -".map".length)].split(/\r?\n/).map(normalizeLine);
+        const segments = json => {
+            const byLine = [];
+            for (const mapping of ts.decodeMappings(json.mappings)) {
+                const column = lines[mapping.generatedLine]?.column(mapping.generatedCharacter) ?? mapping.generatedCharacter;
+                (byLine[mapping.generatedLine] ??= []).push(`${column}>${mapping.sourceIndex}:${mapping.sourceLine}:${mapping.sourceCharacter}`);
+            }
+            return byLine;
+        };
+        const ours = segments(map);
+        const theirs = segments(referenceMap);
+        for (let line = 0; line < Math.max(ours.length, theirs.length); line++) {
+            const key = `${fileName}: ${lines[line]?.text}`;
+            differences.push(...without(ours[line] ?? [], theirs[line] ?? []).map(segment => `${key}: +${segment}`));
+            differences.push(...without(theirs[line] ?? [], ours[line] ?? []).map(segment => `${key}: -${segment}`));
+        }
+    }
+    return differences;
+}
+
+function normalizeLine(text) {
+    const literal = /(["'`])(?:\\.|(?!\1).)*\1/g;
+    const literals = [...text.matchAll(literal)].map(match => ({ start: match.index, end: match.index + match[0].length }));
+    const column = character => {
+        let shift = 0;
+        for (const { start, end } of literals) {
+            if (character > start && character < end) {
+                return start - shift + 1;
+            }
+            if (character < end) {
+                break;
+            }
+            shift += end - start - 2;
+        }
+        return character - shift;
+    };
+    return { text: text.replace(literal, "\"\""), column };
+}
+
+function without(list, other) {
+    const rest = [...other];
+    return list.filter(item => {
+        const at = rest.indexOf(item);
+        if (at >= 0) {
+            rest.splice(at, 1);
+            return false;
+        }
+        return true;
+    });
+}
+
+// The outputs of a transformed emit equal TS 6.0's, and their maps differ from TS 6.0's only
+// where the maps of the plain emit (no transformers) differ too: TS 7's own mapping details.
+function assertEmitsLikeTs6(transformed, plain, message) {
+    assert.deepEqual(texts(transformed.native.writes), texts(transformed.reference.writes), message);
+    const known = new Map();
+    for (const difference of mapDifferences(plain.native.writes, plain.reference.writes)) {
+        known.set(difference, (known.get(difference) ?? 0) + 1);
+    }
+    const unknown = mapDifferences(transformed.native.writes, transformed.reference.writes).filter(difference => {
+        const count = known.get(difference) ?? 0;
+        known.set(difference, count - 1);
+        return count <= 0;
+    });
+    assert.deepEqual(unknown, [], message);
+}
+
+// Like nest-cli's tsconfig-paths hook: module specifiers of import and export declarations, and
+// of import() calls and import types here too, become new string literals.
+const rewriteSpecifiers = (api, renames) => context => sourceFile => {
+    const { factory } = context;
+    const rename = literal => renames[literal.text] === undefined ? literal : factory.createStringLiteral(renames[literal.text]);
+    const visit = node => {
+        if (api.isImportDeclaration(node)) {
+            return factory.updateImportDeclaration(node, node.modifiers, node.importClause, rename(node.moduleSpecifier), node.attributes);
+        }
+        if (api.isExportDeclaration(node) && node.moduleSpecifier !== undefined) {
+            return factory.updateExportDeclaration(node, node.modifiers, node.isTypeOnly, node.exportClause, rename(node.moduleSpecifier), node.attributes);
+        }
+        if (api.isCallExpression(node) && node.expression.kind === api.SyntaxKind.ImportKeyword && api.isStringLiteral(node.arguments[0])) {
+            return factory.updateCallExpression(node, node.expression, node.typeArguments, [rename(node.arguments[0]), ...node.arguments.slice(1)]);
+        }
+        if (api.isImportTypeNode(node) && api.isLiteralTypeNode(node.argument) && api.isStringLiteral(node.argument.literal)) {
+            return factory.updateImportTypeNode(node, factory.createLiteralTypeNode(rename(node.argument.literal)), node.attributes, node.qualifier, node.typeArguments, node.isTypeOf);
+        }
+        return api.visitEachChild(node, visit, context);
+    };
+    return api.visitNode(sourceFile, visit);
+};
+
+const aliasedFiles = {
+    "src/main.ts": "import { Injectable } from './common';\nimport { helper } from '@common';\nimport * as other from '@lib/other';\nimport type { Shape } from '@lib/other';\nexport { answer } from '@lib/answer';\nexport * from '@lib/other';\n\n@Injectable()\nexport class Service {\n    constructor(private readonly shape: Shape) {}\n    run(): string { return helper(other.other); }\n    lazy() { return import('@lib/answer'); }\n    typed(): import('@lib/other').Shape { return this.shape; }\n}\n",
+    "src/common.ts": "export function Injectable(): ClassDecorator { return () => {}; }\n",
+    "src/common/index.ts": "export function helper(value: string): string { return value; }\n",
+    "src/lib/other.ts": "export const other = 'other';\nexport interface Shape { size: number; }\n",
+    "src/lib/answer.ts": "export const answer = 42;\n",
+};
+const aliasedRenames = { "@common": "./common/index", "@lib/other": "./lib/other", "@lib/answer": "./lib/answer" };
+const aliasedOptions = module => (api, dir) => ({
+    ...cjs(api, dir),
+    module: api.ModuleKind[module],
+    target: api.ScriptTarget.ES2022,
+    rootDir: path.join(dir, "src"),
+    paths: { "@common": ["./src/common/index"], "@lib/*": ["./src/lib/*"] },
+    experimentalDecorators: true,
+    emitDecoratorMetadata: true,
+    sourceMap: true,
+    declaration: true,
+    declarationMap: true,
+});
+
+test("a before transformer that only rewrites module specifiers names imports and maps them like TS 6.0", { skip: ts6Skip }, () => {
+    for (const module of ["CommonJS", "ESNext"]) {
+        const plain = emitBoth(aliasedFiles, aliasedOptions(module));
+        const transformers = api => [undefined, undefined, false, { before: [rewriteSpecifiers(api, aliasedRenames)], afterDeclarations: [rewriteSpecifiers(api, aliasedRenames)] }];
+        const transformed = emitBoth(aliasedFiles, aliasedOptions(module), transformers);
+        assertEmitsLikeTs6(transformed, plain, module);
+        const { native } = transformed;
+        const main = texts(native.writes)["out/main.js"];
+        assert.match(main, module === "CommonJS" ? /const _common_1 = require\("\.\/common\/index"\);/ : /from "\.\/common\/index";/, module);
+        assert.match(texts(native.writes)["out/main.d.ts"], /from "\.\/lib\/other"/, module);
+    }
+});
+
+test("a file with rewritten specifiers and other changes keeps TS 6.0's import names", { skip: ts6Skip }, () => {
+    const addLog = api => context => sourceFile => context.factory.updateSourceFile(sourceFile, [
+        ...sourceFile.statements,
+        context.factory.createExpressionStatement(context.factory.createCallExpression(context.factory.createIdentifier("console.log"), undefined, [context.factory.createStringLiteral("added")])),
+    ]);
+    const transformers = api => [undefined, undefined, false, { before: [rewriteSpecifiers(api, aliasedRenames), addLog(api)] }];
+    const transformed = emitBoth(aliasedFiles, aliasedOptions("CommonJS"), transformers);
+    assertEmitsLikeTs6(transformed, emitBoth(aliasedFiles, aliasedOptions("CommonJS")));
+    assert.match(texts(transformed.native.writes)["out/main.js"], /_common_1\.helper/);
+});
+
+test("text that a before transformer synthesizes stays unmapped like TS 6.0", { skip: ts6Skip }, () => {
+    const files = { "a.ts": "function Field(...args: unknown[]): PropertyDecorator { return () => {}; }\nexport class Recipe {\n    @Field({ nullable: true })\n    title?: string;\n}\nexport const answer = 42;\n" };
+    // Like @nestjs/swagger and @nestjs/graphql: a new static method and import, and a decorator
+    // call with a new first argument and a copy of the original object.
+    const plugin = api => context => sourceFile => {
+        const { factory } = context;
+        const visit = node => {
+            if (api.isDecorator(node) && api.isCallExpression(node.expression)) {
+                const call = node.expression;
+                const options = call.arguments[0];
+                const copy = factory.createObjectLiteralExpression(options.properties);
+                const type = factory.createArrowFunction(undefined, undefined, [], undefined, undefined, factory.createIdentifier("String"));
+                return factory.updateDecorator(node, factory.updateCallExpression(call, call.expression, call.typeArguments, [type, copy]));
+            }
+            if (api.isClassDeclaration(node)) {
+                const factoryMethod = factory.createMethodDeclaration([factory.createModifier(api.SyntaxKind.StaticKeyword)], undefined, "_METADATA_FACTORY", undefined, undefined, [], undefined, factory.createBlock([factory.createReturnStatement(factory.createObjectLiteralExpression([factory.createPropertyAssignment("title", factory.createObjectLiteralExpression([factory.createPropertyAssignment("required", factory.createFalse())]))]))]));
+                const updated = api.visitEachChild(node, visit, context);
+                return factory.updateClassDeclaration(updated, updated.modifiers, updated.name, updated.typeParameters, updated.heritageClauses, [...updated.members, factoryMethod]);
+            }
+            return api.visitEachChild(node, visit, context);
+        };
+        const result = api.visitNode(sourceFile, visit);
+        const openapi = factory.createImportDeclaration(undefined, factory.createImportClause(false, undefined, factory.createNamespaceImport(factory.createIdentifier("openapi"))), factory.createStringLiteral("./openapi"));
+        return factory.updateSourceFile(result, [openapi, ...result.statements]);
+    };
+    const options = (api, dir) => ({ ...cjs(api, dir), target: api.ScriptTarget.ES2022, experimentalDecorators: true, sourceMap: true, useDefineForClassFields: false });
+    const files2 = { ...files, "openapi.ts": "export const openapi = 1;\n" };
+    const transformed = emitBoth(files2, options, api => [undefined, undefined, false, { before: [plugin(api)] }]);
+    assertEmitsLikeTs6(transformed, emitBoth(files2, options));
+    assert.match(texts(transformed.native.writes)["out/a.js"], /static _METADATA_FACTORY\(\)/);
+});
+
+test("mappings that a transformer gives another source name that source like TS 6.0", { skip: ts6Skip }, () => {
+    // TS 6.0's customTransforms sourceMapExternalSourceFiles test.
+    const files = { "source.ts": "`multi\n                    line`\n'change'" };
+    const external = api => context => node => api.visitNode(node, function visitor(child) {
+        if (api.isStringLiteral(child) && child.text === "change") {
+            const text = "'changed'";
+            const lineMap = api.computeLineStarts(text);
+            api.setSourceMapRange(child, { pos: 0, end: text.length, source: { text, fileName: "another.html", lineMap, getLineAndCharacterOfPosition: pos => api.computeLineAndCharacterOfPosition(lineMap, pos) } });
+            return child;
+        }
+        return api.visitEachChild(child, visitor, context);
+    }, api.isSourceFile);
+    const options = (api, dir) => ({ ...cjs(api, dir), sourceMap: true, inlineSources: true });
+    const transformed = emitBoth(files, options, api => [undefined, undefined, false, { before: [external(api)] }]);
+    assertEmitsLikeTs6(transformed, emitBoth(files, options));
+    assert.equal(JSON.parse(withMaps(transformed.native.writes)["out/source.js.map"]).sources.length, 2);
+});
+
+test("a compiler host with an empty current directory gets the output names TS 6.0 gives", () => {
+    // TS 6.0's customTransforms tests: relative file names, getCurrentDirectory() is "".
+    const emitted = api => {
+        const sourceFile = api.createSourceFile("source.ts", "function f1() { }\n", api.ScriptTarget.ES2015);
+        const outputs = {};
+        const host = {
+            getSourceFile: fileName => fileName === "source.ts" ? sourceFile : undefined,
+            getDefaultLibFileName: () => "lib.d.ts",
+            getCurrentDirectory: () => "",
+            getDirectories: () => [],
+            getCanonicalFileName: fileName => fileName,
+            useCaseSensitiveFileNames: () => true,
+            getNewLine: () => "\n",
+            fileExists: fileName => fileName === "source.ts",
+            readFile: fileName => fileName === "source.ts" ? sourceFile.text : undefined,
+            writeFile: (fileName, text) => outputs[fileName] = text,
+        };
+        const program = api.createProgram(["source.ts"], { newLine: api.NewLineKind.LineFeed, sourceMap: true }, host);
+        program.emit(undefined, host.writeFile, undefined, false, { before: [context => file => api.visitEachChild(file, node => node, context)] });
+        return Object.keys(outputs);
+    };
+    assert.deepEqual(emitted(ts), ["source.js.map", "source.js"]);
+    if (!ts6Skip) {
+        assert.deepEqual(emitted(ts), emitted(ts6));
+    }
+});
+
 // The consumers.
 
 const nestHook = path.join(consumers, "@nestjs/cli/lib/compiler/hooks/tsconfig-paths.hook.js");
@@ -720,6 +954,28 @@ test("transpileModule with target ES5 reports the TS 7 removal and emits ES2015 
     const output = ts.transpileModule("export const a = [...[1]];\nclass A {}\n", { compilerOptions: { target: ts.ScriptTarget.ES5, module: ts.ModuleKind.CommonJS }, reportDiagnostics: true });
     assert.deepEqual(output.diagnostics.map(diagnostic => diagnostic.code), [5108]);
     assert.match(output.outputText, /\nclass A \{\n\}/);
+});
+
+test("transpileModule leaves the byte order mark of emitBOM out of outputText like TS 6.0", { skip: ts6Skip }, () => {
+    // TS 6.0's services Transpile test "Supports setting 'emitBOM'": the host would write the mark.
+    const { reference, native } = transpileBoth("x;", api => ({ compilerOptions: { emitBOM: true, module: api.ModuleKind.CommonJS }, fileName: "input.js", reportDiagnostics: true }));
+    assert.deepEqual(native, reference);
+    assert.ok(!native.outputText.startsWith("\uFEFF"));
+});
+
+test("transpileModule reads relative path options next to the input file like TS 6.0", { skip: ts6Skip }, () => {
+    // TS 6.0's services Transpile test "Supports setting 'rootDir'", and an outDir for the map.
+    const cases = [
+        ["x;", api => ({ compilerOptions: { rootDir: "./rootDir", module: api.ModuleKind.CommonJS }, fileName: "./rootDir/input.js", reportDiagnostics: true })],
+        ["export const a = 1;\n", api => ({ compilerOptions: { outDir: "out", sourceMap: true, module: api.ModuleKind.CommonJS }, fileName: "src/a.ts", reportDiagnostics: true })],
+    ];
+    for (const [input, options] of cases) {
+        const { reference, native } = transpileBoth(input, options);
+        assert.deepEqual(native, reference, input);
+        assert.deepEqual(native.diagnostics, [], input);
+    }
+    const sources = api => JSON.parse(api.transpileModule(cases[1][0], cases[1][1](api)).sourceMapText).sources;
+    assert.deepEqual(sources(ts), sources(ts6));
 });
 
 test("transpileModule runs custom transformers like TypeScript 6.0", { skip: ts6Skip }, () => {

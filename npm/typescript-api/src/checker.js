@@ -5,13 +5,31 @@
 // services object model call. Each member maps to a tsc-rs API request, or is emulated in JS from
 // such requests where tsc-rs has no request for it.
 
-const { createObjectModel, decodeSyntheticNode } = require("./objects.js");
+const { circularList, createObjectModel, decodeSyntheticNode } = require("./objects.js");
 const { nodeBuilderFlagsToNative, symbolFlagsToNative, syntaxKindToNative, typeFormatFlagsToNative } = require("./flags.js");
 
 const symbolOwnerSnapshot = 1;
+const stackRoom = new Array(8192).fill(0);
 
 function unsupported(api, reason) {
     return new Error(`tsc-rs: ${api} is not supported: ${reason}`);
+}
+
+// TS 6.0 leaves a resolution that a stack overflow interrupts on its resolution stack
+// (pushTypeResolution), or with the empty members it set first (resolveAnonymousTypeMembers), and
+// answers it as a circularity from then on: errorType, no members. A consumer's unbounded walk
+// relies on that to end (typescript-eslint no-unnecessary-type-assertion typeContains, issue
+// 12705). Taking a tsc-rs answer in needs JS stack, and V8 compiles a function lazily only with
+// 40 KB left, so a resolution asked with less than 64 KB of stack left answers that circularity at
+// once instead of overflowing in the middle of a request.
+function hasStackRoom() {
+    try {
+        Reflect.apply(Math.max, undefined, stackRoom);
+        return true;
+    }
+    catch {
+        return false;
+    }
 }
 
 // TS 6.0: src/compiler/checker.ts:1610 createTypeChecker (the `checker` object)
@@ -21,6 +39,7 @@ function createChecker(program) {
     const checker = {};
     const model = createObjectModel(checker, program);
     model.symbolOfDeclaration = node => getSymbolOfDeclaration(node);
+    model.interruptible = (compute, interrupted) => (interrupted === undefined || hasStackRoom() ? undefined : circularAnswer(interrupted)) ?? compute();
     const memo = new Map();
     let errorType;
     let wellKnown;
@@ -33,13 +52,32 @@ function createChecker(program) {
     const typeId = type => model.typeId(type);
     const reference = symbol => model.symbolReference(symbol);
 
-    function cached(key, compute) {
+    // `interrupted` ("type" or "list") marks a resolution TS 6.0 guards with its resolution stack
+    // (pushTypeResolution) or empty members (resolveAnonymousTypeMembers); see hasStackRoom.
+    function cached(key, compute, interrupted) {
         if (memo.has(key)) {
             return memo.get(key);
+        }
+        const circular = interrupted === undefined || hasStackRoom() ? undefined : circularAnswer(interrupted);
+        if (circular !== undefined) {
+            return circular;
         }
         const value = compute();
         memo.set(key, value);
         return value;
+    }
+
+    // The error type takes two requests the first time; with 64 KB of stack left they still fit.
+    function circularAnswer(interrupted) {
+        if (interrupted === "list") {
+            return circularList;
+        }
+        try {
+            return getErrorType();
+        }
+        catch {
+            return undefined;
+        }
     }
 
     function symbolKey(symbol) {
@@ -80,6 +118,19 @@ function createChecker(program) {
         return errorType;
     }
 
+    // tsc-rs's errorType (intrinsic "error"), told apart from the error types of alias references
+    // without asking for it.
+    function isErrorType(type) {
+        if (errorType !== undefined) {
+            return type === errorType;
+        }
+        if (type.intrinsicName !== "error" || model.typeData(type).aliasSymbol !== undefined) {
+            return false;
+        }
+        errorType = type;
+        return true;
+    }
+
     function wellKnownSymbols() {
         wellKnown ??= request("getWellKnownSymbols", {});
         return wellKnown;
@@ -97,7 +148,7 @@ function createChecker(program) {
     // Types and symbols
 
     function getTypeOfSymbol(symbol) {
-        return cached(`typeOfSymbol:${symbolKey(symbol)}`, () => typeOf(request("getTypeOfSymbol", { symbol: reference(symbol) })));
+        return cached(`typeOfSymbol:${symbolKey(symbol)}`, () => typeOf(request("getTypeOfSymbol", { symbol: reference(symbol) })), "type");
     }
 
     function getDeclaredTypeOfSymbol(symbol) {
@@ -109,7 +160,7 @@ function createChecker(program) {
         if (handle === undefined) {
             return getErrorType();
         }
-        return typeOf(request("getTypeOfSymbolAtLocation", { symbol: reference(symbol), location: handle }));
+        return cached(`typeOfSymbolAt:${symbolKey(symbol)}:${handle}`, () => typeOf(request("getTypeOfSymbolAtLocation", { symbol: reference(symbol), location: handle })));
     }
 
     function getPropertiesOfType(type) {
@@ -121,7 +172,7 @@ function createChecker(program) {
     }
 
     function getTypeOfPropertyOfType(type, name) {
-        return typeOf(request("getTypeOfPropertyOfType", { type: typeId(type), name: String(name) }));
+        return cached(`typeOfProperty:${typeId(type)}:${name}`, () => typeOf(request("getTypeOfPropertyOfType", { type: typeId(type), name: String(name) })));
     }
 
     function getAugmentedPropertiesOfType(type) {
@@ -129,7 +180,7 @@ function createChecker(program) {
     }
 
     function getSignaturesOfType(type, kind) {
-        return cached(`signatures:${typeId(type)}:${kind}`, () => (request("getSignaturesOfType", { type: typeId(type), kind }) ?? []).map(data => model.signature(data)));
+        return cached(`signatures:${typeId(type)}:${kind}`, () => (request("getSignaturesOfType", { type: typeId(type), kind }) ?? []).map(data => model.signature(data)), "list");
     }
 
     function getIndexInfosOfType(type) {
@@ -137,10 +188,11 @@ function createChecker(program) {
     }
 
     // TS 6.0 getIndexInfoOfType(type, kind === IndexKind.String ? stringType : numberType): the
-    // index info whose key type is exactly that type.
+    // index info whose key type is exactly that type, the one intrinsic type with only that flag.
     function getIndexInfoOfType(type, kind) {
-        const keyType = kind === IndexKind.String ? getStringType() : getNumberType();
-        return getIndexInfosOfType(type).find(info => info.keyType === keyType);
+        const keyFlags = kind === IndexKind.String ? TypeFlags.String : TypeFlags.Number;
+        const keyName = kind === IndexKind.String ? "string" : "number";
+        return getIndexInfosOfType(type).find(info => info.keyType.flags === keyFlags && info.keyType.intrinsicName === keyName);
     }
 
     function getIndexTypeOfType(type, kind) {
@@ -152,14 +204,19 @@ function createChecker(program) {
     }
 
     function getTypeArguments(type) {
-        return cached(`typeArguments:${typeId(type)}`, () => typesOf(request("getTypeArguments", { type: typeId(type) })));
+        return cached(`typeArguments:${typeId(type)}`, () => typesOf(request("getTypeArguments", { type: typeId(type) })), "list");
     }
 
     function typeRequest(method, type, field = "type") {
         return cached(`${method}:${typeId(type)}`, () => typeOf(request(method, { [field]: typeId(type) })));
     }
 
+    // TS 6.0: src/compiler/checker.ts getApparentType returns an object type that is not mapped, and
+    // a union that is not `boolean`, unchanged.
     function getApparentType(type) {
+        if (type.flags === TypeFlags.Union || (type.flags === TypeFlags.Object && !(type.objectFlags & ts.ObjectFlags.Mapped))) {
+            return type;
+        }
         return typeRequest("getApparentType", type, "objectId");
     }
 
@@ -167,7 +224,13 @@ function createChecker(program) {
         return typeRequest("getNonNullableType", type, "objectId");
     }
 
+    // TS 6.0: src/compiler/checker.ts getBaseConstraintOfType: only instantiable, union,
+    // intersection, template literal, string mapping and index types and generic tuples have one.
     function getBaseConstraintOfType(type) {
+        const constrained = TypeFlags.InstantiableNonPrimitive | TypeFlags.UnionOrIntersection | TypeFlags.TemplateLiteral | TypeFlags.StringMapping | TypeFlags.Index;
+        if (!(type.flags & constrained) && model.typeData(type).isTupleType !== true) {
+            return undefined;
+        }
         return typeRequest("getBaseConstraintOfType", type);
     }
 
@@ -247,7 +310,7 @@ function createChecker(program) {
 
     function getReturnTypeOfSignature(signature) {
         const id = model.signatureId(signature);
-        return cached(`returnType:${id}`, () => typeOf(request("getReturnTypeOfSignature", { objectId: id })));
+        return cached(`returnType:${id}`, () => typeOf(request("getReturnTypeOfSignature", { objectId: id })), "type");
     }
 
     function getTypePredicateOfSignature(signature) {
@@ -259,7 +322,8 @@ function createChecker(program) {
     }
 
     function getParameterType(signature, index) {
-        return typeOf(request("getParameterType", { signature: model.signatureId(signature), index }));
+        const id = model.signatureId(signature);
+        return cached(`parameterType:${id}:${index}`, () => typeOf(request("getParameterType", { signature: id, index })));
     }
 
     // Nodes
@@ -271,7 +335,7 @@ function createChecker(program) {
         }
         return cached(`typeAt:${handle}`, () => {
             const type = typeOf(request("getTypeAtLocation", { location: handle }));
-            return type === getErrorType() && isEntityNameInType(node) ? typeOfEntityNameInType(node) : type;
+            return isErrorType(type) && isEntityNameInType(node) ? typeOfEntityNameInType(node) : type;
         });
     }
 
@@ -802,16 +866,17 @@ function createChecker(program) {
         if (handle === undefined) {
             return [];
         }
-        return symbolsOf(request("getSymbolsInScope", { location: handle, meaning: symbolFlagsToNative(meaning) }));
+        return cached(`symbolsInScope:${handle}:${meaning}`, () => symbolsOf(request("getSymbolsInScope", { location: handle, meaning: symbolFlagsToNative(meaning) }))).slice();
     }
 
     function resolveName(name, location, meaning, excludeGlobals) {
-        return symbolOf(request("resolveName", {
+        const handle = handleOf(location);
+        return cached(`resolveName:${name}:${handle}:${meaning}:${excludeGlobals === true}`, () => symbolOf(request("resolveName", {
             name,
-            location: handleOf(location),
+            location: handle,
             meaning: symbolFlagsToNative(meaning),
             excludeGlobals: excludeGlobals === true,
-        }));
+        })));
     }
 
     // TS 6.0: src/compiler/checker.ts isValidPropertyAccess and isPropertyAccessible: the property
@@ -903,7 +968,7 @@ function createChecker(program) {
         if (handle === undefined) {
             return undefined;
         }
-        const data = request("getConstantValue", { location: handle });
+        const data = cached(`constantValue:${handle}`, () => request("getConstantValue", { location: handle }));
         if (data === undefined || data === null || data.value === null || data.value === undefined) {
             return undefined;
         }
@@ -971,11 +1036,11 @@ function createChecker(program) {
         getSymbolAtLocation,
         getShorthandAssignmentValueSymbol: nodeIn => {
             const handle = handleOf(nodeIn);
-            return handle === undefined ? undefined : symbolOf(request("getShorthandAssignmentValueSymbol", { location: handle }));
+            return handle === undefined ? undefined : cached(`shorthandValue:${handle}`, () => symbolOf(request("getShorthandAssignmentValueSymbol", { location: handle })));
         },
         getExportSpecifierLocalTargetSymbol: nodeIn => {
             const handle = handleOf(nodeIn, ts.isExportSpecifier);
-            return handle === undefined ? undefined : symbolOf(request("getExportSpecifierLocalTargetSymbol", { location: handle }));
+            return handle === undefined ? undefined : cached(`exportSpecifierTarget:${handle}`, () => symbolOf(request("getExportSpecifierLocalTargetSymbol", { location: handle })));
         },
         getExportSymbolOfSymbol,
         getTypeAtLocation,
@@ -992,11 +1057,11 @@ function createChecker(program) {
         getContextualType,
         getContextualTypeForArgumentAtIndex: (nodeIn, argIndex) => {
             const handle = handleOf(nodeIn, ts.isCallLikeExpression);
-            return handle === undefined ? undefined : typeOf(request("getContextualTypeForArgument", { location: handle, index: argIndex }));
+            return handle === undefined ? undefined : cached(`contextualArgument:${handle}:${argIndex}`, () => typeOf(request("getContextualTypeForArgument", { location: handle, index: argIndex })));
         },
         isContextSensitive: node => {
             const handle = handleOf(node);
-            return handle !== undefined && request("isContextSensitive", { location: handle });
+            return handle !== undefined && cached(`contextSensitive:${handle}`, () => request("isContextSensitive", { location: handle }));
         },
         getResolvedSignature,
         getSignatureFromDeclaration,
@@ -1009,7 +1074,7 @@ function createChecker(program) {
         getJsxIntrinsicTagNamesAt,
         isOptionalParameter,
         getAmbientModules,
-        tryGetMemberInModuleExports: (memberName, moduleSymbol) => symbolOf(request("getMemberInModuleExports", { symbol: reference(moduleSymbol), name: memberName })),
+        tryGetMemberInModuleExports: (memberName, moduleSymbol) => cached(`memberInModuleExports:${symbolKey(moduleSymbol)}:${memberName}`, () => symbolOf(request("getMemberInModuleExports", { symbol: reference(moduleSymbol), name: memberName }))),
         getApparentType,
         getBaseConstraintOfType,
         getConstraintOfTypeParameter,
@@ -1031,8 +1096,9 @@ function createChecker(program) {
         getESSymbolType: () => intrinsic("getESSymbolType"),
         getNeverType: () => intrinsic("getNeverType"),
         getNonPrimitiveType: () => intrinsic("getNonPrimitiveType"),
-        isTypeAssignableTo: (source, target) => request("isTypeAssignableTo", { source: typeId(source), target: typeId(target) }),
-        isArrayType: type => cached(`isArray:${typeId(type)}`, () => request("isArrayType", { type: typeId(type) })),
+        isTypeAssignableTo: (source, target) => cached(`assignable:${typeId(source)}:${typeId(target)}`, () => request("isTypeAssignableTo", { source: typeId(source), target: typeId(target) })),
+        // TS 6.0 isArrayType: a reference to the global Array or ReadonlyArray type.
+        isArrayType: type => (type.flags & TypeFlags.Object) !== 0 && (type.objectFlags & ts.ObjectFlags.Reference) !== 0 && cached(`isArray:${typeId(type)}`, () => request("isArrayType", { type: typeId(type) })),
         isTupleType: type => model.typeData(type).isTupleType === true,
         isArrayLikeType: type => cached(`isArrayLike:${typeId(type)}`, () => request("isArrayLikeType", { type: typeId(type) })),
         resolveName,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs TypeScript 6.0.3's own tests, unmodified, against a `typescript` library directory.
 # usage: run.sh help | setup | run <library-dir> <out-dir> [--suite S] [--jobs N] [--force] [--detach]
-#        | compare <base-out> <new-out> [--limit N] [--json FILE]
+#        | compare <base-out> <new-out> [--limit N] [--json FILE] | triage <out-dir> [--ts7 DIR] [--limit N]
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
