@@ -7,8 +7,21 @@
 const fileSystemCallbacks = ["readFile", "fileExists", "directoryExists", "getAccessibleEntries", "realpath", "stat", "writeFile", "removeFile"];
 const useOS = JSON.stringify({ kind: "useOS" });
 const missing = JSON.stringify({ kind: "missing" });
+// What a callback that threw answers: tsc-rs panics on an answer of the wrong kind
+// (crates/ts_goport/src/api/callbackfs.rs).
+const fallbackAnswers = {
+    readFile: missing,
+    fileExists: JSON.stringify({ kind: "value", value: false }),
+    directoryExists: JSON.stringify({ kind: "value", value: false }),
+    getAccessibleEntries: JSON.stringify({ kind: "value", value: { files: [], directories: [] } }),
+    realpath: JSON.stringify({ kind: "identity" }),
+    stat: missing,
+    writeFile: JSON.stringify({ kind: "noop" }),
+    removeFile: JSON.stringify({ kind: "noop" }),
+};
 const done = JSON.stringify({ kind: "value" });
 const encoder = new TextEncoder();
+const { loadAddon } = require("./native/addon.js");
 
 let session;
 
@@ -22,7 +35,7 @@ class Session {
         const { createChannel } = require("./native/channel.js");
         this.fileSystems = [];
         // An exception thrown by a host callback while tsc-rs waits for its answer. The callback
-        // answers "missing" instead (a throwing callback would break the channel), and the request
+        // gives a harmless answer instead (a throwing callback would break the channel), and the request
         // rethrows it when tsc-rs is done.
         this.callbackError = undefined;
         this.nextCallbackId = 0;
@@ -34,7 +47,7 @@ class Session {
             `--callbacks=${fileSystemCallbacks.join(",")}`,
         ]);
         for (const name of fileSystemCallbacks) {
-            this.channel.registerCallback(name, (_, payload) => this.guard(() => this.answer(name, payload), missing));
+            this.channel.registerCallback(name, (_, payload) => this.guard(() => this.answer(name, payload), fallbackAnswers[name]));
         }
         this.request("initialize", null);
     }
@@ -66,6 +79,14 @@ class Session {
                 return results;
             }
             response = this.request("batchRequests", { requests: [], continuationToken: response.continuationToken });
+        }
+    }
+
+    // V8 sees only the JS side of a program; tsc-rs's side lives in this process too (unless the
+    // session runs in a child process).
+    adjustExternalMemory(change) {
+        if (process.env.TSRS_API_CHANNEL !== "process" && change !== 0) {
+            loadAddon().adjustExternalMemory(change);
         }
     }
 

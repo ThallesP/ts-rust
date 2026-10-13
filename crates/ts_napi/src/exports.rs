@@ -1,4 +1,4 @@
-//! The Node-API surface: `NativeChannel` and `runTsc`. The `#[napi]`
+//! The Node-API surface: `NativeChannel`, `runTsc` and `adjustExternalMemory`. The `#[napi]`
 //! expansions are unsafe FFI glue; the code written here is safe and
 //! forwards to `channel` and `tsc`.
 
@@ -95,4 +95,13 @@ fn call(env: Env, on_call: &OnCall<'_>, name: String, data: String) -> Result<St
 pub fn run_tsc(args: Vec<String>) -> Result<i32> {
     hooks::claim_tsc().map_err(Error::from_reason)?;
     crate::tsc::run(args).map_err(Error::from_reason)
+}
+
+/// Tells V8 that the process holds `change` more bytes (or fewer, when
+/// negative) outside the JS heap, and returns the new total. Each program
+/// holds a snapshot in tsc-rs that V8 cannot see; without this, the garbage
+/// collector rarely runs and the snapshots of unreachable programs pile up.
+#[napi(catch_unwind)]
+pub fn adjust_external_memory(env: Env, change: i64) -> Result<i64> {
+    env.adjust_external_memory(change)
 }

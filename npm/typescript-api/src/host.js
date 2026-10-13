@@ -92,6 +92,10 @@ function fileSystemFor(ts, program) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
+            // TS 6.0 asks the host for root files with getSourceFile only, not fileExists.
+            if (program.rootNativeToJs.has(path) && host.getSourceFile !== undefined) {
+                return program.adoptHostSourceFile(path) !== undefined;
+            }
             return host.fileExists(path);
         },
         directoryExists(path) {
@@ -120,7 +124,7 @@ function fileSystemFor(ts, program) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
-            if (host.fileExists(path)) {
+            if (host.fileExists(path) || (program.rootNativeToJs.has(path) && program.adoptHostSourceFile(path) !== undefined)) {
                 return { mode: 0o100644, size: 0, mtime: new Date(0) };
             }
             if (host.directoryExists?.(path)) {
@@ -256,6 +260,11 @@ class HostModuleResolver {
             }
         }
         this.filesByDirectory.clear();
+    }
+
+    // What releasing the resolver needs, without the program.
+    nativeHandle() {
+        return { id: this.id, callbackName: this.callbackName };
     }
 
     release() {

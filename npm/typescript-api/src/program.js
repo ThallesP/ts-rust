@@ -31,12 +31,24 @@ const releaseNative = new FinalizationRegistry(native => {
     }
 });
 
-function releaseNativeState({ session, snapshot, resolver }) {
+function releaseNativeState(native) {
+    if (native.released) {
+        return;
+    }
+    native.released = true;
+    const { session, snapshot, resolver, externalMemory } = native;
+    session.adjustExternalMemory(-externalMemory);
     session.request("release", { snapshot });
     if (resolver !== undefined) {
         session.unregisterCallback(resolver.callbackName);
         session.request("releaseModuleResolver", { resolver: resolver.id });
     }
+}
+
+// A rough size of a snapshot in tsc-rs: a checked program of one file and the default lib takes
+// about 27 MB.
+function snapshotSize(fileCount) {
+    return 16 * 1024 * 1024 + fileCount * 128 * 1024;
 }
 
 // TS 6.0: src/compiler/program.ts:1499 createProgram
@@ -52,9 +64,8 @@ function createProgram(ts, rootNamesOrOptions, options, host, oldProgram, config
 // tsc-rs compiled.
 //
 // A program made from an oldProgram of this session updates the old snapshot with the files whose
-// text changed instead of reading every file again. The snapshot of the program before the
-// oldProgram is released then, so a chain of programs (a language service, ts.server projects,
-// watch) holds at most two snapshots.
+// text changed instead of reading every file again. A program releases its snapshot when it is
+// garbage collected; it tells V8 about the snapshot's memory, so that collections come often enough.
 class NativeProgram {
     constructor(ts, { rootNames, options, projectReferences, host, oldProgram, configFileParsingDiagnostics, typeScriptVersion }) {
         // TS 6.0's program members are closures, and TS 6.0 passes some around unbound
@@ -77,7 +88,6 @@ class NativeProgram {
         this.usesDefaultHost = isDefaultHost(this.host);
         this.fileSystem = fileSystemFor(ts, this);
         this.released = false;
-        this.previousProgram = undefined;
         this.structureIsReused = ts.StructureIsReused.Not;
         this.rootNativeToJs = new Map();
         this.hostSourceFiles = new Map();
@@ -120,8 +130,11 @@ class NativeProgram {
             this.hostResolver?.release();
             throw error;
         }
-        releaseNative.register(this, this.nativeState(), this);
+        this.native = { session: this.session, snapshot: this.snapshot, resolver: this.hostResolver?.nativeHandle(), externalMemory: 0 };
+        releaseNative.register(this, this.native, this.native);
         this.nativeFileNames = this.request("getSourceFileNames");
+        this.native.externalMemory = snapshotSize(this.nativeFileNames.length);
+        this.session.adjustExternalMemory(this.native.externalMemory);
         this.indexFileNames();
         if (this.fileSystem !== undefined) {
             this.adoptHostLibFiles(base);
@@ -132,20 +145,9 @@ class NativeProgram {
         }
         if (previous !== undefined) {
             this.releaseOldSourceFiles(previous);
-            previous.previousProgram?.releaseNative();
-            previous.previousProgram = undefined;
-            this.previousProgram = previous;
         }
     }
 
-    nativeState() {
-        const { hostResolver } = this;
-        return {
-            session: this.session,
-            snapshot: this.snapshot,
-            resolver: hostResolver === undefined ? undefined : { id: hostResolver.id, callbackName: hostResolver.callbackName },
-        };
-    }
 
     programParams() {
         const { ts } = this;
@@ -333,7 +335,7 @@ class NativeProgram {
 
     assertNative(method) {
         if (this.released) {
-            throw new Error(`tsc-rs: ${method} is not supported on this program: two newer programs were created from it (createProgram oldProgram), so its compiler state was released`);
+            throw new Error(`tsc-rs: ${method} is not supported on this program: its compiler state was released`);
         }
     }
 
@@ -342,8 +344,8 @@ class NativeProgram {
             return;
         }
         this.released = true;
-        releaseNative.unregister(this);
-        releaseNativeState(this.nativeState());
+        releaseNative.unregister(this.native);
+        releaseNativeState(this.native);
         this.nativeFiles.clear();
     }
 

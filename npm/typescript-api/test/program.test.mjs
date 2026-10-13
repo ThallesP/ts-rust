@@ -388,7 +388,7 @@ test("a program made from an oldProgram has tsc-rs read only the files whose tex
     }
 });
 
-test("a program two programs after it releases its compiler state; its JS side keeps working", () => {
+test("programs made from an oldProgram keep their own compiler state while they are referenced", () => {
     const dir = writeFixture("release", { "main.ts": "export const main: number = 1;\n" });
     const options = { types: [] };
     const { host, edit } = editableHost(ts, dir, options);
@@ -396,12 +396,9 @@ test("a program two programs after it releases its compiler state; its JS side k
     const first = ts.createProgram(roots, options, host);
     edit("main.ts", "export const main: number = 2;\n");
     const second = ts.createProgram(roots, options, host, first);
-    assert.equal(first.released, false);
     edit("main.ts", "export const main: number = \"3\";\n");
     const third = ts.createProgram(roots, options, host, second);
-    assert.equal(first.released, true);
-    assert.equal(second.released, false);
-    assert.throws(() => first.getSemanticDiagnostics(), /^Error: tsc-rs: getSemanticDiagnostics is not supported on this program: two newer programs were created from it/);
+    assert.equal(first.getSemanticDiagnostics().length, 0);
     assert.equal(first.getSourceFile(path.join(dir, "main.ts")).text, "export const main: number = 1;\n");
     assert.equal(second.getSemanticDiagnostics().length, 0);
     assert.deepEqual(third.getSemanticDiagnostics().map(diagnostic => diagnostic.code), [2322]);
@@ -652,7 +649,7 @@ test("ts.server.ProjectService opens a file and answers type queries through its
     assert.deepEqual(describe(ts), describe(ts6));
 });
 
-test("repeated openClientFile with new content stays fast and keeps two native snapshots", () => {
+test("repeated openClientFile with new content stays fast, and every program it gave out keeps working", () => {
     const dir = projectServiceFixture("project-service-loop");
     const service = projectService(ts);
     const programs = new Set();
@@ -665,7 +662,9 @@ test("repeated openClientFile with new content stays fast and keeps two native s
     }
     const perUpdate = (performance.now() - started) / updates;
     assert.equal(programs.size, updates);
-    assert.equal([...programs].filter(program => !program.released).length, 2);
+    assert.equal([...programs].filter(program => program.released).length, 0);
+    const [first] = programs;
+    assert.equal(first.getTypeChecker().typeToString(first.getTypeChecker().getTypeAtLocation(first.getSourceFile(path.join(dir, "src/file.ts")).statements[1].declarationList.declarations[0].name)), "number");
     // Generous: about 3 ms per update on an idle machine, as with TS 6.0.3's own ProjectService.
     assert.ok(perUpdate < 100, `${perUpdate.toFixed(1)} ms per update`);
 });
