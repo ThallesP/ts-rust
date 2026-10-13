@@ -1481,3 +1481,231 @@ test("an unbounded walk over instantiated types ends near the end of the stack, 
     assert.equal(checker.typeToString(signature.getReturnType()), "RecursiveMethod<{} & NewOptions>");
     assert.equal(signature.getParameters().length, 1);
 });
+
+// src/index.js installs the node `symbol` field when lib/typescript.js loads; installing it again
+// is a no-op, and here it makes the tests independent of that line.
+require(path.join(packageDir, "src/objects.js")).install(ts);
+
+test("a parsed declaration keeps TS 6.0's own keys and answers `symbol` from its program on first read", () => {
+    const text = "type Foo = { a: number };\nfunction f(x: number) { return x; }\nf(1);\n";
+    const parsed = ts.createSourceFile("a.ts", text, ts.ScriptTarget.Latest, true);
+    const reference = ts6?.createSourceFile("a.ts", text, ts6.ScriptTarget.Latest, true);
+    for (const [index, statement] of parsed.statements.slice(0, 2).entries()) {
+        assert.equal(statement.symbol, undefined, "a file no program has answers nothing");
+        assert.ok(Object.keys(statement).includes("symbol"));
+        if (reference !== undefined) {
+            assert.deepEqual(Object.keys(statement), Object.keys(reference.statements[index]));
+        }
+    }
+    const dir = writeFixture("node-symbols", { "main.ts": `export ${text}`, "script.js": "function foo() { let a = 10; }\n" });
+    const program = ts.createProgram([path.join(dir, "main.ts"), path.join(dir, "script.js")], { ...baseOptions, allowJs: true });
+    const main = program.getSourceFile(path.join(dir, "main.ts"));
+    const [alias, func] = main.statements;
+    // No checker exists yet: the first read makes one.
+    assert.equal(func.symbol.name, "f");
+    assert.equal(func.parameters[0].symbol.name, "x");
+    assert.equal(alias.type.symbol.flags & ts.SymbolFlags.TypeLiteral, ts.SymbolFlags.TypeLiteral);
+    assert.equal(main.symbol, program.getTypeChecker().getSymbolAtLocation(main), "a module's SourceFile has its module symbol");
+    assert.equal(program.getSourceFile(path.join(dir, "script.js")).statements[0].symbol.name, "foo", "a JS function, as suggestion diagnostics read it");
+    assert.equal(func.body.symbol, undefined, "a block is no declaration");
+    // TS 6.0's binder and transformers assign the field; the assignment wins.
+    func.symbol = "assigned";
+    assert.equal(func.symbol, "assigned");
+});
+
+function languageServiceHost(api, files, options) {
+    return {
+        getScriptFileNames: () => Object.keys(files),
+        getScriptVersion: () => "1",
+        getScriptSnapshot: name => {
+            const text = files[name] ?? api.sys.readFile(name);
+            return text === undefined ? undefined : api.ScriptSnapshot.fromString(text);
+        },
+        getCurrentDirectory: () => path.dirname(Object.keys(files)[0]),
+        getCompilationSettings: () => options,
+        getDefaultLibFileName: settings => api.getDefaultLibFilePath(settings),
+        fileExists: name => files[name] !== undefined || api.sys.fileExists(name),
+        readFile: name => files[name] ?? api.sys.readFile(name),
+    };
+}
+
+// Quick info, signature help, definitions, references and completion details of every identifier
+// and call of the files, as text.
+function languageServiceFacts(api, files, options) {
+    const service = api.createLanguageService(languageServiceHost(api, files, options));
+    const parts = displayParts => displayParts === undefined ? "" : api.displayPartsToString(displayParts);
+    const facts = new Map();
+    for (const [fileName, text] of Object.entries(files)) {
+        const base = path.basename(fileName);
+        for (const match of text.matchAll(/[A-Za-z_]\w*|[(,]/g)) {
+            const at = `${base}:${match.index} ${match[0]}`;
+            if (match[0] === "(" || match[0] === ",") {
+                facts.set(`signature help ${at}`, guard(() => {
+                    const help = service.getSignatureHelpItems(fileName, match.index + 1, {});
+                    return help && `${help.selectedItemIndex}/${help.argumentIndex}: ${help.items.map(item => [parts(item.prefixDisplayParts), item.parameters.map(parameter => parts(parameter.displayParts)).join(parts(item.separatorDisplayParts)), parts(item.suffixDisplayParts)].join("")).join(" | ")}`;
+                }));
+                continue;
+            }
+            facts.set(`quick info ${at}`, guard(() => {
+                const info = service.getQuickInfoAtPosition(fileName, match.index);
+                return info && `${info.kind} ${info.kindModifiers}: ${parts(info.displayParts)}`;
+            }));
+            // tsc-rs's lib files are TS 7's, so positions in them differ.
+            const where = definition => path.basename(definition.fileName).startsWith("lib.") ? path.basename(definition.fileName) : `${path.basename(definition.fileName)}:${definition.textSpan.start}`;
+            facts.set(`definition ${at}`, guard(() => service.getDefinitionAtPosition(fileName, match.index)?.map(definition => `${definition.kind} ${definition.containerName}.${definition.name} ${where(definition)}`).join(", ")));
+        }
+        for (const match of text.matchAll(/\b(?:class|function|const|let|interface|type) (\w+)/g)) {
+            const position = match.index + match[0].length - match[1].length;
+            facts.set(`references ${base}:${position} ${match[1]}`, guard(() => service.findReferences(fileName, position)?.map(symbol => `${parts(symbol.definition.displayParts)}: ${symbol.references.map(reference => `${path.basename(reference.fileName)}:${reference.textSpan.start}`).join(",")}`).join(" | ")));
+        }
+        for (const match of text.matchAll(/\b(\w+)\.(\w+)/g)) {
+            const position = match.index + match[1].length + 1;
+            facts.set(`completion details ${base}:${position} ${match[2]}`, guard(() => {
+                const details = service.getCompletionEntryDetails(fileName, position, match[2], {}, undefined, {}, undefined);
+                return details && `${details.kind}: ${parts(details.displayParts)}`;
+            }));
+        }
+    }
+    return facts;
+}
+
+test("quick info, signature help, definitions, references and completion details read like TypeScript 6.0", { skip: ts6Skip }, () => {
+    const dir = writeFixture("language-service", {});
+    const files = {
+        [path.join(dir, "main.ts")]: `import { helper, Shape } from "./lib";
+function overloaded(): void;
+function overloaded<T>(x: T): T;
+function overloaded<T>(x?: T): T | void {}
+overloaded("s");
+namespace N { export class C<T extends string = "a", U = number> { m(n: number) { return this; } static s(this: void) {} p = 1; private q = 2; } }
+const c = new N.C<"z">();
+c.m(1);
+N.C.s();
+const shape: Shape = { kind: "circle", radius: 1 };
+helper(shape, 2);
+function isText(value: unknown): value is string { return typeof value === "string"; }
+function assertNumber(value: unknown): asserts value is number {}
+const literal = { method() { return this; }, field: 1 };
+literal.method();
+export default class {}
+const arrow = (x: number, y = 2, ...rest: string[]) => x + y + rest.length;
+arrow(1, 2, "a");
+enum Color { Red, Green }
+const red = Color.Red;
+`,
+        [path.join(dir, "lib.ts")]: `export interface Shape { kind: "circle" | "square"; radius?: number }
+/** Area of a shape. */
+export function helper(shape: Shape, scale: number): number { return (shape.radius ?? 1) * scale; }
+`,
+    };
+    const options = { strict: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, declaration: true, types: [] };
+    const expected = languageServiceFacts(ts6, files, { ...options, stableTypeOrdering: true });
+    const actual = languageServiceFacts(ts, files, options);
+    // tsc-rs does not send the type arguments of the type an instantiated member was read from, so
+    // its container is written without them (TS 6.0: `N.C<"z", number>.m`).
+    const known = [
+        ["quick info main.ts:", " m", "(method) N.C<\"z\", number>.m(n: number): N.C<\"z\", number>", "(method) N.C.m(n: number): N.C<\"z\", number>"],
+        ["completion details main.ts:", " m", "(method) N.C<\"z\", number>.m(n: number): N.C<\"z\", number>", "(method) N.C.m(n: number): N.C<\"z\", number>"],
+        ["quick info main.ts:", " length", "(property) Array<string>.length: number", "(property) Array.length: number"],
+        ["completion details main.ts:", " length", "(property) Array<string>.length: number", "(property) Array.length: number"],
+    ];
+    const differences = [];
+    for (const [key, value] of expected) {
+        const ours = actual.get(key);
+        if (ours === value) {
+            continue;
+        }
+        const explained = known.some(([prefix, suffix, theirs, mine]) => key.includes(prefix) && key.endsWith(suffix) && value.endsWith(theirs) && ours?.endsWith(mine));
+        if (!explained) {
+            differences.push(`${key}\n    ts6:  ${value}\n    ours: ${ours}`);
+        }
+    }
+    assert.deepEqual(differences, []);
+    assert.ok([...actual.values()].filter(value => value.startsWith("throws")).length === 0);
+});
+
+test("tryGetThisTypeAt and isDeclarationVisible answer like TypeScript 6.0 at every node", { skip: ts6Skip }, () => {
+    const { dir, rootNames, reference, native } = createPrograms("this-and-visibility", {
+        "main.ts": `export class Box<T> {
+    value!: T;
+    get(this: Box<T>, n: number) { return this.value; }
+    static make() { return this; }
+    private hidden = 1;
+    protected shared() {}
+}
+export function standalone(this: { tag: string }) { return this.tag; }
+function plain() { return 1; }
+const literal = { field: 1, method() { return this.field; }, nested: { inner() { return 2; } } };
+interface Handlers { onClick(this: HTMLLike, n: number): void; name?: string }
+interface HTMLLike { id: string }
+const typed: Handlers = { onClick(n) { return this.id; }, name: "x" };
+const target = { count: 0, bump: undefined as undefined | (() => void) };
+target.bump = function () { this.count++; };
+export namespace Space { export const inner = 1; const local = 2; }
+const local = 1;
+export { local };
+interface Shape { a: number }
+export type { Shape };
+declare module "ambient" { export const x: number; }
+`,
+    }, { declaration: true, noImplicitThis: true });
+    reference.getSemanticDiagnostics();
+    const theirs = reference.getTypeChecker();
+    const ours = native.getTypeChecker();
+    const differences = [];
+    for (const fileName of rootNames) {
+        const referenceNodes = preorder(ts6, reference.getSourceFile(fileName));
+        const nativeNodes = preorder(ts, native.getSourceFile(fileName));
+        referenceNodes.forEach((referenceNode, index) => {
+            const nativeNode = nativeNodes[index];
+            const where = `${referenceNode.pos} ${ts6.SyntaxKind[referenceNode.kind]} ${referenceNode.getText().slice(0, 30)}`;
+            const thisType = (api, checker, node, includeGlobalThis) => {
+                const type = checker.tryGetThisTypeAt(node, includeGlobalThis);
+                return type === undefined ? "none" : checker.typeToString(type);
+            };
+            for (const includeGlobalThis of [true, false]) {
+                const expected = guard(() => thisType(ts6, theirs, referenceNode, includeGlobalThis));
+                const actual = guard(() => thisType(ts, ours, nativeNode, includeGlobalThis));
+                if (expected !== actual) {
+                    differences.push(`${where} tryGetThisTypeAt(${includeGlobalThis}): ts6 ${expected}, ours ${actual}`);
+                }
+            }
+            const visible = guard(() => theirs.isDeclarationVisible(referenceNode));
+            const ourVisible = guard(() => ours.isDeclarationVisible(nativeNode));
+            if (visible !== ourVisible) {
+                differences.push(`${where} isDeclarationVisible: ts6 ${visible}, ours ${ourVisible}`);
+            }
+        });
+    }
+    assert.deepEqual(differences, []);
+    void dir;
+});
+
+test("signature help writes candidates in TS 6.0's order, the chosen one instantiated, with display parts", { skip: ts6Skip }, () => {
+    const { rootNames, reference, native } = createPrograms("signature-help", {
+        "main.ts": `declare function pick(a: "x"): 1;
+declare function pick(a: string): 2;
+declare function pick<T>(a: T[]): T;
+pick([true]);
+declare function spread(...args: [a: string, b?: number]): void;
+`,
+    });
+    const call = program => program.getSourceFile(rootNames[0]).statements[3].expression;
+    const describe = (api, program) => {
+        const checker = program.getTypeChecker();
+        const candidates = [];
+        const resolved = checker.getResolvedSignatureForSignatureHelp(call(program), candidates, 1);
+        return {
+            candidates: candidates.map(signature => checker.signatureToString(signature)),
+            chosen: candidates.indexOf(resolved),
+            parameters: candidates.map(signature => checker.getExpandedParameters(signature).map(list => list.map(parameter => api.createPrinter().printNode(api.EmitHint.Unspecified, checker.symbolToParameterDeclaration(parameter, undefined, api.NodeBuilderFlags.None), program.getSourceFile(rootNames[0]))).join(", "))),
+            rest: candidates.map(signature => checker.hasEffectiveRestParameter(signature)),
+            returnType: api.displayPartsToString(api.mapToDisplayParts(writer => checker.writeType(checker.getReturnTypeOfSignature(resolved), undefined, undefined, writer))),
+            kinds: api.mapToDisplayParts(writer => checker.writeSymbol(resolved.declaration.symbol, undefined, undefined, undefined, writer)).map(part => part.kind),
+        };
+    };
+    assert.deepEqual(describe(ts, native), describe(ts6, reference));
+    const spread = native.getSourceFile(rootNames[0]).statements[4];
+    const nativeChecker = native.getTypeChecker();
+    assert.throws(() => nativeChecker.getExpandedParameters(nativeChecker.getSignatureFromDeclaration(spread)), /^Error: tsc-rs: getExpandedParameters is not supported: /);
+});

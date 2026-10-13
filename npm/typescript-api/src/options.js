@@ -460,6 +460,7 @@ function toTsOptionDiagnostics(ts, options, responses, getSourceFile) {
     const invalidSubstitutions = getNonRelativeSubstitutions(ts, options);
     const rules = getPlacementRules(ts);
     const result = [];
+    let placedSubstitutions = false;
     for (const response of responses ?? []) {
         if (isTranslationArtifact(ts, options, response)) {
             continue;
@@ -476,9 +477,14 @@ function toTsOptionDiagnostics(ts, options, responses, getSourceFile) {
             const span = ts.getErrorSpanForNode(locator.configFile, node);
             return { ...diagnostic, file: locator.configFile, start: span.start, length: span.length };
         };
-        if (response.code === ts.Diagnostics.Non_relative_paths_are_not_allowed_when_baseUrl_is_not_set_Did_you_forget_a_leading_Slash.code && invalidSubstitutions.length > 0) {
-            const [key, valueIndex] = invalidSubstitutions.shift();
-            result.push(...locator.placePathsValue(key, valueIndex, at));
+        // tsc-rs reports 5090 once per substitution, without a position, so its identical
+        // diagnostics collapse into one; each one goes to its substitution, as TS 6.0 places them.
+        const nonRelativePaths = response.code === ts.Diagnostics.Non_relative_paths_are_not_allowed_when_baseUrl_is_not_set_Did_you_forget_a_leading_Slash.code;
+        if (nonRelativePaths && (invalidSubstitutions.length > 0 || placedSubstitutions)) {
+            for (const [key, valueIndex] of invalidSubstitutions.splice(0)) {
+                result.push(...locator.placePathsValue(key, valueIndex, at));
+            }
+            placedSubstitutions = true;
             continue;
         }
         const rule = rules.get(response.code);

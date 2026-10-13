@@ -1,8 +1,9 @@
 "use strict";
 
-// One tsc-rs API session per process and case sensitivity. Programs are snapshots in it. The
-// session asks the JS side for every file system operation; the innermost entry of `fileSystems`
-// answers, and an operation it does not handle (or no entry at all) goes to the operating system.
+// One tsc-rs API session per current directory and case sensitivity. Programs are snapshots in it.
+// The session asks the JS side for every file system operation; the innermost entry of
+// `fileSystems` answers, and an operation it does not handle (or no entry at all) goes to the
+// operating system.
 
 const fileSystemCallbacks = ["readFile", "fileExists", "directoryExists", "getAccessibleEntries", "realpath", "stat", "writeFile", "removeFile"];
 const useOS = JSON.stringify({ kind: "useOS" });
@@ -25,20 +26,22 @@ const { loadAddon } = require("./native/addon.js");
 
 const sessions = new Map();
 
-// tsc-rs compares file names the way its session was started; a host whose case sensitivity
-// differs from ts.sys (TS 6.0's own tests use case-insensitive in-memory hosts) gets its own.
-function getSession(ts, useCaseSensitiveFileNames = ts.sys.useCaseSensitiveFileNames) {
-    const key = !!useCaseSensitiveFileNames;
+// tsc-rs compares file names the way its session was started, and its current directory names
+// relative paths, finds automatic @types and words messages. A host whose case sensitivity or
+// current directory differs from ts.sys (TS 6.0's own tests use in-memory hosts at "/.src")
+// gets its own session.
+function getSession(ts, useCaseSensitiveFileNames = ts.sys.useCaseSensitiveFileNames, currentDirectory = ts.sys.getCurrentDirectory()) {
+    const key = `${!!useCaseSensitiveFileNames}\0${currentDirectory}`;
     let session = sessions.get(key);
     if (session === undefined) {
-        session = new Session(ts, key);
+        session = new Session(!!useCaseSensitiveFileNames, currentDirectory);
         sessions.set(key, session);
     }
     return session;
 }
 
 class Session {
-    constructor(ts, useCaseSensitiveFileNames) {
+    constructor(useCaseSensitiveFileNames, currentDirectory) {
         const { createChannel } = require("./native/channel.js");
         this.fileSystems = [];
         // An exception thrown by a host callback while tsc-rs waits for its answer. The callback
@@ -49,7 +52,7 @@ class Session {
         this.channel = createChannel([
             "--api",
             "--cwd",
-            ts.sys.getCurrentDirectory(),
+            currentDirectory,
             `--useCaseSensitiveFileNames=${useCaseSensitiveFileNames}`,
             `--callbacks=${fileSystemCallbacks.join(",")}`,
         ]);

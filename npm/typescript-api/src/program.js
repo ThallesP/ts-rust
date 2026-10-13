@@ -8,6 +8,7 @@ const { toTsDiagnostics } = require("./diagnostics.js");
 const { syntaxKindToNative, syntaxKindToTs6 } = require("./flags.js");
 
 const bundledLibs = "bundled:///libs/";
+const maxCachedPaths = 65536;
 
 // The newest program that gave out each SourceFile. A language service or a ts.server project
 // shares unchanged SourceFiles between its programs, as TS 6.0 does, and an older program's
@@ -36,8 +37,11 @@ function releaseNativeState(native) {
         return;
     }
     native.released = true;
-    const { session, snapshot, resolver, externalMemory } = native;
+    const { session, snapshot, resolver, externalMemory, lineage } = native;
     session.adjustExternalMemory(-externalMemory);
+    if (--lineage.programs === 0) {
+        session.adjustExternalMemory(-lineage.externalMemory);
+    }
     session.request("release", { snapshot });
     if (resolver !== undefined) {
         session.unregisterCallback(resolver.callbackName);
@@ -45,10 +49,23 @@ function releaseNativeState(native) {
     }
 }
 
-// A rough size of a snapshot in tsc-rs: a checked program of one file and the default lib takes
-// about 27 MB.
+// V8 sees only the JS side of a program; it is told roughly what the program's snapshot holds in
+// tsc-rs, so that it collects programs (and their snapshots) often enough, and not more often. A
+// snapshot updated from another one shares nearly all of its state with it: the programs updated
+// from one created snapshot (a lineage) report its size once, while any of them is alive, and
+// each adds what it holds alone.
+const kib = 1024;
+
+// A created snapshot: a checked program of one file and the default lib takes about 27 MB.
 function snapshotSize(fileCount) {
-    return 16 * 1024 * 1024 + fileCount * 128 * 1024;
+    return 16 * 1024 * kib + fileCount * 128 * kib;
+}
+
+// An updated snapshot: its program's tables, its checkers and the files read again. Measured in
+// ts.server.ProjectService loops with one changed file per update: about 0.8 MB with 90 files,
+// 1 MB with 210.
+function updateSize(fileCount, changedCount) {
+    return 512 * kib + fileCount * 3 * kib + changedCount * 256 * kib;
 }
 
 // TS 6.0: src/compiler/program.ts:1499 createProgram
@@ -91,7 +108,10 @@ class NativeProgram {
         this.relativePrefix = ts.isRootedDiskPath(this.currentDirectory) ? undefined : ts.ensureTrailingDirectorySeparator(this.nativeDirectory);
         this.getCanonicalFileName = ts.createGetCanonicalFileName(this.host.useCaseSensitiveFileNames());
         this.libLocation = ts.normalizePath(this.host.getDefaultLibLocation?.() ?? ts.getDirectoryPath(this.host.getDefaultLibFileName(options)));
-        this.session = getSession(ts, this.host.useCaseSensitiveFileNames());
+        this.session = getSession(ts, this.host.useCaseSensitiveFileNames(), this.nativeDirectory);
+        const previous = oldProgram instanceof NativeProgram && oldProgram.session === this.session ? oldProgram : undefined;
+        // File name -> path; a program of the same session and directory computes the same paths.
+        this.paths = previous?.currentDirectory === this.currentDirectory ? previous.paths : new Map();
         this.usesDefaultHost = isDefaultHost(this.host);
         this.fileSystem = fileSystemFor(ts, this);
         this.released = false;
@@ -125,7 +145,6 @@ class NativeProgram {
         this.checkDefaultLib();
         this.hostResolver = this.fileSystem !== undefined && usesHostModuleResolution(this.host) ? new HostModuleResolver(this) : undefined;
 
-        const previous = oldProgram instanceof NativeProgram && oldProgram.session === this.session ? oldProgram : undefined;
         // TS 6.0: src/compiler/program.ts shouldProgramCreateNewSourceFiles
         this.shouldCreateNewSourceFile = previous !== undefined && ts.optionsHaveChanges(previous.options, options, ts.sourceFileAffectingCompilerOptions);
         const base = previous !== undefined && !previous.released && previous.usesDefaultHost === this.usesDefaultHost ? previous : undefined;
@@ -141,12 +160,20 @@ class NativeProgram {
             this.hostResolver?.release();
             throw error;
         }
-        this.native = { session: this.session, snapshot: this.snapshot, resolver: this.hostResolver?.nativeHandle(), externalMemory: 0 };
+        const lineage = base?.native.lineage ?? { programs: 0, externalMemory: 0 };
+        lineage.programs++;
+        this.native = { session: this.session, snapshot: this.snapshot, resolver: this.hostResolver?.nativeHandle(), externalMemory: 0, lineage };
         releaseNative.register(this, this.native, this.native);
-        this.nativeFileNames = this.request("getSourceFileNames");
-        this.native.externalMemory = snapshotSize(this.nativeFileNames.length);
-        this.session.adjustExternalMemory(this.native.externalMemory);
-        this.indexFileNames();
+        const sameFiles = base !== undefined && this.keepsFilesOf(base, changes);
+        this.nativeFileNames = sameFiles ? base.nativeFileNames : this.request("getSourceFileNames");
+        this.reportExternalMemory(base, changes);
+        if (sameFiles) {
+            this.shareFileIndex(base);
+            this.missingFilePaths = base.missingFilePaths;
+        }
+        else {
+            this.indexFileNames();
+        }
         this.nameReferencedFiles();
         if (this.fileSystem !== undefined) {
             this.adoptHostLibFiles(base);
@@ -160,6 +187,22 @@ class NativeProgram {
         }
     }
 
+    reportExternalMemory(base, changes) {
+        const { lineage } = this.native;
+        const fileCount = this.nativeFileNames.length;
+        const lineageSize = snapshotSize(fileCount);
+        if (lineageSize > lineage.externalMemory) {
+            this.session.adjustExternalMemory(lineageSize - lineage.externalMemory);
+            lineage.externalMemory = lineageSize;
+        }
+        if (base === undefined) {
+            return;
+        }
+        // A program that reads the disk does not know which files tsc-rs read again.
+        const changedCount = changes.invalidateAll ? Math.ceil(fileCount / 16) : changes.changed.length;
+        this.native.externalMemory = updateSize(fileCount, changedCount);
+        this.session.adjustExternalMemory(this.native.externalMemory);
+    }
 
     // TS 6.0: src/compiler/program.ts createProgram processes host.getDefaultLibFileName(options) as
     // the default library. A host that names none, or cannot supply it, gives a program without
@@ -297,21 +340,23 @@ class NativeProgram {
     // Carries over what the old program knew about files that did not change.
     reuseFrom(base, changes) {
         this.structureIsReused = this.structureReuse(base, changes);
-        if (changes.invalidateAll) {
-            return;
-        }
+        const libs = this.nativeFileNames.filter(name => name.startsWith(bundledLibs));
+        // tsc-rs keeps the syntax trees of unchanged files, so their node handles stay the same.
+        // The bundled lib files never change, also when tsc-rs reads every other file again.
+        this.reuseNativeFiles(base, changes.invalidateAll ? libs : [...changes.unchanged, ...libs], !changes.invalidateAll);
         // Nothing to compile again: the new snapshot answers diagnostics as the old one does (a
         // global diagnostics request checks every file).
-        if (this.compilesSameAs(base, changes)) {
+        if (!changes.invalidateAll && this.compilesSameAs(base, changes)) {
             this.nativeDiagnostics = base.nativeDiagnostics;
         }
-        // tsc-rs keeps the syntax trees of unchanged files, so their node handles stay the same.
-        const unchanged = [...changes.unchanged, ...this.nativeFileNames.filter(name => name.startsWith(bundledLibs))];
-        for (const nativeFileName of unchanged) {
+    }
+
+    reuseNativeFiles(base, nativeFileNames, withMetadata) {
+        for (const nativeFileName of nativeFileNames) {
             if (!this.nativeFileNameSet.has(nativeFileName)) {
                 continue;
             }
-            if (base.metadata.has(nativeFileName)) {
+            if (withMetadata && base.metadata.has(nativeFileName)) {
                 this.metadata.set(nativeFileName, base.metadata.get(nativeFileName));
             }
             if (base.nativeFiles.has(nativeFileName)) {
@@ -357,6 +402,29 @@ class NativeProgram {
             return StructureIsReused.SafeModules;
         }
         return StructureIsReused.Completely;
+    }
+
+    // TS 6.0: src/compiler/program.ts tryReuseStructureFromOldProgram keeps the old program's files
+    // when no file changed its imports or references; tsc-rs's program then has the old files too.
+    // A host's module resolver may answer differently each time, so its programs ask tsc-rs.
+    keepsFilesOf(base, changes) {
+        const { ts } = this;
+        return !changes.invalidateAll
+            && this.hostResolver === undefined
+            && this.currentDirectory === base.currentDirectory
+            && this.libLocation === base.libLocation
+            && ts.arrayIsEqualTo(base.rootNames, this.rootNames)
+            && ts.arrayIsEqualTo(base.projectReferences, this.projectReferences, ts.projectReferenceIsEqualTo)
+            && JSON.stringify(base.nativeOptions) === JSON.stringify(this.nativeOptions)
+            && changes.changed.every(name => this.structureKeys.get(name) === base.structureKeys.get(name))
+            && !this.host.hasChangedAutomaticTypeDirectiveNames?.();
+    }
+
+    // The indexes of indexFileNames, which keepsFilesOf makes the same as the base program's.
+    shareFileIndex(base) {
+        this.nativeFileNameSet = base.nativeFileNameSet;
+        this.pathToNativeFileName = base.pathToNativeFileName;
+        this.nativePathToNativeFileName = base.nativePathToNativeFileName;
     }
 
     indexFileNames() {
@@ -412,7 +480,15 @@ class NativeProgram {
     }
 
     toPath(fileName) {
-        return this.ts.toPath(fileName, this.currentDirectory, this.getCanonicalFileName);
+        let path = this.paths.get(fileName);
+        if (path === undefined) {
+            path = this.ts.toPath(fileName, this.currentDirectory, this.getCanonicalFileName);
+            if (this.paths.size >= maxCachedPaths) {
+                this.paths.clear();
+            }
+            this.paths.set(fileName, path);
+        }
+        return path;
     }
 
     // The name of a program file: root files keep the names the caller passed.
@@ -548,7 +624,7 @@ class NativeProgram {
         this.hostTexts.set(nativeFileName, sourceFile.text);
         this.sourceFileOptions.set(nativeFileName, sourceFileOptions);
         this.prepareSourceFile(sourceFile, nativeFileName, fileName);
-        this.structureKeys.set(nativeFileName, structureKey(this.ts, sourceFile));
+        this.structureKeys.set(nativeFileName, structureKeyOf(this.ts, sourceFile));
         if (!nativeFileName.startsWith(bundledLibs)) {
             this.hostResolver?.addFile(nativeFileName, fileName);
         }
@@ -1714,6 +1790,18 @@ class NativeProgram {
     getGlobalTypingsCacheLocation() {
         return this.host.getGlobalTypingsCacheLocation?.();
     }
+}
+
+// A host gives the same SourceFile objects to many programs (a language service's document registry).
+const structureKeys = new WeakMap();
+
+function structureKeyOf(ts, sourceFile) {
+    let key = structureKeys.get(sourceFile);
+    if (key === undefined) {
+        key = structureKey(ts, sourceFile);
+        structureKeys.set(sourceFile, key);
+    }
+    return key;
 }
 
 // What TS 6.0's tryReuseStructureFromOldProgram compares between two versions of a file.

@@ -119,26 +119,81 @@ function createClasses(ts) {
     }
     defineSymbolFields(ts, NativeSymbol);
     defineSignatureFields(ts, NativeSignature);
-    return { NativeType, NativeSymbol, NativeSignature, typeShapes: new Map(), declarationSymbolField: declarationSymbolField(ts) };
-}
-
-// The `symbol` field of a declaration node in a file programs share (ObjectModel withSymbolField).
-function declarationSymbolField(ts) {
-    return {
-        configurable: true,
-        enumerable: true,
-        get() {
-            const program = programOfSourceFile(ts.getSourceFileOfNode(this));
-            return program === undefined ? undefined : modelsByChecker.get(program.getTypeChecker())?.symbolOfNode(this);
-        },
-        set(value) {
-            own(this, "symbol", value);
-        },
-    };
+    return { NativeType, NativeSymbol, NativeSignature, typeShapes: new Map(), nodeSymbols: installNodeSymbols(ts) };
 }
 
 function programOfSourceFile(sourceFile) {
     return require("./program.js").programOfSourceFile(sourceFile);
+}
+
+// Node symbols
+
+// TS 6.0: src/compiler/binder.ts bindWorker gives these kinds a symbol (and bindSourceFileIfExternalModule
+// the SourceFile of a module); JS expando assignments are answered when a checker hands them out.
+const boundKindNames = [
+    "TypeParameter", "Parameter", "VariableDeclaration", "BindingElement", "PropertyDeclaration", "PropertySignature", "PropertyAssignment",
+    "ShorthandPropertyAssignment", "EnumMember", "CallSignature", "ConstructSignature", "IndexSignature", "MethodDeclaration", "MethodSignature",
+    "FunctionDeclaration", "Constructor", "GetAccessor", "SetAccessor", "FunctionType", "JSDocFunctionType", "JSDocSignature", "ConstructorType",
+    "TypeLiteral", "JSDocTypeLiteral", "MappedType", "ObjectLiteralExpression", "FunctionExpression", "ArrowFunction", "ClassExpression",
+    "ClassDeclaration", "InterfaceDeclaration", "TypeAliasDeclaration", "EnumDeclaration", "ModuleDeclaration", "JsxAttributes", "JsxAttribute",
+    "ImportEqualsDeclaration", "NamespaceImport", "ImportSpecifier", "ExportSpecifier", "NamespaceExportDeclaration", "ImportClause",
+    "ExportDeclaration", "ExportAssignment", "NamespaceExport", "JSDocParameterTag", "JSDocPropertyTag", "JSDocTypedefTag", "JSDocCallbackTag",
+    "JSDocEnumTag", "SourceFile",
+];
+
+const nodeSymbolsByTs = new WeakMap();
+
+// Declarations a checker handed out (ObjectModel withSymbolField): answered whatever their kind.
+const handedOutDeclarations = new WeakSet();
+
+// TS 6.0's binder sets `symbol` on every declaration of a program file, and services and tools read
+// it (computeSuggestionDiagnostics reads `node.symbol.members`, findBaseOfDeclaration). TS 6.0's
+// factory starts each declaration with `symbol = undefined` (createBaseDeclaration); with this
+// accessor on the node prototype, that first assignment makes `symbol` an own field of a bound kind
+// (so own enumerable properties stay those of TS 6.0's nodes) that asks the newest live program of
+// the node's file when it is read, and so keeps no program alive. Other kinds get no own field; a
+// SourceFile answers through the prototype. Nodes parsed before this runs (src/index.js installs it
+// at load) get the field when a checker hands them out.
+function installNodeSymbols(ts) {
+    let nodeSymbols = nodeSymbolsByTs.get(ts);
+    if (nodeSymbols !== undefined) {
+        return nodeSymbols;
+    }
+    const kinds = new Set(boundKindNames.map(name => ts.SyntaxKind[name]));
+    const get = function getSymbol() {
+        return symbolOfProgramNode(ts, kinds, this);
+    };
+    const set = function setSymbol(value) {
+        own(this, "symbol", value);
+    };
+    const field = { configurable: true, enumerable: true, get, set };
+    nodeSymbols = { field };
+    nodeSymbolsByTs.set(ts, nodeSymbols);
+    Object.defineProperty(ts.objectAllocator.getNodeConstructor().prototype, "symbol", {
+        configurable: true,
+        get,
+        set(value) {
+            if (value !== undefined) {
+                own(this, "symbol", value);
+            }
+            else if (kinds.has(this.kind)) {
+                Object.defineProperty(this, "symbol", field);
+            }
+        },
+    });
+    return nodeSymbols;
+}
+
+function symbolOfProgramNode(ts, kinds, node) {
+    if (!kinds.has(node.kind) && !handedOutDeclarations.has(node)) {
+        return undefined;
+    }
+    const sourceFile = ts.getSourceFileOfNode(node);
+    const program = sourceFile === undefined ? undefined : programOfSourceFile(sourceFile);
+    if (program === undefined) {
+        return undefined;
+    }
+    return modelsByChecker.get(program.getTypeChecker())?.symbolOfNode(node);
 }
 
 // Symbol
@@ -209,14 +264,18 @@ function defineSignatureFields(ts, NativeSignature) {
     });
     lazy(prototype, "parameters", signature => {
         const { model, data } = native(signature);
-        return model.symbolList(data.parameters ?? [], "getParametersOfSignature", data.id, "list");
+        const parameters = model.symbolList(data.parameters ?? [], "getParametersOfSignature", data.id, "list");
+        model.noteParameters(signature, parameters);
+        return parameters;
     });
     lazy(prototype, "thisParameter", signature => {
         const { model, data } = native(signature);
         if (data.thisParameter === undefined) {
             return undefined;
         }
-        return model.cachedSymbol(data.thisParameter) ?? model.symbol(model.request("getThisParameterOfSignature", { objectId: data.id }));
+        const thisParameter = model.cachedSymbol(data.thisParameter) ?? model.symbol(model.request("getThisParameterOfSignature", { objectId: data.id }));
+        model.noteParameters(signature, [thisParameter]);
+        return thisParameter;
     });
     lazy(prototype, "target", signature => {
         const { model, data } = native(signature);
@@ -513,6 +572,7 @@ class ObjectModel {
         this.signatures = new Map();
         this.nodes = new Map();
         this.declarationSymbols = new WeakMap();
+        this.parameterSignatures = new WeakMap();
         modelsByChecker.set(checker, this);
     }
 
@@ -550,21 +610,26 @@ class ObjectModel {
         return this.withSymbolField(this.node(handle));
     }
 
-    // TS 6.0's binder sets `symbol` on every declaration and services code reads it
-    // (findBaseOfDeclaration). A language service or a ts.server project shares unchanged
-    // SourceFiles between its programs, so the field asks the newest live program of the node's
-    // file: a field bound to this program would keep it, and its tsc-rs snapshot, alive and answer
-    // from it after newer programs. A file no program shares (shadowSourceFile) gets this one's.
+    // A declaration this checker hands out answers `symbol` (installNodeSymbols) whatever its kind
+    // and also when it was parsed before the node prototype had the field. A language service or a
+    // ts.server project shares unchanged SourceFiles between its programs, so the field asks the
+    // newest live program of the node's file: a field bound to this program would keep it, and its
+    // tsc-rs snapshot, alive and answer from it after newer programs. A file no program shares
+    // (shadowSourceFile) gets this one's.
     withSymbolField(node) {
         if (node === undefined) {
             return undefined;
         }
+        const { field } = this.classes.nodeSymbols;
         const descriptor = Object.getOwnPropertyDescriptor(node, "symbol");
-        if (descriptor !== undefined && (descriptor.get !== undefined || descriptor.value !== undefined)) {
+        if (descriptor !== undefined && descriptor.get !== field.get && (descriptor.get !== undefined || descriptor.value !== undefined)) {
             return node;
         }
         if (programOfSourceFile(this.ts.getSourceFileOfNode(node)) !== undefined) {
-            Object.defineProperty(node, "symbol", this.classes.declarationSymbolField);
+            handedOutDeclarations.add(node);
+            if (descriptor !== undefined && descriptor.get === undefined) {
+                Object.defineProperty(node, "symbol", field);
+            }
             return node;
         }
         const model = this;
@@ -699,6 +764,20 @@ class ObjectModel {
     }
 
     // Signatures
+
+    // The signature whose parameter list first had each parameter symbol: an instantiated
+    // signature's parameters are its own transient symbols (TS 6.0 instantiateSignature).
+    noteParameters(signature, parameters) {
+        for (const parameter of parameters) {
+            if (parameter !== undefined && !this.parameterSignatures.has(parameter)) {
+                this.parameterSignatures.set(parameter, signature);
+            }
+        }
+    }
+
+    signatureOfParameter(parameter) {
+        return this.parameterSignatures.get(parameter);
+    }
 
     signature(data) {
         if (data === undefined || data === null) {
@@ -1183,4 +1262,9 @@ function decodeSyntheticNode(ts, bytes, { multilineObjectLiterals = false, singl
     return new SyntheticTree(ts, bytes, multilineObjectLiterals, singleQuote).build(1);
 }
 
-module.exports = { circularList, createObjectModel, decodeSyntheticNode };
+// Called by src/index.js when lib/typescript.js loads, before anything is parsed.
+function install(ts) {
+    installNodeSymbols(ts);
+}
+
+module.exports = { circularList, createObjectModel, decodeSyntheticNode, install };

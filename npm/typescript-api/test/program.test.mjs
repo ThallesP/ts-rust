@@ -388,6 +388,75 @@ test("a program made from an oldProgram has tsc-rs read only the files whose tex
     }
 });
 
+test("a program made from an oldProgram whose changed files keep their imports keeps the old file list without asking tsc-rs", () => {
+    const dir = writeFixture("same-files", {
+        "main.ts": "import { dep } from \"./dep\";\nexport const value: number = dep;\n",
+        "dep.ts": "export const dep = 1;\n",
+        "other.ts": "export const other = 2;\n",
+    });
+    const options = { strict: true, types: [] };
+    const { host, edit } = editableHost(ts, dir, options);
+    const roots = [path.join(dir, "main.ts")];
+    const first = ts.createProgram(roots, options, host);
+    const { session } = first;
+    const request = session.request;
+    let asked = 0;
+    session.request = function countFileNames(method, params) {
+        asked += method === "getSourceFileNames" ? 1 : 0;
+        return request.call(this, method, params);
+    };
+    const names = program => program.getSourceFiles().map(file => path.basename(file.fileName)).filter(name => !name.startsWith("lib."));
+    try {
+        edit("main.ts", "import { dep } from \"./dep\";\nexport const value: string = dep;\n");
+        const second = ts.createProgram(roots, options, host, first);
+        assert.equal(asked, 0);
+        assert.deepEqual(names(second), names(first));
+        assert.deepEqual(second.getSemanticDiagnostics().map(diagnostic => diagnostic.code), [2322]);
+        assert.equal(second.getTypeChecker().typeToString(second.getTypeChecker().getTypeAtLocation(second.getSourceFile(path.join(dir, "dep.ts")).statements[0].declarationList.declarations[0].name)), "1");
+        edit("main.ts", "import { dep } from \"./dep\";\nimport { other } from \"./other\";\nexport const value = dep + other;\n");
+        const third = ts.createProgram(roots, options, host, second);
+        assert.equal(asked, 1);
+        assert.deepEqual(names(third), ["dep.ts", "other.ts", "main.ts"]);
+        assert.deepEqual(third.getSemanticDiagnostics(), []);
+    }
+    finally {
+        session.request = request;
+    }
+});
+
+test("a program updated from an oldProgram reports only its own part of the shared tsc-rs state to V8", () => {
+    const dir = writeFixture("external-memory", { "main.ts": "export const main = 1;\n" });
+    const options = { types: [] };
+    const { host, edit } = editableHost(ts, dir, options);
+    const roots = [path.join(dir, "main.ts")];
+    const first = ts.createProgram(roots, options, host);
+    const { session } = first;
+    const adjust = session.adjustExternalMemory;
+    let reported = 0;
+    session.adjustExternalMemory = change => {
+        reported += change;
+    };
+    try {
+        edit("main.ts", "export const main = 2;\n");
+        const second = ts.createProgram(roots, options, host, first);
+        const updated = reported;
+        first.releaseNative();
+        // The state both share stays reported while one of them is alive.
+        assert.equal(reported, updated);
+        second.releaseNative();
+        const created = -reported;
+        assert.ok(created >= 16 * 1024 * 1024, `created ${created}`);
+        assert.ok(updated > 0 && updated <= created / 8, `updated ${updated}`);
+        const third = ts.createProgram(roots, options, host);
+        assert.equal(reported, 0);
+        third.releaseNative();
+        assert.equal(reported, -created);
+    }
+    finally {
+        session.adjustExternalMemory = adjust;
+    }
+});
+
 test("programs made from an oldProgram keep their own compiler state while they are referenced", () => {
     const dir = writeFixture("release", { "main.ts": "export const main: number = 1;\n" });
     const options = { types: [] };
@@ -865,6 +934,28 @@ test("a host whose current directory is relative gets relative file names and me
         };
     };
     assert.deepEqual(describe(ts), describe(ts6));
+});
+
+test("a host's current directory names relative files and finds automatic @types, not the process's, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const files = {
+            "/proj/src/main.ts": "export const x: number = fooGlobal;\n",
+            "/proj/node_modules/@types/foo/index.d.ts": "declare var fooGlobal: number;\n",
+        };
+        const host = memoryHost(anyTs, files, { currentDirectory: "/proj" });
+        const directories = { "/proj/node_modules/@types": ["foo"] };
+        host.getDirectories = directory => directories[anyTs.normalizePath(anyTs.combinePaths("/proj", directory))] ?? [];
+        host.directoryExists = directory => Object.keys(files).some(fileName => fileName.startsWith(`${anyTs.normalizePath(anyTs.combinePaths("/proj", directory))}/`));
+        const program = anyTs.createProgram(["src/main.ts"], { declaration: true, outDir: "out", types: ["*"] }, host);
+        return {
+            files: program.getSourceFiles().map(file => file.fileName).filter(name => !name.includes("/lib.")),
+            diagnostics: messages(anyTs, [...program.getOptionsDiagnostics(), ...program.getGlobalDiagnostics(), ...program.getSemanticDiagnostics()]),
+            commonSourceDirectory: program.getCommonSourceDirectory(),
+        };
+    };
+    const expected = describe(ts6);
+    assert.deepEqual(expected.diagnostics, []);
+    assert.deepEqual(describe(ts), expected);
 });
 
 test("a file first found through a relative reference keeps that relative name, like TypeScript 6.0", needsTs6, () => {

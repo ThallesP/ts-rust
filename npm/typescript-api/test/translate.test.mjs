@@ -557,6 +557,22 @@ test("option diagnostics from tsc-rs are placed in tsconfig.json like TS 6.0 pla
     assert.equal(toTsOptionDiagnostics(ts, { module: ts.ModuleKind.System }, [response(5095, "x")], () => undefined).length, 0);
 });
 
+test("every non-relative paths substitution gets its own TS5090, although tsc-rs's identical ones collapse into one", () => {
+    const dir = writeProject("paths-5090", {
+        "tsconfig.json": `{\n    "compilerOptions": {\n        "paths": {\n            "@interface/*": ["src/interface/*"],\n            "@blah": ["./ok", "blah"],\n            "@humbug/*": ["*/generated"]\n        }\n    }\n}\n`,
+    });
+    const parsed = parseConfig(ts, path.join(dir, "tsconfig.json"));
+    const response = { pos: -1, end: -1, code: 5090, category: 1, text: "Non-relative paths are not allowed. Did you forget a leading './'?" };
+    const diagnostics = toTsOptionDiagnostics(ts, parsed.options, [response, response], () => undefined);
+    const message = "error TS5090: Non-relative paths are not allowed when 'baseUrl' is not set. Did you forget a leading './'?";
+    assert.equal(ts.formatDiagnostics(diagnostics, formatHost(dir)), [
+        `tsconfig.json(4,30): ${message}`,
+        `tsconfig.json(5,31): ${message}`,
+        `tsconfig.json(6,27): ${message}`,
+        "",
+    ].join("\n"));
+});
+
 // --- options.js: against tsc-rs and TS 6.0.3 --------------------------------------------------
 
 const plainSource = "export const value: number = 1;\nexport function sum(xs: number[]) { let s = 0; for (const x of xs) s += x; return s; }\n";
