@@ -3061,10 +3061,28 @@ mod flat_arena {
         /// Out of line, an arena that keeps chunks (no room) took 3% (hono
         /// st) to 21% (elysia st) more instructions than the chunks of R209,
         /// inlined 1% to 4.5% (plain builds, flatarena1 r2 knob2).
+        #[cold]
+        #[inline(never)]
+        fn rest_or_items(&self, i: usize) -> &T {
+            if i < self.items.len() {
+                return &self.items[i];
+            }
+            self.rest_entry(i)
+        }
+
         #[inline(always)]
         fn rest_entry(&self, i: usize) -> &T {
             let j = i - self.items.len();
             &self.rest[j >> CHUNK_SHIFT][j & CHUNK_MASK]
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn rest_or_items_mut(&mut self, i: usize) -> &mut T {
+            if i < self.items.len() {
+                return &mut self.items[i];
+            }
+            self.rest_entry_mut(i)
         }
 
         #[inline(always)]
@@ -3092,24 +3110,22 @@ mod flat_arena {
 
         #[inline]
         fn index(&self, i: usize) -> &T {
-            if i < self.items.len() {
-                &self.items[i]
-            } else {
-                std::hint::cold_path();
-                self.rest_entry(i)
+            // STUDY: chunk mode test first, then the read of round 1.
+            if self.rest_len != 0 {
+                return self.rest_or_items(i);
             }
+            &self.items[i]
         }
     }
 
     impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
         #[inline]
         fn index_mut(&mut self, i: usize) -> &mut T {
-            if i < self.items.len() {
-                &mut self.items[i]
-            } else {
-                std::hint::cold_path();
-                self.rest_entry_mut(i)
+            // STUDY: chunk mode test first, then the read of round 1.
+            if self.rest_len != 0 {
+                return self.rest_or_items_mut(i);
             }
+            &mut self.items[i]
         }
     }
 
