@@ -3061,13 +3061,15 @@ mod flat_arena {
         /// Out of line, an arena that keeps chunks (no room) took 3% (hono
         /// st) to 21% (elysia st) more instructions than the chunks of R209,
         /// inlined 1% to 4.5% (plain builds, flatarena1 r2 knob2).
-        #[inline(always)]
+        #[cold]
+        #[inline(never)]
         fn rest_entry(&self, i: usize) -> &T {
             let j = i - self.items.len();
             &self.rest[j >> CHUNK_SHIFT][j & CHUNK_MASK]
         }
 
-        #[inline(always)]
+        #[cold]
+        #[inline(never)]
         fn rest_entry_mut(&mut self, i: usize) -> &mut T {
             let j = i - self.items.len();
             &mut self.rest[j >> CHUNK_SHIFT][j & CHUNK_MASK]
@@ -3095,7 +3097,6 @@ mod flat_arena {
             if i < self.items.len() {
                 &self.items[i]
             } else {
-                std::hint::cold_path();
                 self.rest_entry(i)
             }
         }
@@ -3107,7 +3108,6 @@ mod flat_arena {
             if i < self.items.len() {
                 &mut self.items[i]
             } else {
-                std::hint::cold_path();
                 self.rest_entry_mut(i)
             }
         }
