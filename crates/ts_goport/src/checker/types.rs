@@ -2851,30 +2851,18 @@ pub type StringLiteralType = Type;
 // memory resident. Later chunks are made at full size: a program that fills
 // the first chunk is large, and growing each chunk too cost about 1.5% of
 // check time on hono, zod and effect (rss2 grid: copies and page faults).
-// flatarena1 PROBE3 (study only, not for merge): the chunked arena until it holds GOPORT_FA1_MOVE bytes (default
-// 32 MiB), then one move into a flat `Vec` with a reserve of GOPORT_FA1_RESERVE bytes (default 2 GiB). A read tests
-// the flat `Vec` first: its bounds test is the mode test, so a flat arena reads as layout1 B2.
+// flatarena1 HY32 (study only, not for merge): the chunked arena until it holds `ARENA_FLAT_MOVE_BYTES`, then one
+// move into a flat `Vec` with a room of `ARENA_FLAT_RESERVE_BYTES` (virtual memory: only written entries become
+// resident). A read tests the flat `Vec` first: its bounds test is the mode test, so a flat arena reads as layout1
+// B2. Without the room (a 32-bit or Windows target, or a failed `try_reserve_exact`) the arena stays chunked.
 pub struct ChunkedArena<T> {
     flat: Vec<T>,
     chunks: Vec<Vec<T>>,
     len: usize,
 }
 
-fn fa1_knobs() -> (usize, usize) {
-    static K: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *K.get_or_init(|| {
-        let g = |n: &str, d: usize| {
-            std::env::var(n)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(d)
-        };
-        (
-            g("GOPORT_FA1_MOVE", 32 << 20),
-            g("GOPORT_FA1_RESERVE", 1 << 31),
-        )
-    })
-}
+const ARENA_FLAT_MOVE_BYTES: usize = 32 << 20;
+const ARENA_FLAT_RESERVE_BYTES: usize = 1 << 31;
 
 // PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
 // entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
@@ -2958,19 +2946,23 @@ impl<T> ChunkedArena<T> {
 
     /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries, or moves
     /// every entry into the flat `Vec` (true) once the arena holds
-    /// GOPORT_FA1_MOVE bytes.
+    /// `ARENA_FLAT_MOVE_BYTES`.
     #[cold]
     #[inline(never)]
     fn add_chunk(&mut self) -> bool {
-        let (move_bytes, reserve_bytes) = fa1_knobs();
         let size = std::mem::size_of::<T>().max(1);
-        if self.len.saturating_mul(size) >= move_bytes {
-            let mut flat = Vec::with_capacity((reserve_bytes / size).max(self.len * 2));
-            for chunk in std::mem::take(&mut self.chunks) {
-                flat.extend(chunk);
+        if cfg!(all(target_pointer_width = "64", not(windows)))
+            && self.len.saturating_mul(size) >= ARENA_FLAT_MOVE_BYTES
+        {
+            let mut flat = Vec::new();
+            let room = (ARENA_FLAT_RESERVE_BYTES / size).max(self.len * 2);
+            if flat.try_reserve_exact(room).is_ok() {
+                for chunk in std::mem::take(&mut self.chunks) {
+                    flat.extend(chunk);
+                }
+                self.flat = flat;
+                return true;
             }
-            self.flat = flat;
-            return true;
         }
         self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
         false
