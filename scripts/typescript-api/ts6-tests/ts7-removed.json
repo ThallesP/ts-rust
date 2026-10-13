@@ -1,5 +1,5 @@
 {
- "source": "R-tests.md section 4 probe (/work/scratch/research/ts-api-tests/probe-removed.json): settings TS 7 removed that each test passes into the library, recorded by a wrapper of typescript@6.0.3",
+ "source": "A probe run of the tier1 tests on a wrapper of typescript@6.0.3 that recorded the compiler options each test passed into the library: per test, the settings TS 7 removed",
  "tier1": {
   "unittests:: customTransforms before+decorators": [
    "target=ES5/ES3"

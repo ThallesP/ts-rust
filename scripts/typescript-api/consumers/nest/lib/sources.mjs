@@ -46,7 +46,7 @@ export function prepareAppDir(from, appDir) {
 }
 
 // TS 6.0 parsed package.json shape: the typescript dependency becomes the packed tarball and an
-// override makes every other copy in the tree the same package (R-nest.md section 7).
+// override makes every other copy in the tree the same package (@nestjs/cli pins its own typescript).
 export function useTarballInPackageJson(appDir, tgz, { extraDependencies = {}, extraDevDependencies = {} } = {}) {
     const file = path.join(appDir, "package.json");
     const pkg = readJson(file);

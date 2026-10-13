@@ -2,7 +2,7 @@
 
 Runs TypeScript 6.0.3's own tests, unmodified, against a library directory: any package directory
 with `lib/typescript.js`, such as `npm/typescript-api` (tsc-rs) or a stock `typescript@6.0.3`
-install (the control). Background and the test inventory: `/work/scratch/research/R-tests.md`.
+install (the control).
 
 ```sh
 scripts/typescript-api/ts6-tests/run.sh help
@@ -52,7 +52,7 @@ when `build-swapped.mjs` changes. The whole setup takes about a minute.
 | Suite | What | Tests | Wall, typescript@6.0.3 (dev host) |
 |---|---|---|---|
 | `apisamples` | The 9 APISample programs of `tests/cases/compiler/APISample_*.ts` (emitted JS taken from `tests/baselines/reference`), run with `node_modules/typescript` linked to the library; normalized output and written files are diffed against `apisamples/expected/` (recorded from typescript@6.0.3 with this harness). | 9 | 14 s |
-| `tier1` | First-adoption selection (R-tests.md §4 rows 1-11; mocha grep in `suites.json`): Public APIs, regExpScannerRecovery, evaluation, Printer/Factory/Transform APIs, customTransforms, config parsing, programApi, moduleResolution, services Transpile/PreProcessFile/Colorization/DocumentRegistry/languageService, transpile runner. | 2,578 | 9-14 s |
+| `tier1` | First-adoption selection (mocha grep in `suites.json`): Public APIs, regExpScannerRecovery, evaluation, Printer/Factory/Transform APIs, customTransforms, config parsing, programApi, moduleResolution, services Transpile/PreProcessFile/Colorization/DocumentRegistry/languageService, transpile runner. | 2,578 | 9-14 s |
 | `compiler` | compiler + conformance runners, only `Correct errors for` and `Correct JS output for` (every test case and configuration), sharded over `--jobs` mocha processes by TS 6.0's own `shards`/`shardId` test config. | 29,946 | 4 jobs: 119 s (load ~10), 200-250 s (load ~20), 5.6 GiB peak; 1 job: 595 s (load ~20), 1.9 GiB |
 | `all` | The three above, in that order. | 32,533 | |
 
@@ -78,8 +78,8 @@ Which suites exercise programs, the checker and emit (and therefore tsc-rs once 
   stops on the sample's own TypeError before it builds a program (TS 6.0.3 does the same).
 
 Expected failures once tsc-rs answers: TS 7 removed settings that many TS 6.0 tests use (ES5
-target, AMD/System/UMD, Classic/Node10, `outFile`, `baseUrl`, `downlevelIteration`). R-tests.md
-§4 lists them per suite; `ts7-removed.json` per tier1 test (see Compare).
+target, AMD/System/UMD, Classic/Node10, `outFile`, `baseUrl`, `downlevelIteration`).
+`ts7-removed.json` lists them per tier1 test (see Compare).
 
 ## Outputs (`<out-dir>`)
 
@@ -109,17 +109,19 @@ still failing, and added tests, then up to `--limit` names per category with the
 `--json FILE` writes every name. Exit 1 when any base pass is lost or absent. Only suites present in
 both runs are compared; the others are listed as unrun. Tests that pass a setting TS 7 removed are
 marked `[TS7-removed: ...]` and counted in the "Lost (TS7-removed)" column: `ts7-removed.json` holds
-the 689 tier1 tests that the R-tests.md probe (a typescript@6.0.3 wrapper that recorded the options
-each test passed in, `/work/scratch/research/ts-api-tests/probe-removed.json`) flagged; 610 of them
-are services Transpile tests, whose harness defaults to ES5.
+the 689 tier1 tests that a probe run flagged (the tier1 tests on a typescript@6.0.3 wrapper that
+recorded the options each test passed in); 610 of them are services Transpile tests, whose harness
+defaults to ES5.
 
 ## Triage
 
 `triage <out-dir> [--ts7 DIR] [--limit N]` classifies every failing compiler-suite test of a run
 (`results.json` and the local baselines under `ws/compiler-*/tests/baselines/local/`) against TS 7's
 own baseline of the same name: the Go harness's `testdata/baselines/reference/{compiler,conformance}/`
-in the `tsc/` directory DIR of a microsoft/TypeScript checkout at the tsc-rs pin (default
-`/work/scratch/repos/ts71/tsc`, `TS6_TESTS_TS7` overrides; fed0bf24149f on 2026-10-13). tsc-rs is a
+in the `tsc/` directory DIR of a microsoft/TypeScript checkout at the tsc-rs pin (`TS6_TESTS_TS7`
+overrides). The default, `target/typescript-api/ts71-baselines/tsc`, is a shallow sparse fetch of
+fed0bf24149f with only the paths triage reads (`tsc/internal/testrunner` and the compiler and
+conformance baselines and cases), about 350 MB, made on first use. tsc-rs is a
 port of that code, so the package's answers should equal those baselines. It writes
 `<out-dir>/triage.json` (every failing test with its class, reason, TS 7 case and baseline paths)
 and `<out-dir>/triage.md` (counts per class and check, the D list grouped by cause, the suspicious
@@ -187,9 +189,10 @@ Normalizations: only what the two harnesses format differently, each found in re
 
 `node scripts/typescript-api/ts6-tests/repro.mjs list | <case>... | all [--pkg DIR] [--ts6 DIR] [--tsgo BIN]`
 runs a tiny program per triage cluster through the package (default `npm/typescript-api`),
-typescript@6.0.3 (default `/work/scratch/consumers/node_modules/typescript`) and the `tsgo` command
-line (default `target/release/tsgo`), and prints the diagnostics and declaration files of each next
-to TS 7's expected answer. Fixtures go to `target/typescript-api/ts6-repro/<case>/`. Hosts: `disk`
+typescript@6.0.3 (default `npm/typescript-api/.cache/typescript-6.0.3`, which
+`npm/typescript-api/scripts/build.mjs` unpacks) and the `tsgo` command line (default
+`target/release/tsgo`), and prints the diagnostics and declaration files of each next to TS 7's
+expected answer. Fixtures go to `target/typescript-api/ts6-repro/<case>/`. Hosts: `disk`
 (`ts.createCompilerHost`), `memory` (an in-memory CompilerHost under `/ts6-repro-virtual/`, like the
 TS 6.0 harness's virtual file system), `other-cwd` (relative names and `getCurrentDirectory()` point at
 the fixture while the process runs elsewhere).

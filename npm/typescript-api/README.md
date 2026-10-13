@@ -20,7 +20,8 @@ cd npm/typescript-api && npm pack                  # typescript-6.0.3.tgz
 ```
 
 `build.mjs` downloads typescript@6.0.3 from the npm registry (its sha512 is pinned) and caches it in
-`.cache/`; `TS6_TARBALL=<path>` uses a local copy.
+`.cache/`; `TS6_TARBALL=<path>` uses a local copy. It also unpacks the unchanged package into
+`.cache/typescript-6.0.3`, which the tests compare with.
 
 In a project, make every `typescript` in the tree the package. With npm:
 
@@ -67,9 +68,10 @@ Options that TypeScript 7 removed:
 
 Not supported, with a `tsc-rs: ... is not supported` error rather than a wrong answer:
 
-- Language service features that need TypeScript 6.0's checker internals: quick info, completions,
-  signature help, find references, rename and the code fixes and refactors. Diagnostics, emit
-  (`getEmitOutput`) and `getProgram` work.
+- Language service features run TypeScript 6.0's own services code on tsc-rs's checker. Diagnostics,
+  `getEmitOutput`, quick info, signature help, go to definition, find references and completion
+  details give TypeScript 6.0's text (names inside printed types come as plain text parts, not
+  `className` and the like). A feature that needs a checker member tsc-rs cannot answer throws.
 - A few TypeChecker members tsc-rs cannot answer: `getStringLiteralType`,
   `getNumberLiteralType`, `getBigIntLiteralType`, `getSymbolOfExpando`, and some argument forms of
   others. `symbolToString`, `signatureToString` and a few more are worked out in JS.
@@ -118,8 +120,17 @@ all of them until it returns.
 
 ## Tests
 
-`cd npm/typescript-api && node --test test/*.test.mjs` runs the package's own tests. Most compare
-with typescript@6.0.3.
+`cd npm/typescript-api && node --test test/*.test.mjs` runs the package's own tests, after the two
+builds above. Most compare with typescript@6.0.3, the copy in `.cache/typescript-6.0.3`
+(`TS6_STOCK=<dir>` names another). The tests that run tools on the package (typescript-eslint's
+rules, the NestJS swagger and graphql plugins, nest-cli's tsconfig-paths hook, ts-jest's hoisting)
+need the pinned packages of `test/consumers`, about 180 MB from the npm registry:
+
+```sh
+cd npm/typescript-api && npm run install:consumers   # npm ci --ignore-scripts --prefix test/consumers
+```
+
+Without them those tests skip and say why. `TSRS_CONSUMERS=<node_modules>` uses other copies.
 
 `scripts/typescript-api/` runs other projects' tests, unmodified, against the package:
 

@@ -5,8 +5,9 @@
 //
 // usage: node scripts/typescript-api/ts7-api/channel-bench.mjs [--project <tsconfig.json>] [--runs N]
 //        node scripts/typescript-api/ts7-api/channel-bench.mjs help
-// Default project: /work/scratch/research/nest-ts-api/nest-cli-copy/tsconfig.json (nest-cli with
-// its node_modules). Prints a JSON summary (milliseconds; medians unless named).
+// Default project: target/typescript-api/consumers/nest/nest-cli-unit/tsconfig.json, nest-cli 12.0.8
+// with its node_modules, which the nest-cli-unit scenario of consumers/nest.sh installs. Prints a
+// JSON summary (milliseconds; medians unless named).
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -16,7 +17,8 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const self = fileURLToPath(import.meta.url);
-const channelModule = path.resolve(path.dirname(self), "../../../npm/typescript-api/src/native/channel.js");
+const repoDir = path.resolve(path.dirname(self), "../../..");
+const channelModule = path.join(repoDir, "npm/typescript-api/src/native/channel.js");
 const readCallbacks = ["readFile", "fileExists", "directoryExists", "getAccessibleEntries", "realpath", "stat"];
 const useOS = JSON.stringify({ kind: "useOS" });
 
@@ -132,12 +134,15 @@ else if (argv[0] === "--one") {
     measure(argv[1], argv[2], argv[3]);
 }
 else {
-    let project = "/work/scratch/research/nest-ts-api/nest-cli-copy/tsconfig.json";
+    let project = path.join(repoDir, "target/typescript-api/consumers/nest/nest-cli-unit/tsconfig.json");
     let runs = 3;
     for (let i = 0; i < argv.length; i++) {
         if (argv[i] === "--project") project = path.resolve(argv[++i]);
         else if (argv[i] === "--runs") runs = Number(argv[++i]);
         else throw new Error(`unknown argument ${argv[i]} (see help)`);
+    }
+    if (!fs.existsSync(project)) {
+        throw new Error(`no project at ${project}: pass --project, or run scripts/typescript-api/consumers/nest.sh (see help)`);
     }
     const results = {};
     for (let i = 0; i < runs; i++) {

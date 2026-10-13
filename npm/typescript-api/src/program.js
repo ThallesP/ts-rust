@@ -2005,7 +2005,7 @@ function notSupportedFeature(name, error) {
     return new Error(`tsc-rs: languageService.${name} is not supported here: it needs the TypeScript 6.0 checker (${error.message})`, { cause: error });
 }
 
-// Nodes that tsc-rs parses as another kind over the same range (R-ast-diff.md section 2): the types
+// Nodes that tsc-rs parses as another kind over the same range: the types
 // of `implements` and interface `extends` clauses are TypeReferences, `A.B` in them a
 // QualifiedName; a hole in an array binding pattern is a BindingElement.
 let shapes;

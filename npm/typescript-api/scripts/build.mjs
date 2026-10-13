@@ -4,6 +4,7 @@
 // (see HOOKS). src/index.js fills the hooks, so programs, checkers and emit come from tsc-rs while
 // every other export stays TypeScript 6.0.3's. The lib.*.d.ts files are the ones tsc-rs embeds
 // (crates/ts_goport/libs), so the files that tools read from disk are the files the compiler checks.
+// The unchanged package goes to .cache/typescript-6.0.3: the tests compare with it.
 //
 // usage: node scripts/build.mjs
 // TS6_TARBALL=<path> uses that typescript-6.0.3.tgz instead of the cache or the registry.
@@ -23,6 +24,7 @@ const tarball = {
     integrity: "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==",
     cache: path.join(packageDir, ".cache", "typescript-6.0.3.tgz"),
 };
+const stockDir = path.join(packageDir, ".cache", "typescript-6.0.3");
 
 // Functions of the TypeScript 6.0.3 bundle that src/index.js can replace. Each becomes
 // `function name(...args)` that calls `__tsrsHooks.name` when it is set and the original
@@ -63,7 +65,9 @@ for (const name of fs.readdirSync(goLibDir)) {
     }
 }
 
-console.log(`wrote ${path.relative(process.cwd(), libDir) || "."}`);
+unpackStock(files);
+
+console.log(`wrote ${path.relative(process.cwd(), libDir) || "."} and ${path.relative(process.cwd(), stockDir)}`);
 
 async function readTarball() {
     const fromEnv = process.env.TS6_TARBALL;
@@ -92,6 +96,7 @@ function verified(bytes, source) {
 }
 
 // The ustar subset that npm tarballs use: regular files, with the name split over prefix and name.
+// Each entry is { data, mode }.
 function readTar(bytes) {
     const result = new Map();
     for (let offset = 0; offset + 512 <= bytes.length;) {
@@ -104,7 +109,7 @@ function readTar(bytes) {
         const size = parseInt(field(124, 12).trim() || "0", 8);
         const type = field(156, 1);
         if (type === "0" || type === "") {
-            result.set(name, bytes.subarray(offset + 512, offset + 512 + size));
+            result.set(name, { data: bytes.subarray(offset + 512, offset + 512 + size), mode: parseInt(field(100, 8).trim() || "644", 8) });
         }
         offset += 512 + Math.ceil(size / 512) * 512;
     }
@@ -112,11 +117,33 @@ function readTar(bytes) {
 }
 
 function entry(files, name) {
-    const bytes = files.get(name);
-    if (bytes === undefined) {
+    const file = files.get(name);
+    if (file === undefined) {
         throw new Error(`typescript-6.0.3.tgz has no ${name}`);
     }
-    return bytes;
+    return file.data;
+}
+
+// The unchanged package, written next to the tarball once. A new directory takes the place of the
+// old one only when it is complete.
+function unpackStock(files) {
+    const marker = path.join(stockDir, ".integrity");
+    if (fs.existsSync(marker) && fs.readFileSync(marker, "utf8") === tarball.integrity) {
+        return;
+    }
+    const partial = `${stockDir}.partial`;
+    fs.rmSync(partial, { recursive: true, force: true });
+    for (const [name, { data, mode }] of files) {
+        if (!name.startsWith("package/")) {
+            continue;
+        }
+        const file = path.join(partial, name.slice("package/".length));
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, data, { mode: mode & 0o777 });
+    }
+    fs.writeFileSync(path.join(partial, ".integrity"), tarball.integrity);
+    fs.rmSync(stockDir, { recursive: true, force: true });
+    fs.renameSync(partial, stockDir);
 }
 
 function patchTypeScript(text) {

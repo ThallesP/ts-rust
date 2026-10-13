@@ -16,10 +16,11 @@ const USAGE = `usage: node scripts/typescript-api/ts6-tests/repro.mjs help | lis
            [--pkg DIR] [--ts6 DIR] [--tsgo BIN]
 
 Runs each case through the package (--pkg, default npm/typescript-api), stock typescript@6.0.3
-(--ts6, default /work/scratch/consumers/node_modules/typescript) and the tsgo command line (--tsgo,
-default target/release/tsgo), and prints the diagnostics and declaration files of each. Fixture
-files are written to ${path.relative(REPO, FIXTURES)}/<case>/. "list" prints the cases with the
-triage cluster and the expected (TS 7) answer.`;
+(--ts6, default npm/typescript-api/.cache/typescript-6.0.3, which npm/typescript-api/scripts/build.mjs
+unpacks) and the tsgo command line (--tsgo, default target/release/tsgo), and prints the
+diagnostics and declaration files of each. Fixture files are written to
+${path.relative(REPO, FIXTURES)}/<case>/. "list" prints the cases with the triage cluster and the
+expected (TS 7) answer.`;
 
 // host: "disk" (ts.createCompilerHost), "memory" (an in-memory CompilerHost under /ts6-repro-virtual/,
 // paths that do not exist on disk, like the TS 6.0 harness's virtual file system), "other-cwd" (disk,
@@ -120,7 +121,7 @@ const CASES = {
 function parseArgs(args) {
     const options = {
         pkg: path.join(REPO, "npm/typescript-api"),
-        ts6: "/work/scratch/consumers/node_modules/typescript",
+        ts6: path.join(REPO, "npm/typescript-api/.cache/typescript-6.0.3"),
         tsgo: path.join(REPO, "target/release/tsgo"),
         cases: [],
     };

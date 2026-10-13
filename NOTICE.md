@@ -38,6 +38,16 @@ as TypeScript uses it.
 
 License: [licenses/vscode-languageserver-node-LICENSE.txt](licenses/vscode-languageserver-node-LICENSE.txt).
 
+## NestJS CLI
+
+Copyright (c) 2017-2025 Kamil Mysliwiec, Thomas Ricart. Licensed under the MIT License.
+
+`npm/typescript-api/test/fixtures/nest-cli-hooks` holds spec fixtures of
+[nestjs/nest-cli](https://github.com/nestjs/nest-cli), copied without change
+([PROVENANCE.md](npm/typescript-api/test/fixtures/nest-cli-hooks/PROVENANCE.md)).
+
+License: [licenses/nest-cli-LICENSE.txt](licenses/nest-cli-LICENSE.txt).
+
 ## Go
 
 Copyright (c) 2009 The Go Authors. Licensed under the BSD 3-Clause License.

@@ -274,7 +274,7 @@ async function runSwaggerSwc(ctx) {
 }
 
 // (f) sample/23-graphql-code-first with the graphql plugin. TS 6.0 turns strict on by default and
-// the sample then has 4 errors (R-nest.md section 9), so the copy sets strict: false.
+// the sample then has 4 errors, so the copy sets strict: false.
 async function runGraphqlSample(ctx) {
     prepareAppDir(path.join(ensureSource("nest"), "sample/23-graphql-code-first"), ctx.appDir);
     const tsconfigFile = appFile(ctx, "tsconfig.json");

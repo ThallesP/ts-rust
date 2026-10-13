@@ -1,6 +1,6 @@
 "use strict";
 
-// Codes whose tsc-rs text dropped words that TS 6.0 users see (R-semantic-gap.md §5): the
+// Codes whose tsc-rs text dropped words that TS 6.0 users see: the
 // TS 6.0 text is used. Neither message has arguments.
 const TS6_TEXT_CODES = new Set([5074, 5090]);
 

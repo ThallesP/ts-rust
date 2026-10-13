@@ -1,9 +1,10 @@
 // Tests for src/flags.js, src/names.js, src/options.js and src/diagnostics.js.
 // Run after `node scripts/build.mjs`: `node --test test/translate.test.mjs`.
-// The tests that drive tsc-rs use target/release/tsgo (TSRS_TSGO) through the TypeScript 7 sync
-// API client (TSRS_TS7_API); the ones that compare with TypeScript 6.0.3 itself unpack the
-// tarball scripts/build.mjs cached (TSRS_TS6 overrides it). Each skips with a reason when its
-// tool is missing.
+// The tests that drive tsc-rs send raw requests (TS7's API, crates/ts_goport/src/api) through this
+// package's own session (src/session.js) and run tsc-rs's command line with bin/tsc, so they need
+// the addon (scripts/build-native.mjs). The ones that compare with TypeScript 6.0.3 itself use the
+// copy scripts/build.mjs unpacks (test/support.mjs). Each skips with a reason when its tool is
+// missing.
 
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
@@ -12,64 +13,59 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { packageDir, repoDir, stockMain as ts6Main, stockSkip as ts6Skip } from "./support.mjs";
 
 const require = createRequire(import.meta.url);
-const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repoDir = path.resolve(packageDir, "../..");
 const ts = require(path.join(packageDir, "lib/typescript.js"));
 const flags = require(path.join(packageDir, "src/flags.js"));
 const names = require(path.join(packageDir, "src/names.js"));
 const { toNativeOptions, toTsOptionDiagnostics, NATIVE_OPTION_NAMES } = require(path.join(packageDir, "src/options.js"));
 const { toTsDiagnostic, toTsDiagnostics } = require(path.join(packageDir, "src/diagnostics.js"));
+const { getSession } = require(path.join(packageDir, "src/session.js"));
+const { addonPath } = require(path.join(packageDir, "src/native/addon.js"));
 
 const rustSource = path.join(repoDir, "crates/ts_goport/src");
-const tsgoPath = process.env.TSRS_TSGO ?? path.join(repoDir, "target/release/tsgo");
-const ts7ApiPath = process.env.TSRS_TS7_API ?? "/work/scratch/ts71/package/dist/api/sync/api.js";
-const nativeSkip = !fs.existsSync(tsgoPath)
-    ? `no tsc-rs binary at ${tsgoPath} (build it or set TSRS_TSGO)`
-    : !fs.existsSync(ts7ApiPath)
-        ? `no TypeScript 7 sync API client at ${ts7ApiPath} (set TSRS_TS7_API)`
-        : false;
-const ts6Main = findTs6Reference();
+const tscPath = path.join(packageDir, "bin/tsc");
+const nativeSkip = fs.existsSync(addonPath()) ? false : `no tsc-rs addon at ${addonPath()} (run scripts/build-native.mjs)`;
 const ts6 = ts6Main === undefined ? undefined : require(ts6Main);
-const ts6Skip = ts6 === undefined ? "no TypeScript 6.0.3 reference (run scripts/build.mjs or set TSRS_TS6)" : false;
-const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-translate-"));
+// With "/" and without links (macOS /var, Windows short names): the names tsc-rs reports.
+const workDir = ts.normalizePath(fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-translate-"))));
 
-let api;
 after(() => {
-    api?.close();
     fs.rmSync(workDir, { recursive: true, force: true });
 });
 
-// The lib/typescript.js of TypeScript 6.0.3 itself.
-function findTs6Reference() {
-    if (process.env.TSRS_TS6) {
-        return require.resolve(process.env.TSRS_TS6);
-    }
-    const tarball = path.join(packageDir, ".cache/typescript-6.0.3.tgz");
-    const dir = path.join(repoDir, "target/typescript-api/ts603");
-    const main = path.join(dir, "package/lib/typescript.js");
-    if (!fs.existsSync(main)) {
-        if (!fs.existsSync(tarball)) {
-            return undefined;
-        }
-        fs.mkdirSync(dir, { recursive: true });
-        execFileSync("tar", ["-xzf", tarball, "-C", dir]);
-    }
-    return main;
+// A tsc-rs snapshot with one project. `request` adds the snapshot and the project to the params;
+// `list` is a request whose answer is a list.
+function openNative(params) {
+    const session = getSession(ts, ts.sys.useCaseSensitiveFileNames, workDir);
+    const { snapshot, projects } = session.request("createSnapshot", { fileNotifications: { invalidateAll: true }, ...params });
+    assert.equal(projects.length, 1);
+    const [project] = projects;
+    const request = (method, args) => session.request(method, { snapshot, project: project.id, ...args });
+    return {
+        compilerOptions: project.compilerOptions,
+        request,
+        list: (method, args) => request(method, args) ?? [],
+        dispose: () => session.request("release", { snapshot }),
+    };
 }
 
-async function getApi() {
-    if (api === undefined) {
-        const { API } = await import(pathToFileURL(ts7ApiPath).href);
-        api = new API({ tsserverPath: tsgoPath, cwd: workDir });
-    }
-    return api;
+function openNativeProject(configPath) {
+    return openNative({ openProjects: [ts.normalizePath(configPath)] });
+}
+
+function createNativeProgram(rootFiles, compilerOptions) {
+    return openNative({ createPrograms: [{ rootFiles: rootFiles.map(file => ts.normalizePath(file)), compilerOptions }] });
+}
+
+function relativeName(dir, fileName) {
+    return path.relative(dir, fileName).replaceAll("\\", "/");
 }
 
 function writeProject(name, files) {
-    const dir = path.join(workDir, name);
+    const dir = `${workDir}/${name}`;
     fs.rmSync(dir, { recursive: true, force: true });
     for (const [file, text] of Object.entries(files)) {
         fs.mkdirSync(path.dirname(path.join(dir, file)), { recursive: true });
@@ -325,7 +321,7 @@ export const ce = class {};
 export * from "./b";
 `;
 
-test("tsc-rs reports the escaped names TS 6.0.3 reports", { skip: nativeSkip || ts6Skip }, async () => {
+test("tsc-rs reports the escaped names TS 6.0.3 reports", { skip: nativeSkip || ts6Skip }, () => {
     const dir = writeProject("names", {
         "a.ts": namesSource,
         "b.ts": "export const fromB = 1;\n",
@@ -333,7 +329,7 @@ test("tsc-rs reports the escaped names TS 6.0.3 reports", { skip: nativeSkip || 
         "tsconfig.json": { compilerOptions: { strict: true, target: "es2022", module: "commonjs", types: [] }, files: ["a.ts", "e.ts"] },
     });
     const ids = name => name.replace(/^__([@#])(.*?)@(\d+)$/, "__$1$2@N").replace(/^__#\d+@/, "__#N@");
-    const native = collectNativeNames(await getApi(), dir);
+    const native = collectNativeNames(dir);
     const reference = collectTs6Names(dir);
     assert.deepEqual(Object.keys(native).sort(), Object.keys(reference).sort());
     for (const [label, list] of Object.entries(reference)) {
@@ -341,30 +337,35 @@ test("tsc-rs reports the escaped names TS 6.0.3 reports", { skip: nativeSkip || 
     }
 });
 
-function collectNativeNames(client, dir) {
-    const config = path.join(dir, "tsconfig.json");
-    const snapshot = client.createSnapshot({ openProject: config });
-    const project = snapshot.getConfiguredProject(config);
-    const checker = project.checker;
-    project.program.getSourceFile(path.join(dir, "a.ts"));
-    const file = checker.getSymbolOfSourceFile(path.join(dir, "a.ts"));
-    const exports = checker.getExportsOfModule(file);
-    const byName = name => exports.find(symbol => symbol.name === name);
-    const escaped = symbols => [...symbols].map(symbol => symbol.escapedName);
-    const result = {
-        fileExports: escaped(file.getExports().values()),
-        classMembers: escaped(byName("C").getMembers().values()),
-        classStatics: escaped(byName("C").getExports().values()),
-        classProperties: escaped(checker.getPropertiesOfType(checker.getDeclaredTypeOfSymbol(byName("C")))),
-        interfaceMembers: escaped(byName("I").getMembers().values()),
-        typeLiteral: escaped([checker.getDeclaredTypeOfSymbol(byName("T")).getSymbol()]),
-        objectLiteral: escaped([checker.getTypeOfSymbol(byName("o")).getSymbol()]),
-        functionExpression: escaped([checker.getTypeOfSymbol(byName("fe")).getSymbol()]),
-        classExpression: escaped([checker.getTypeOfSymbol(byName("ce")).getSymbol()]),
-        exportEquals: escaped(checker.getSymbolOfSourceFile(path.join(dir, "e.ts")).getExports().values()),
-    };
-    snapshot.dispose();
-    return result;
+// A tsc-rs symbol's `name` is its escaped name (TS7's Symbol.escapedName).
+function collectNativeNames(dir) {
+    const native = openNativeProject(path.join(dir, "tsconfig.json"));
+    try {
+        const fileSymbol = name => native.request("getSymbolOfSourceFile", { file: `${dir}/${name}` });
+        const escaped = symbols => symbols.map(symbol => symbol.name);
+        const table = (symbol, method) => escaped(native.list(method, { symbol: symbol.reference }));
+        const declaredType = symbol => native.request("getDeclaredTypeOfSymbol", { symbol: symbol.reference });
+        const typeOf = symbol => native.request("getTypeOfSymbol", { symbol: symbol.reference });
+        const symbolOf = type => native.request("getSymbolOfType", { objectId: type.id });
+        const file = fileSymbol("a.ts");
+        const exports = native.list("getExportsOfModule", { symbol: file.reference });
+        const byName = name => exports.find(symbol => symbol.name === name);
+        return {
+            fileExports: table(file, "getExportsOfSymbol"),
+            classMembers: table(byName("C"), "getMembersOfSymbol"),
+            classStatics: table(byName("C"), "getExportsOfSymbol"),
+            classProperties: escaped(native.list("getPropertiesOfType", { type: declaredType(byName("C")).id })),
+            interfaceMembers: table(byName("I"), "getMembersOfSymbol"),
+            typeLiteral: escaped([symbolOf(declaredType(byName("T")))]),
+            objectLiteral: escaped([symbolOf(typeOf(byName("o")))]),
+            functionExpression: escaped([symbolOf(typeOf(byName("fe")))]),
+            classExpression: escaped([symbolOf(typeOf(byName("ce")))]),
+            exportEquals: table(fileSymbol("e.ts"), "getExportsOfSymbol"),
+        };
+    }
+    finally {
+        native.dispose();
+    }
 }
 
 function collectTs6Names(dir) {
@@ -771,32 +772,31 @@ const optionCases = [
 ];
 
 test("tsconfig cases: tsc-rs program options, option diagnostics and emit follow TS 6.0.3", { skip: nativeSkip }, async t => {
-    const client = await getApi();
     for (const optionCase of optionCases) {
-        await t.test(optionCase.name, () => checkOptionCase(client, optionCase));
+        await t.test(optionCase.name, () => checkOptionCase(optionCase));
     }
 });
 
-function checkOptionCase(client, optionCase) {
+function checkOptionCase(optionCase) {
     const tsconfig = optionCase.tsconfig ?? { compilerOptions: { types: [], ...optionCase.compilerOptions } };
     const dir = writeProject(optionCase.name.replace(/[^\w]+/g, "-"), { "tsconfig.json": tsconfig, ...(optionCase.files ?? { "src/a.ts": plainSource }) });
     const parsed = parseConfig(ts, path.join(dir, "tsconfig.json"));
     assert.deepEqual(parsed.errors, []);
     const translated = toNativeOptions(ts, parsed.options);
-    const program = client.createProgram(parsed.fileNames, translated.options);
+    const program = createNativeProgram(parsed.fileNames, translated.options);
     try {
-        const nativeOptions = program.getCompilerOptions();
+        const nativeOptions = program.compilerOptions;
         for (const [name, value] of Object.entries(optionCase.native(dir))) {
             assert.deepEqual(nativeOptions[name], value, `tsc-rs option ${name}`);
         }
-        const nativeFiles = program.getSourceFileNames();
+        const nativeFiles = program.list("getSourceFileNames");
         for (const lib of optionCase.libFiles ?? []) {
             assert.ok(nativeFiles.includes(`bundled:///libs/${lib}`), `lib ${lib}`);
         }
         const host = formatHost(dir);
         const optionDiagnostics = ts.sortAndDeduplicateDiagnostics([
             ...translated.diagnostics,
-            ...toTsOptionDiagnostics(ts, parsed.options, program.getProgramDiagnostics(), () => undefined),
+            ...toTsOptionDiagnostics(ts, parsed.options, program.list("getProgramDiagnostics"), () => undefined),
         ]);
         assert.deepEqual(optionDiagnostics.map(d => d.code), optionCase.codes ?? []);
         if (ts6 === undefined) {
@@ -825,7 +825,7 @@ const ts6LibFiles = new Map();
 // A TS 6.0.3 compiler host that parses each lib file once for all the cases.
 function createTs6Host(options) {
     const host = ts6.createCompilerHost(options);
-    const libDirectory = path.dirname(ts6Main);
+    const libDirectory = ts6.normalizePath(path.dirname(ts6Main));
     const getSourceFile = host.getSourceFile;
     host.getSourceFile = (fileName, languageVersionOrOptions, ...rest) => {
         if (path.dirname(fileName) !== libDirectory) {
@@ -841,8 +841,8 @@ function createTs6Host(options) {
 }
 
 function assertSameSemanticDiagnostics(program, program6, host) {
-    const files = program.getSourceFileNames().filter(fileName => !fileName.startsWith("bundled:"));
-    const native = files.flatMap(fileName => [...program.getSyntacticDiagnostics(fileName), ...program.getSemanticDiagnostics(fileName)]);
+    const files = program.list("getSourceFileNames").filter(fileName => !fileName.startsWith("bundled:"));
+    const native = files.flatMap(fileName => [...program.list("getSyntacticDiagnostics", { files: [fileName] }), ...program.list("getSemanticDiagnostics", { files: [fileName] })]);
     const sourceFiles = new Map(program6.getSourceFiles().map(file => [file.fileName, file]));
     const diagnostics = ts.sortAndDeduplicateDiagnostics(toTsDiagnostics(ts, native, fileName => sourceFiles.get(fileName)));
     const diagnostics6 = ts6.sortAndDeduplicateDiagnostics(program6.getSourceFiles().flatMap(file => [...program6.getSyntacticDiagnostics(file), ...program6.getSemanticDiagnostics(file)]));
@@ -851,22 +851,21 @@ function assertSameSemanticDiagnostics(program, program6, host) {
 
 function assertSameEmit(program, program6, dir, files) {
     const outputs6 = new Map();
-    program6.emit(undefined, (fileName, text) => outputs6.set(path.relative(dir, fileName), text));
-    const outputs = new Map([...program.emitToString().outputFiles].map(([fileName, output]) => [path.relative(dir, fileName), output.text]));
+    program6.emit(undefined, (fileName, text) => outputs6.set(relativeName(dir, fileName), text));
+    const outputs = new Map(program.request("emitToString", {}).outputFiles.map(output => [relativeName(dir, output.fileName), output.text]));
     for (const file of files) {
         assert.ok(outputs6.has(file), `TS 6.0 emits ${file}`);
         assert.equal(outputs.get(file), outputs6.get(file), `emit of ${file}`);
     }
 }
 
-test("every TS 6.0 lib loads in tsc-rs under its TS 6.0 file name or lib name", { skip: nativeSkip }, async () => {
-    const client = await getApi();
+test("every TS 6.0 lib loads in tsc-rs under its TS 6.0 file name or lib name", { skip: nativeSkip }, () => {
     const dir = writeProject("all-libs", { "a.ts": "export {};\n" });
     const libFiles = [...new Set(ts.libMap.values())];
     const { options } = toNativeOptions(ts, { lib: libFiles, types: [], noEmit: true });
-    const program = client.createProgram([path.join(dir, "a.ts")], options);
+    const program = createNativeProgram([`${dir}/a.ts`], options);
     try {
-        const loaded = new Set(program.getSourceFileNames().filter(name => name.startsWith("bundled:///libs/")).map(name => name.slice("bundled:///libs/".length)));
+        const loaded = new Set(program.list("getSourceFileNames").filter(name => name.startsWith("bundled:///libs/")).map(name => name.slice("bundled:///libs/".length)));
         const missing = libFiles.filter(file => !loaded.has(file) && !loaded.has(file.replace("lib.esnext.", "lib.es2026.")));
         assert.deepEqual(missing, []);
     }
@@ -933,10 +932,8 @@ let r: Promise<number> = Promise.resolve("s");
 };
 
 // The diagnostics tsc-rs's command line reports for a project, as TS 6.0 diagnostics.
-function nativeProjectDiagnostics(client, dir) {
-    const config = path.join(dir, "tsconfig.json");
-    const snapshot = client.createSnapshot({ openProject: config });
-    const program = snapshot.getConfiguredProject(config).program;
+function nativeProjectDiagnostics(dir) {
+    const program = openNativeProject(path.join(dir, "tsconfig.json"));
     const sourceFiles = new Map();
     const getSourceFile = fileName => {
         if (fileName.startsWith("bundled:")) {
@@ -949,40 +946,48 @@ function nativeProjectDiagnostics(client, dir) {
         }
         return sourceFiles.get(fileName);
     };
-    const files = program.getSourceFileNames().filter(fileName => !fileName.startsWith("bundled:"));
-    const responses = [...program.getConfigFileParsingDiagnostics(), ...program.getProgramDiagnostics(), ...files.flatMap(fileName => program.getSyntacticDiagnostics(fileName))];
+    const files = program.list("getSourceFileNames").filter(fileName => !fileName.startsWith("bundled:"));
+    const ofEachFile = method => files.flatMap(fileName => program.list(method, { files: [fileName] }));
+    const responses = [...program.list("getConfigFileParsingDiagnostics"), ...program.list("getProgramDiagnostics"), ...ofEachFile("getSyntacticDiagnostics")];
     if (!responses.some(response => response.category === ts.DiagnosticCategory.Error)) {
-        responses.push(...program.getGlobalDiagnostics(), ...files.flatMap(fileName => program.getSemanticDiagnostics(fileName)));
+        responses.push(...program.list("getGlobalDiagnostics"), ...ofEachFile("getSemanticDiagnostics"));
     }
-    const suggestions = files.flatMap(fileName => program.getSuggestionDiagnostics(fileName));
+    const suggestions = ofEachFile("getSuggestionDiagnostics");
     const diagnostics = ts.sortAndDeduplicateDiagnostics(toTsDiagnostics(ts, responses, getSourceFile));
-    snapshot.dispose();
+    program.dispose();
     return { diagnostics, suggestions: toTsDiagnostics(ts, suggestions, getSourceFile) };
 }
 
+// The output of a command line, with "\n" for the system's new line (TS 6.0's tsc writes "\r\n" on
+// Windows; the diagnostics it is compared with are formatted with "\n").
 function runCli(command, args, cwd) {
+    let output;
     try {
-        return execFileSync(command, args, { cwd, encoding: "utf8" });
+        output = execFileSync(command, args, { cwd, encoding: "utf8" });
     }
     catch (error) {
-        return error.stdout;
+        output = error.stdout;
     }
+    return output.replaceAll("\r\n", "\n");
 }
 
-test("diagnostics print like tsc-rs's command line with --pretty false", { skip: nativeSkip }, async () => {
-    const client = await getApi();
+// tsc-rs's own command line, in a child process through the addon.
+function runTscRs(args, cwd) {
+    return runCli(process.execPath, [tscPath, ...args], cwd);
+}
+
+test("diagnostics print like tsc-rs's command line with --pretty false", { skip: nativeSkip }, () => {
     for (const [name, files] of [["diagnostics-check", diagnosticsSource], ["diagnostics-global", { "a.ts": "const x: number = 1;\n", "tsconfig.json": { compilerOptions: { noLib: true, types: [], noEmit: true }, files: ["a.ts"] } }]]) {
         const dir = writeProject(name, files);
-        const { diagnostics } = nativeProjectDiagnostics(client, dir);
+        const { diagnostics } = nativeProjectDiagnostics(dir);
         assert.ok(diagnostics.length >= 10, name);
-        assert.equal(ts.formatDiagnostics(diagnostics, formatHost(dir)), runCli(tsgoPath, ["-p", ".", "--pretty", "false"], dir), name);
+        assert.equal(ts.formatDiagnostics(diagnostics, formatHost(dir)), runTscRs(["-p", ".", "--pretty", "false"], dir), name);
     }
 });
 
-test("pretty diagnostics print like TS 6.0.3's tsc, and like tsc-rs apart from its related information layout", { skip: nativeSkip || ts6Skip }, async () => {
-    const client = await getApi();
+test("pretty diagnostics print like TS 6.0.3's tsc, and like tsc-rs apart from its related information layout", { skip: nativeSkip || ts6Skip }, () => {
     const dir = writeProject("diagnostics-pretty", diagnosticsSource);
-    const { diagnostics } = nativeProjectDiagnostics(client, dir);
+    const { diagnostics } = nativeProjectDiagnostics(dir);
     const host = formatHost(dir);
     // tsc writes each diagnostic with formatDiagnosticsWithColorAndContext and a new line.
     const ours = diagnostics.map(diagnostic => ts.formatDiagnosticsWithColorAndContext([diagnostic], host) + "\n").join("");
@@ -992,13 +997,12 @@ test("pretty diagnostics print like TS 6.0.3's tsc, and like tsc-rs apart from i
     assert.equal(trimEnd(ours), trimEnd(tsc6));
     // tsc-rs puts a related message on its location line, before the code frame.
     const plain = text => text.replace(/\x1b\[[0-9;]*m/g, "");
-    const tsgo = plain(trimEnd(runCli(tsgoPath, ["-p", ".", "--pretty", "true"], dir)));
+    const tsgo = plain(trimEnd(runTscRs(["-p", ".", "--pretty", "true"], dir)));
     const ts6Layout = plain(trimEnd(ours)).replace(/^( {2}\S+:\d+:\d+)\n((?: {4}.*\n)*) {4}(.*)\n/gm, "$1 - $3\n$2");
     assert.equal(ts6Layout, tsgo);
 });
 
-test("suggestion diagnostics keep reportsUnnecessary and reportsDeprecated like TS 6.0.3's", { skip: nativeSkip || ts6Skip }, async () => {
-    const client = await getApi();
+test("suggestion diagnostics keep reportsUnnecessary and reportsDeprecated like TS 6.0.3's", { skip: nativeSkip || ts6Skip }, () => {
     const dir = writeProject("diagnostics-suggestions", {
         "a.ts": `import { f, g } from "./b";
 const unused = 1;
@@ -1017,7 +1021,7 @@ export const use = gone;
         "b.ts": "export function f() {}\nexport function g() {}\n",
         "tsconfig.json": { compilerOptions: { strict: true, target: "es2022", module: "esnext", types: [], noEmit: true }, files: ["a.ts", "b.ts"] },
     });
-    const { suggestions } = nativeProjectDiagnostics(client, dir);
+    const { suggestions } = nativeProjectDiagnostics(dir);
     const parsed = parseConfig(ts6, path.join(dir, "tsconfig.json"));
     const service = ts6.createLanguageService({
         getCompilationSettings: () => parsed.options,

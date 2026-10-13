@@ -1,6 +1,6 @@
 // Builder programs, incremental programs, TS 6.0's watch API and tsc -b (src/builder.js) over tsc-rs,
-// checked against stock typescript@6.0.3 where it is installed (TS6_STOCK, default
-// /work/scratch/consumers/node_modules/typescript).
+// checked against stock typescript@6.0.3: the copy scripts/build.mjs unpacks (TS6_STOCK names
+// another, test/support.mjs).
 // Run: cd npm/typescript-api && node --test test/builder.test.mjs
 // TSRS_API_CHANNEL=process runs tsc-rs as a `tsgo --api` child process when the addon is not built.
 
@@ -11,12 +11,13 @@ import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 
+import { stockMain, stockSkip } from "./support.mjs";
+
 const require = createRequire(import.meta.url);
 const ts = require("../lib/typescript.js");
 const { NativeProgram } = require("../src/program.js");
-const stockPath = process.env.TS6_STOCK ?? "/work/scratch/consumers/node_modules/typescript";
-const ts6 = fs.existsSync(stockPath) ? require(stockPath) : undefined;
-const needsStock = { skip: ts6 === undefined && `stock typescript@6.0.3 is not at ${stockPath}` };
+const ts6 = stockMain === undefined ? undefined : require(stockMain);
+const needsStock = { skip: stockSkip };
 
 const temporaryDirectories = [];
 after(() => {

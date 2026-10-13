@@ -614,8 +614,8 @@ function loadResults(outDir) {
     return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
-// Settings TS 7 removed that a test passes into the library (R-tests.md section 4 probe), so a
-// loss under tsc-rs semantics can be told from a regression.
+// Settings TS 7 removed that a test passes into the library (ts7-removed.json), so a loss under
+// tsc-rs semantics can be told from a regression.
 function loadRemovedSettings() {
     const file = path.join(HERE, "ts7-removed.json");
     const data = JSON.parse(readText(file) ?? "{}");

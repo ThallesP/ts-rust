@@ -48,7 +48,7 @@ export function prepareCjsFixture(ctx, options) {
     return prepareFixture(ctx, "nest-cjs-paths", options);
 }
 
-// The plugin is the only source of the DTO schema properties (R-nest.md section 9).
+// The plugin is the only source of the DTO schema properties: the checked classes have no @ApiProperty.
 export function checkSchema(ctx, text, schemaName, { required = [], properties = [] }) {
     let schema;
     try {

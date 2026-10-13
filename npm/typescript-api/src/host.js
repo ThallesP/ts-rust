@@ -266,6 +266,25 @@ class HostModuleResolver {
     }
 
     // Resolves the files tsc-rs did not ask about, so that the host sees every file once.
+    // tsc-rs resolves again when a later request rebuilds the program (the emit of files that custom
+    // transformers changed): the host answers those resolutions too while `run` runs.
+    whileResolving(run) {
+        const { program } = this;
+        for (const [nativeFileName, sourceFile] of program.hostSourceFiles) {
+            if (sourceFile !== undefined) {
+                this.addFile(nativeFileName, program.toJsFileName(nativeFileName));
+            }
+        }
+        this.target.resolver = this;
+        try {
+            return run();
+        }
+        finally {
+            this.filesByDirectory.clear();
+            this.target.resolver = undefined;
+        }
+    }
+
     finish(nativeFileNames) {
         for (const nativeFileName of nativeFileNames) {
             if (this.program.hostSourceFiles.has(nativeFileName) && !this.program.moduleResolutions.has(nativeFileName)) {

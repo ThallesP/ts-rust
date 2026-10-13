@@ -25,6 +25,7 @@
     },
     "scripts": {
         "build": "node scripts/build.mjs",
+        "install:consumers": "npm ci --ignore-scripts --no-audit --no-fund --prefix test/consumers",
         "test": "node --test test/*.test.mjs"
     }
 }

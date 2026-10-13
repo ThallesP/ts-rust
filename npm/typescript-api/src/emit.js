@@ -247,6 +247,10 @@ function groupOutputs(program, outputFiles) {
 // The JS of files whose `before` transformers changed them, emitted by tsc-rs from their new text
 // in a snapshot layered over the program's (the same program otherwise).
 function reemitScripts(program, texts) {
+    return program.hostResolver === undefined ? reemitLayered(program, texts) : program.hostResolver.whileResolving(() => reemitLayered(program, texts));
+}
+
+function reemitLayered(program, texts) {
     const { session } = program;
     program.assertNative?.("emit");
     const layered = program.withFileSystem(() =>

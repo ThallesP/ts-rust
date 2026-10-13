@@ -1,6 +1,6 @@
 {
     "tier1": {
-        "description": "First-adoption selection of TS 6.0.3 unit and transpile tests (R-tests.md section 4, rows 1-11)",
+        "description": "First-adoption selection of TS 6.0.3 unit and transpile tests",
         "runners": ["unittest", "transpile"],
         "grep": "^(unittests:: (regExpScannerRecovery|evaluation::|config:: (tsconfigParsing|convertCompilerOptionsFromJson|convertTypeAcquisitionFromJson|matchFiles|configurationExtension)|PrinterAPI|TransformAPI|customTransforms|Public APIs|programApi::|Program\\.|FactoryAPI|builder|jsonParserRecovery|moduleResolution::|services:: (Transpile|PreProcessFile|Colorization|DocumentRegistry|hostNewLineSupport|cancellableLanguageServiceOperations|languageService::))|comment parsing|transpile tests)",
         "shardable": false

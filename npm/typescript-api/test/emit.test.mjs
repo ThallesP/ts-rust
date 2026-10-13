@@ -6,54 +6,26 @@
 // differences named in each test. Source maps are compared by what they point at, or mapping by
 // mapping against TS 6.0's where the plain emit (no transformers) maps alike: tsc-rs maps some
 // lines differently and leaves out `"sourceRoot":""` (TS 7 behavior).
-// The consumer tests (nest-cli's tsconfig-paths hook, @nestjs/swagger, ts-jest) use the installed
-// packages in TSRS_CONSUMERS (default /work/scratch/consumers/node_modules) and nest-cli's spec
-// fixtures in TSRS_NEST_CLI (default /work/scratch/repos/nest-cli); they skip when missing.
+// TypeScript 6.0.3 is the copy scripts/build.mjs unpacks. The consumer tests (nest-cli's
+// tsconfig-paths hook, @nestjs/swagger, ts-jest) use the packages of test/consumers and skip when
+// they are not installed; nest-cli's spec fixtures are in test/fixtures (test/support.mjs).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
+
+import { consumersDir as consumers, consumersSkip, nestCliHookFixtures, packageDir, stockMain as ts6Main, stockSkip as ts6Skip } from "./support.mjs";
 
 const require = createRequire(import.meta.url);
-const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repoDir = path.resolve(packageDir, "../..");
 const ts = require(path.join(packageDir, "lib/typescript.js"));
-const ts6Main = findTs6Reference();
 const ts6 = ts6Main === undefined ? undefined : require(ts6Main);
-const ts6Skip = ts6 === undefined ? "no TypeScript 6.0.3 reference (run scripts/build.mjs or set TSRS_TS6)" : false;
-const consumers = process.env.TSRS_CONSUMERS ?? "/work/scratch/consumers/node_modules";
-const nestCli = process.env.TSRS_NEST_CLI ?? "/work/scratch/repos/nest-cli";
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-emit-"));
-
-function findTs6Reference() {
-    if (process.env.TSRS_TS6) {
-        return require.resolve(process.env.TSRS_TS6);
-    }
-    const tarball = path.join(packageDir, ".cache/typescript-6.0.3.tgz");
-    const dir = path.join(repoDir, "target/typescript-api/ts603");
-    const main = path.join(dir, "package/lib/typescript.js");
-    if (!fs.existsSync(main)) {
-        if (!fs.existsSync(tarball)) {
-            return undefined;
-        }
-        fs.mkdirSync(dir, { recursive: true });
-        execFileSync("tar", ["-xzf", tarball, "-C", dir]);
-    }
-    return main;
-}
-
-function skipUnless(...paths) {
-    if (ts6Skip) {
-        return ts6Skip;
-    }
-    const missing = paths.find(file => !fs.existsSync(file));
-    return missing === undefined ? false : `${missing} is missing`;
-}
+const needsConsumers = ts6Skip || consumersSkip;
 
 // A busy host can refuse a fork once (ENOMEM, EAGAIN): the run is tried again.
 function spawnNode(args, options) {
@@ -154,22 +126,23 @@ const twoFiles = {
 // The swagger test runs first: it starts child processes, before this process grows.
 const swaggerPlugin = path.join(consumers, "@nestjs/swagger/dist/plugin/compiler-plugin.js");
 
-test("@nestjs/swagger's plugin emits the same files as TypeScript 6.0", { skip: skipUnless(swaggerPlugin, path.join(consumers, "@nestjs/common")) }, () => {
+test("@nestjs/swagger's plugin emits the same files as TypeScript 6.0", { skip: needsConsumers }, () => {
     const app = writeFixture({
         "src/cats/dto/create-cat.dto.ts": "import { Role } from '../entities/role.enum';\n\nexport class CreateCatDto {\n  /**\n   * The name of the cat\n   * @example Kitty\n   */\n  name: string;\n  age?: number;\n  tags: string[];\n  role: Role;\n  breed: string | null;\n  readonly createdAt: Date = new Date();\n}\n",
         "src/cats/entities/role.enum.ts": "export enum Role {\n  Admin = 'admin',\n  User = 'user',\n}\n",
         "src/cats/entities/cat.entity.ts": "export class Cat {\n  name: string;\n  age: number;\n  owners?: Cat[];\n}\n",
         "src/cats/cats.controller.ts": "import { Body, Controller, Get, HttpCode, Param, Post } from '@nestjs/common';\nimport { CreateCatDto } from './dto/create-cat.dto';\nimport { Cat } from './entities/cat.entity';\n\n@Controller('cats')\nexport class CatsController {\n  private readonly cats: Cat[] = [];\n\n  /** Create a cat */\n  @Post()\n  @HttpCode(201)\n  async create(@Body() createCatDto: CreateCatDto): Promise<Cat> {\n    const cat = { ...createCatDto, owners: [] } as unknown as Cat;\n    this.cats.push(cat);\n    return cat;\n  }\n\n  @Get(':id')\n  findOne(@Param('id') id: string): Cat {\n    return this.cats[+id];\n  }\n}\n",
     });
-    fs.symlinkSync(consumers, path.join(app, "node_modules"));
+    fs.symlinkSync(consumers, path.join(app, "node_modules"), "junction");
     // @nestjs/swagger imports `typescript` as an ES module: a resolve hook points it at the
     // TypeScript that the run compares.
     fs.writeFileSync(path.join(app, "loader.mjs"), "export async function resolve(specifier, context, next) {\n    if (specifier === \"typescript\") {\n        return { url: process.env.TS_URL, shortCircuit: true, format: \"commonjs\" };\n    }\n    return next(specifier, context);\n}\n");
     fs.writeFileSync(path.join(app, "register.mjs"), "import { register } from \"node:module\";\nregister(\"./loader.mjs\", import.meta.url);\n");
     fs.writeFileSync(path.join(app, "run.mjs"), `import { createRequire } from "node:module";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
-const ts = require(new URL(process.env.TS_URL).pathname);
+const ts = require(fileURLToPath(process.env.TS_URL));
 const plugin = await import(${JSON.stringify(pathToFileURL(swaggerPlugin).href)});
 const app = ${JSON.stringify(app)};
 const files = ["src/cats/cats.controller.ts", "src/cats/dto/create-cat.dto.ts", "src/cats/entities/cat.entity.ts", "src/cats/entities/role.enum.ts"].map(file => path.join(app, file));
@@ -807,15 +780,14 @@ test("a compiler host with an empty current directory gets the output names TS 6
 // The consumers.
 
 const nestHook = path.join(consumers, "@nestjs/cli/lib/compiler/hooks/tsconfig-paths.hook.js");
-const nestFixtures = path.join(nestCli, "test/lib/compiler/hooks/fixtures");
 
-test("nest-cli's tsconfig-paths hook emits the same files as TypeScript 6.0", { skip: skipUnless(nestHook, nestFixtures) }, async () => {
+test("nest-cli's tsconfig-paths hook emits the same files as TypeScript 6.0", { skip: needsConsumers }, async () => {
     const { tsconfigPathsBeforeHookFactory } = await import(pathToFileURL(nestHook).href);
     // The hook loads `typescript` from the current directory.
     const cwdFor = (name, target) => {
         const dir = path.join(workDir, name);
         fs.mkdirSync(path.join(dir, "node_modules"), { recursive: true });
-        fs.symlinkSync(target, path.join(dir, "node_modules/typescript"));
+        fs.symlinkSync(target, path.join(dir, "node_modules/typescript"), "junction");
         return dir;
     };
     const cwds = new Map([[ts6, cwdFor("ts6-cwd", path.resolve(path.dirname(ts6Main), ".."))], [ts, cwdFor("ours-cwd", packageDir)]]);
@@ -837,7 +809,7 @@ test("nest-cli's tsconfig-paths hook emits the same files as TypeScript 6.0", { 
             for (const api of [ts6, ts]) {
                 process.chdir(cwds.get(api));
                 const baseUrl = path.join(workDir, `nest-${outputs.size}-${name}`);
-                fs.cpSync(path.join(nestFixtures, name), baseUrl, { recursive: true });
+                fs.cpSync(path.join(nestCliHookFixtures, name), baseUrl, { recursive: true });
                 const options = { baseUrl, outDir: path.join(baseUrl, "dist"), target: api.ScriptTarget.ESNext, module: api.ModuleKind.CommonJS, stableTypeOrdering: true, types: [], ...extra(api) };
                 const program = api.createProgram({ rootNames: rootNames.map(file => path.join(baseUrl, file)), options });
                 const hook = tsconfigPathsBeforeHookFactory(options);
@@ -992,7 +964,7 @@ test("transpileModule runs custom transformers like TypeScript 6.0", { skip: ts6
 
 const hoistJest = path.join(consumers, "ts-jest/dist/transformers/hoist-jest.js");
 
-test("ts-jest's hoist-jest transformer hoists jest.mock like TypeScript 6.0", { skip: skipUnless(hoistJest) }, () => {
+test("ts-jest's hoist-jest transformer hoists jest.mock like TypeScript 6.0", { skip: needsConsumers }, () => {
     const hoist = require(hoistJest);
     const logger = { child: () => logger, debug() {}, trace() {}, info() {}, warn() {}, wrap: (_level, _message, run) => run };
     const input = "import { sum } from './sum';\nimport { describe, it, expect, jest } from '@jest/globals';\n// mocks\njest.mock('./sum', () => ({ sum: jest.fn(() => 3) }));\ndescribe('sum', () => {\n  it('adds', () => {\n    expect(sum(1, 2)).toBe(3);\n  });\n});\n";

@@ -4,8 +4,8 @@
 //!
 //! A reader that finds the queue empty spins before it sleeps on the
 //! condition variable: a futex wake costs about 28 µs per round trip, where
-//! a spinning reader sees the item in under 1 µs (napi-session probe,
-//! `R-rust-host.md`). It spins for `SPIN` only while most of its recent
+//! a spinning reader sees the item in under 1 µs (measured on Linux x64).
+//! It spins for `SPIN` only while most of its recent
 //! waits on the pipe ended within `SPIN`, else for `SHORT_SPIN`: in
 //! typescript-eslint's rule tests most waits are longer (the JS thread
 //! works between requests, a request checks a file), and a long spin there

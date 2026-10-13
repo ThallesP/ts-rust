@@ -2,45 +2,22 @@
 // snapshots, as tools and TS 6.0's own callers (language service, ts.server.ProjectService) use
 // them. Run after `node scripts/build.mjs`: `node --test test/program.test.mjs`.
 // Differential tests build the same program with TypeScript 6.0.3 itself (`stableTypeOrdering:
-// true`) and compare; TypeScript 6.0.3 comes from the tarball scripts/build.mjs cached (TSRS_TS6
-// overrides it).
+// true`) and compare; TypeScript 6.0.3 is the copy scripts/build.mjs unpacks (test/support.mjs).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
 
-// TEMPORARY: src/index.js installs the hooks only with this set, until root removes the gate.
+import { packageDir, stockMain, stockSkip } from "./support.mjs";
 
 const require = createRequire(import.meta.url);
-const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repoDir = path.resolve(packageDir, "../..");
 const ts = require(path.join(packageDir, "lib/typescript.js"));
-const ts6Main = findTs6Reference();
-const ts6 = ts6Main === undefined ? undefined : require(ts6Main);
-const needsTs6 = { skip: ts6 === undefined ? "no TypeScript 6.0.3 reference (run scripts/build.mjs or set TSRS_TS6)" : false };
+const ts6 = stockMain === undefined ? undefined : require(stockMain);
+const needsTs6 = { skip: stockSkip };
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-program-"));
-
-function findTs6Reference() {
-    if (process.env.TSRS_TS6) {
-        return require.resolve(process.env.TSRS_TS6);
-    }
-    const tarball = path.join(packageDir, ".cache/typescript-6.0.3.tgz");
-    const dir = path.join(repoDir, "target/typescript-api/ts603");
-    const main = path.join(dir, "package/lib/typescript.js");
-    if (!fs.existsSync(main)) {
-        if (!fs.existsSync(tarball)) {
-            return undefined;
-        }
-        fs.mkdirSync(dir, { recursive: true });
-        execFileSync("tar", ["-xzf", tarball, "-C", dir]);
-    }
-    return main;
-}
 
 function writeFixture(name, files) {
     const dir = path.join(workDir, name);

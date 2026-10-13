@@ -1,6 +1,7 @@
 // Triage of a compiler-suite run against TS 7's own baselines (the Go harness at the tsc-rs pin).
 // Entry point: `run.sh triage <out-dir>` (harness.mjs dispatches here). README.md "Triage" documents
 // the classes and every normalization.
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,17 +9,32 @@ import { fileURLToPath } from "node:url";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "../../..");
 const CACHE = path.resolve(process.env.TS6_TESTS_CACHE || path.join(REPO, "target/typescript-api/ts60"));
-const DEFAULT_TS7 = process.env.TS6_TESTS_TS7 || "/work/scratch/repos/ts71/tsc";
+// TS 7's baselines: the paths of microsoft/TypeScript at the tsc-rs pin that triage reads (loadTs7,
+// ts7CaseFor, ts7Baseline), fetched into TS7_CHECKOUT on first use.
+const TS7_PIN = {
+    repo: "https://github.com/microsoft/TypeScript.git",
+    commit: "fed0bf24149fb1ed36039212648bafdafc1ea10e",
+    sparse: [
+        "tsc/internal/testrunner",
+        "tsc/testdata/baselines/reference/compiler",
+        "tsc/testdata/baselines/reference/conformance",
+        "tsc/testdata/tests/cases/compiler",
+        "tsc/testdata/tests/cases/conformance",
+    ],
+};
+const TS7_CHECKOUT = path.join(REPO, "target/typescript-api/ts71-baselines");
+const DEFAULT_TS7 = process.env.TS6_TESTS_TS7 || path.join(TS7_CHECKOUT, "tsc");
 const NO_CONTENT = null;
 
 export const TRIAGE_USAGE = `  triage <out-dir> [--ts7 DIR] [--limit N]
       Classify every failing compiler-suite test of <out-dir> against TS 7's own baseline of the same
       name. DIR is the tsc/ directory of a microsoft/TypeScript checkout at the tsc-rs pin (default
-      ${DEFAULT_TS7}; TS6_TESTS_TS7 overrides). Classes: A equals TS 7; B uses a setting TS 7
+      ${path.relative(REPO, TS7_CHECKOUT)}/tsc, a sparse shallow fetch of ${TS7_PIN.commit.slice(0, 12)} made on first
+      use, about 300 MB; TS6_TESTS_TS7 overrides). Classes: A equals TS 7; B uses a setting TS 7
       removed; C no comparable TS 7 baseline (case removed or changed, variant dropped); D differs
       from TS 7 (a candidate bug). Also lists passing tests whose TS 7 baseline differs from TS 6.0's.
-      Writes <out-dir>/triage.json and <out-dir>/triage.md, nothing else; re-runnable. --limit caps
-      the names listed per D cause in triage.md (default 12, 0 = all).`;
+      Writes <out-dir>/triage.json and <out-dir>/triage.md, besides the default DIR; re-runnable.
+      --limit caps the names listed per D cause in triage.md (default 12, 0 = all).`;
 
 // TS 6.0: src/harness/harnessIO.ts optionRegex (directives of a test case).
 const OPTION_REGEX = /^\/{2}\s*@(\w+)\s*:\s*([^\r\n]*)/gm;
@@ -43,12 +59,13 @@ function readText(file) {
 }
 
 function parseTriageArgs(args) {
-    const options = { ts7: DEFAULT_TS7, limit: 12 };
+    const options = { ts7: DEFAULT_TS7, fetchTs7: !process.env.TS6_TESTS_TS7, limit: 12 };
     const positional = [];
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
         if (arg === "--ts7") {
             options.ts7 = args[++i];
+            options.fetchTs7 = false;
         }
         else if (arg === "--limit") {
             options.limit = Number(args[++i]);
@@ -280,6 +297,32 @@ function variantInCase(caseDirectives, variation) {
 }
 
 // ---- TS 7 checkout ----
+
+function git(cwd, args) {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).trim();
+}
+
+// TS7_CHECKOUT at the pin with the paths of TS7_PIN.sparse; a new checkout replaces a missing or
+// wrong one only when it is complete.
+function ensureTs7Checkout() {
+    if (fs.existsSync(path.join(TS7_CHECKOUT, ".git")) && git(TS7_CHECKOUT, ["rev-parse", "HEAD"]) === TS7_PIN.commit) {
+        if (git(TS7_CHECKOUT, ["sparse-checkout", "list"]) !== TS7_PIN.sparse.join("\n")) {
+            git(TS7_CHECKOUT, ["sparse-checkout", "set", "--cone", ...TS7_PIN.sparse]);
+        }
+        return;
+    }
+    console.log(`triage: fetching TS 7's baselines (${TS7_PIN.repo} at ${TS7_PIN.commit.slice(0, 12)}) into ${path.relative(REPO, TS7_CHECKOUT)}`);
+    const partial = `${TS7_CHECKOUT}.partial`;
+    fs.rmSync(partial, { recursive: true, force: true });
+    fs.mkdirSync(partial, { recursive: true });
+    git(partial, ["init", "-q"]);
+    git(partial, ["remote", "add", "origin", TS7_PIN.repo]);
+    git(partial, ["sparse-checkout", "set", "--cone", ...TS7_PIN.sparse]);
+    git(partial, ["fetch", "-q", "--depth", "1", "--filter=blob:none", "origin", TS7_PIN.commit]);
+    git(partial, ["checkout", "-q", "FETCH_HEAD"]);
+    fs.rmSync(TS7_CHECKOUT, { recursive: true, force: true });
+    fs.renameSync(partial, TS7_CHECKOUT);
+}
 
 function gitCommit(dir) {
     const gitDir = path.join(dir, ".git");
@@ -854,6 +897,9 @@ export function commandTriage(args) {
         .filter(name => name.startsWith("compiler"))
         .sort()
         .map(name => path.join(options.outDir, "ws", name, "tests/baselines/local"));
+    if (options.fetchTs7) {
+        ensureTs7Checkout();
+    }
     const ts7 = loadTs7(options.ts7);
     const context = { ...options, ts7, shardDirs, caseTexts: new Map() };
     const failures = [];

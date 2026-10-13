@@ -4,26 +4,24 @@
 // `stableTypeOrdering: true`, the TS 7 ordering) and by this package, every node of the fixture
 // files is asked the same questions, and the answers must agree except for the TS 7 differences
 // listed with each fixture. TSRS_CHECKER_REPORT=1 prints every compared fact that differs.
-// TypeScript 6.0.3 comes from the tarball scripts/build.mjs cached (TSRS_TS6 overrides it).
+// TypeScript 6.0.3 is the copy scripts/build.mjs unpacks, and the tools are the packages of
+// test/consumers (test/support.mjs).
 
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import v8 from "node:v8";
 import vm from "node:vm";
 import { createRequire } from "node:module";
-import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
+
+import { consumersDir, consumersSkip as consumersMissing, packageDir, stockMain, stockSkip as ts6Skip } from "./support.mjs";
 
 const require = createRequire(import.meta.url);
-const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repoDir = path.resolve(packageDir, "../..");
 const ts = require(path.join(packageDir, "lib/typescript.js"));
-const ts6Main = findTs6Reference();
-const ts6 = ts6Main === undefined ? undefined : require(ts6Main);
-const ts6Skip = ts6 === undefined ? "no TypeScript 6.0.3 reference (run scripts/build.mjs or set TSRS_TS6)" : false;
+const ts6 = stockMain === undefined ? undefined : require(stockMain);
 const report = process.env.TSRS_CHECKER_REPORT === "1";
 const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-checker-"));
 const totals = { facts: 0, agree: 0 };
@@ -33,23 +31,6 @@ after(() => {
         console.log(`all fixtures: ${totals.agree}/${totals.facts} facts agree (${(100 * totals.agree / totals.facts).toFixed(2)}%)`);
     }
 });
-
-function findTs6Reference() {
-    if (process.env.TSRS_TS6) {
-        return require.resolve(process.env.TSRS_TS6);
-    }
-    const tarball = path.join(packageDir, ".cache/typescript-6.0.3.tgz");
-    const dir = path.join(repoDir, "target/typescript-api/ts603");
-    const main = path.join(dir, "package/lib/typescript.js");
-    if (!fs.existsSync(main)) {
-        if (!fs.existsSync(tarball)) {
-            return undefined;
-        }
-        fs.mkdirSync(dir, { recursive: true });
-        execFileSync("tar", ["-xzf", tarball, "-C", dir]);
-    }
-    return main;
-}
 
 function writeFixture(name, files) {
     const dir = path.join(workDir, name);
@@ -568,8 +549,7 @@ test("reads documentation comments and JSDoc tags through the TS 6.0 symbol meth
 });
 
 // Tools from other projects, run unmodified against both checkers.
-const consumersDir = process.env.TSRS_CONSUMERS ?? "/work/scratch/consumers/node_modules";
-const consumersSkip = ts6Skip || (fs.existsSync(path.join(consumersDir, "@typescript-eslint/eslint-plugin")) ? false : `no tool packages at ${consumersDir} (set TSRS_CONSUMERS)`);
+const consumersSkip = ts6Skip || consumersMissing;
 const consumersRequire = createRequire(path.join(consumersDir, "noop.js"));
 
 const lintRules = [
@@ -749,7 +729,7 @@ function runNestPlugin(api, program, before, options, rootNames) {
 
 function nestPrograms(name) {
     const dir = writeFixture(name, nestFiles);
-    fs.symlinkSync(consumersDir, path.join(dir, "node_modules"), "dir");
+    fs.symlinkSync(consumersDir, path.join(dir, "node_modules"), "junction");
     const rootNames = Object.keys(nestFiles).map(file => path.join(dir, file));
     const options = { ...nestOptions, outDir: path.join(dir, "dist"), rootDir: path.join(dir, "src") };
     return {
@@ -760,7 +740,7 @@ function nestPrograms(name) {
 }
 
 test("the NestJS swagger plugin writes the same OpenAPI metadata through this checker", { skip: consumersSkip }, async () => {
-    const { before } = await import(path.join(consumersDir, "@nestjs/swagger/dist/plugin/compiler-plugin.js"));
+    const { before } = await import(pathToFileURL(path.join(consumersDir, "@nestjs/swagger/dist/plugin/compiler-plugin.js")).href);
     const { rootNames, reference, native } = nestPrograms("swagger");
     const options = { introspectComments: true, classValidatorShim: true };
     const expected = runNestPlugin(ts6, reference, before, options, rootNames);
@@ -771,7 +751,7 @@ test("the NestJS swagger plugin writes the same OpenAPI metadata through this ch
 });
 
 test("the NestJS graphql plugin writes the same field metadata through this checker", { skip: consumersSkip }, async () => {
-    const { before } = await import(path.join(consumersDir, "@nestjs/graphql/dist/plugin/compiler-plugin.js"));
+    const { before } = await import(pathToFileURL(path.join(consumersDir, "@nestjs/graphql/dist/plugin/compiler-plugin.js")).href);
     const { rootNames, reference, native } = nestPrograms("graphql");
     const options = { introspectComments: true };
     const expected = runNestPlugin(ts6, reference, before, options, rootNames);

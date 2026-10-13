@@ -176,7 +176,7 @@ const NATIVE_TO_TS6_KIND_NAME = {
     JSDocUnknownTag: "JSDocTag",
 };
 
-// TS 6.0 kinds that tsc-rs parses the same source text to another kind (R-ast-diff.md §1): unknown
+// TS 6.0 kinds that tsc-rs parses the same source text to another kind: unknown
 // JSDoc tags and `#member` names in JSDoc links.
 const TS6_TO_NATIVE_KIND_NAME = {
     EndOfFileToken: "EndOfFile",
@@ -358,7 +358,7 @@ function typeFormatFlagsToNative(flags) {
     return (flags & TS6_TYPE_FORMAT_FLAGS) >>> 0;
 }
 
-// R-ast-diff.md §3. Reparsed (3), HasJSDoc (21), PossiblyContainsDeprecatedTag (26) and
+// TS7 bits with no TS 6.0 bit: Reparsed (3), HasJSDoc (21), PossiblyContainsDeprecatedTag (26) and
 // ReparserTransformedLiteral (28) have no TS 6.0 bit; TS 6.0 Namespace, GlobalAugmentation,
 // HasAggregatedChildData, TypeCached and Deprecated are computed or cached in TS 6.0.
 const NODE_FLAGS = bitTable(
@@ -413,7 +413,7 @@ function nodeFlagsToNative(flags, ts6Kind) {
     return result >>> 0;
 }
 
-// Option enums (R-semantic-gap.md §4). 0 means "not set" in tsc-rs, so TS 6.0 ES3 and
+// Option enums. 0 means "not set" in tsc-rs, so TS 6.0 ES3 and
 // ModuleKind.None have no native value.
 function scriptTargetToNative(target) {
     return target === 0 ? undefined : target;

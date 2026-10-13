@@ -4,7 +4,7 @@ Runs NestJS tooling (`@nestjs/cli` 12.0.8, `@nestjs/swagger` 12.0.2, `@nestjs/gr
 and the other tools that load `typescript` in NestJS projects (webpack with ts-loader and
 fork-ts-checker-webpack-plugin, jest with ts-jest, ts-node) against a `typescript` package
 directory or tarball, and diffs two runs. Entry point:
-`scripts/typescript-api/consumers/nest.sh` (`nest.sh help`). Background: `/work/scratch/research/R-nest.md`.
+`scripts/typescript-api/consumers/nest.sh` (`nest.sh help`).
 
 ```sh
 scripts/typescript-api/consumers/nest.sh run npm/typescript-api/.cache/typescript-6.0.3.tgz target/typescript-api/consumers/nest/runs/stock
