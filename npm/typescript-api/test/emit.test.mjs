@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -123,7 +123,8 @@ const twoFiles = {
     "b.ts": "export const b = 1;\n",
 };
 
-// The swagger test runs first: it starts child processes, before this process grows.
+// The swagger test and the package tests after it run first: they start child processes, before
+// this process grows.
 const swaggerPlugin = path.join(consumers, "@nestjs/swagger/dist/plugin/compiler-plugin.js");
 
 test("@nestjs/swagger's plugin emits the same files as TypeScript 6.0", { skip: needsConsumers }, () => {
@@ -165,6 +166,113 @@ process.stdout.write(JSON.stringify(out));
         const native = run(path.join(packageDir, "lib/typescript.js"), format);
         assert.deepEqual(native, reference, format);
         assert.match(native["dist/cats/dto/create-cat.dto.js"], /_OPENAPI_METADATA_FACTORY/);
+    }
+});
+
+// The package in place of typescript@6.0.3: the files tools load from it and its command lines.
+
+test("the package has TypeScript 6.0's tsserver, typingsInstaller and locale files, and its own lib/tsc.js", { skip: ts6Skip }, () => {
+    const lib = path.join(packageDir, "lib");
+    const stockLib = path.dirname(ts6Main);
+    for (const name of ["tsserver.js", "_tsserver.js", "typingsInstaller.js", "_typingsInstaller.js"]) {
+        assert.ok(fs.readFileSync(path.join(lib, name)).equals(fs.readFileSync(path.join(stockLib, name))), name);
+    }
+    const locales = dir => fs.readdirSync(dir).filter(name => fs.existsSync(path.join(dir, name, "diagnosticMessages.generated.json"))).sort();
+    assert.ok(locales(stockLib).length >= 13);
+    assert.deepEqual(locales(lib), locales(stockLib));
+    for (const locale of locales(lib)) {
+        const messages = name => fs.readFileSync(path.join(name, locale, "diagnosticMessages.generated.json"));
+        assert.ok(messages(lib).equals(messages(stockLib)), locale);
+    }
+    const bins = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).bin;
+    assert.deepEqual(Object.keys(bins).sort(), Object.keys(JSON.parse(fs.readFileSync(path.join(stockLib, "../package.json"), "utf8")).bin).sort());
+    for (const file of Object.values(bins)) {
+        assert.ok(fs.existsSync(path.join(packageDir, file)), file);
+    }
+    // ts.validateLocaleAndSetLanguage changes the messages of the whole process.
+    const script = `const ts = require(${JSON.stringify(path.join(lib, "typescript.js"))});
+const errors = [];
+ts.validateLocaleAndSetLanguage("de", ts.sys, errors);
+process.stdout.write(JSON.stringify([errors.length, ts.flattenDiagnosticMessageText(ts.createCompilerDiagnostic(ts.Diagnostics.File_0_not_found, "x").messageText, "\\n")]));`;
+    const german = spawnNode(["-e", script]);
+    assert.equal(german.status, 0, german.stderr);
+    assert.deepEqual(JSON.parse(german.stdout), [0, "Die Datei \"x\" wurde nicht gefunden."]);
+    // lib/tsc.js runs tsc-rs's command line, as bin/tsc does.
+    const versions = ["lib/tsc.js", "bin/tsc"].map(file => spawnNode([path.join(packageDir, file), "--version"]));
+    for (const version of versions) {
+        assert.equal(version.status, 0, version.stderr);
+    }
+    assert.equal(versions[0].stdout, versions[1].stdout);
+    assert.doesNotMatch(versions[0].stdout, /6\.0\.3/);
+});
+
+// Sends `requests` to a tsserver over its stdio protocol and returns the responses in order.
+function tsserverResponses(script, requests) {
+    const server = spawn(process.execPath, [script, "--disableAutomaticTypingAcquisition"], { stdio: ["pipe", "pipe", "pipe"] });
+    const responses = new Map();
+    let pending = "";
+    let stderr = "";
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => finish(new Error(`tsserver did not answer in time\n${stderr}`)), 60_000);
+        const finish = error => {
+            clearTimeout(timer);
+            server.kill();
+            if (error === undefined) {
+                resolve(requests.map((_, index) => responses.get(index + 1)));
+            }
+            else {
+                reject(error);
+            }
+        };
+        server.stderr.on("data", data => stderr += data);
+        server.on("exit", code => finish(new Error(`tsserver exited (${code})\n${stderr}`)));
+        server.stdout.setEncoding("utf8");
+        server.stdout.on("data", data => {
+            pending += data;
+            const lines = pending.split("\n");
+            pending = lines.pop();
+            for (const line of lines.filter(text => text.startsWith("{"))) {
+                const message = JSON.parse(line);
+                if (message.type === "response") {
+                    responses.set(message.request_seq, message);
+                }
+            }
+            if (responses.size === requests.length) {
+                server.removeAllListeners("exit");
+                finish();
+            }
+        });
+        requests.forEach((request, index) => server.stdin.write(`${JSON.stringify({ seq: index + 1, type: "request", ...request })}\n`));
+    });
+}
+
+test("bin/tsserver runs TypeScript 6.0's server on tsc-rs programs", async () => {
+    const dir = writeFixture({
+        "a.ts": "export const b = 1;\nconst c: string = b;\n",
+        "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, types: [] }, files: ["a.ts"] }),
+    });
+    const file = path.join(dir, "a.ts");
+    const responses = await tsserverResponses(path.join(packageDir, "bin/tsserver"), [
+        { command: "open", arguments: { file } },
+        { command: "quickinfo", arguments: { file, line: 1, offset: 14 } },
+        { command: "semanticDiagnosticsSync", arguments: { file } },
+    ]);
+    assert.deepEqual(responses.map(response => [response.command, response.success, response.message]), [["open", true, undefined], ["quickinfo", true, undefined], ["semanticDiagnosticsSync", true, undefined]]);
+    assert.equal(responses[1].body.displayString, "const b: 1");
+    assert.deepEqual(responses[2].body.map(diagnostic => [diagnostic.code, diagnostic.start]), [[2322, { line: 2, offset: 7 }]]);
+});
+
+test("build-native.mjs runs cargo itself where there is no systemd user session (CI runners)", { skip: process.platform === "win32" ? "the stand-in cargo is a shell script" : false }, () => {
+    const bin = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-cargo-"));
+    fs.writeFileSync(path.join(bin, "cargo"), "#!/bin/sh\necho \"stand-in cargo: $*\" >&2\nexit 3\n", { mode: 0o755 });
+    const withoutSession = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    delete withoutSession.XDG_RUNTIME_DIR;
+    delete withoutSession.DBUS_SESSION_BUS_ADDRESS;
+    delete withoutSession.CI;
+    for (const env of [{ ...withoutSession, CI: "true" }, withoutSession]) {
+        const child = spawnNode([path.join(packageDir, "scripts/build-native.mjs")], { env });
+        assert.notEqual(child.status, 0);
+        assert.match(child.stderr, /^stand-in cargo: build --release -p ts_napi$/m, env.CI ?? "no CI");
     }
 });
 
@@ -479,6 +587,132 @@ test("imports that a before transformer creates are kept even when unused", { sk
         const { reference, native } = emitBoth(files, options, api => [undefined, undefined, false, { before: [addImport(api)] }]);
         assert.deepEqual(texts(native.writes), texts(reference.writes), module);
         assert.match(texts(native.writes)["out/a.dto.js"], /openapi/);
+    }
+});
+
+test("statements that end without a semicolon stay apart when a before transformer adds or moves statements", { skip: ts6Skip }, () => {
+    const files = {
+        "a.ts": "import { b } from './b'\nexport const a = b\nconst f = function () { return [1] }\nif (a) f()\n;[a].forEach(n => n)\n;(() => f())()\nlet g = () => ({})\n",
+        "b.ts": "export const b = (n: number) => n\n",
+    };
+    const append = api => context => sourceFile => context.factory.updateSourceFile(sourceFile, [
+        ...sourceFile.statements,
+        context.factory.createExpressionStatement(context.factory.createParenthesizedExpression(context.factory.createIdentifier("x"))),
+    ]);
+    // In place, as ts-jest's hoist-jest sorts: the statements of the parse tree, last first.
+    const reverse = () => () => sourceFile => {
+        sourceFile.statements.reverse();
+        return sourceFile;
+    };
+    const options = (api, dir) => ({ ...cjs(api, dir), sourceMap: true });
+    const mappings = writes => JSON.parse(writes.find(write => write.fileName === "out/a.js.map").text).mappings.replace(/;+$/, "");
+    for (const before of [[append], [reverse], [reverse, append]]) {
+        const { reference, native } = emitBoth(files, options, api => [undefined, undefined, false, { before: before.map(transformer => transformer(api)) }]);
+        assert.deepEqual(texts(native.writes), texts(reference.writes), String(before.length));
+        if (before.length === 1 && before[0] === append) {
+            // The `;` leaves the map tsc-rs's own of the file (TS 7 maps some names apart from TS 6.0).
+            assert.equal(mappings(native.writes), mappings(emitWith(ts, writeFixture(files), ["a.ts"], options).writes));
+        }
+    }
+    // ts-jest's hoisting through transpileModule.
+    const hoist = api => () => sourceFile => {
+        const isMock = statement => api.isExpressionStatement(statement) && /^jest\.mock\(/.test(statement.getText());
+        sourceFile.statements.sort((left, right) => Number(isMock(right)) - Number(isMock(left)));
+        return sourceFile;
+    };
+    const input = "const a = 1\njest.mock('./foo')\n;[a].forEach(x => console.log(x))\nconst t = a\n`${t}`.trim()\n";
+    const { reference, native } = transpileBoth(input, api => ({ compilerOptions: { module: api.ModuleKind.CommonJS, sourceMap: true }, fileName: "t.ts", transformers: { before: [hoist(api)] } }));
+    assert.equal(native.outputText, reference.outputText);
+    assert.match(native.outputText, /^jest\.mock\('\.\/foo'\);\nconst a = 1;\n\[a\]\.forEach/m);
+});
+
+test("a before transformer that reorders the statements in place is seen on every emit of the file", { skip: ts6Skip }, () => {
+    const files = { "a.test.ts": "import { foo } from './foo';\nfoo();\njest.mock('./foo');\ndeclare const jest: any;\n", "foo.ts": "export function foo() { return 1; }\n" };
+    const hoist = api => () => sourceFile => {
+        const isMock = statement => api.isExpressionStatement(statement) && /^jest\.mock\(/.test(statement.getText());
+        sourceFile.statements.sort((left, right) => Number(isMock(right)) - Number(isMock(left)));
+        return sourceFile;
+    };
+    const run = api => {
+        const dir = writeFixture(files);
+        const fileName = path.join(dir, "a.test.ts");
+        const options = { ...cjs(api, dir), types: [] };
+        const emits = [];
+        const program = api.createProgram([fileName], options);
+        for (let count = 0; count < 2; count++) {
+            program.emit(program.getSourceFile(fileName), (name, text) => name.endsWith(".js") && emits.push(text), undefined, false, { before: [hoist(api)] });
+        }
+        // ts-jest's LanguageService keeps the SourceFile of an unchanged file from one emit to the next.
+        const host = {
+            getScriptFileNames: () => [fileName],
+            getScriptVersion: () => "1",
+            getScriptSnapshot: name => api.sys.fileExists(name) ? api.ScriptSnapshot.fromString(api.sys.readFile(name)) : undefined,
+            getCurrentDirectory: () => dir,
+            getCompilationSettings: () => options,
+            getDefaultLibFileName: compilerOptions => api.getDefaultLibFilePath(compilerOptions),
+            fileExists: api.sys.fileExists,
+            readFile: api.sys.readFile,
+            getCustomTransformers: () => ({ before: [hoist(api)] }),
+        };
+        const service = api.createLanguageService(host, api.createDocumentRegistry());
+        for (let count = 0; count < 2; count++) {
+            emits.push(service.getEmitOutput(fileName).outputFiles.find(output => output.name.endsWith(".js")).text);
+        }
+        return emits;
+    };
+    const native = run(ts);
+    assert.deepEqual(native, run(ts6));
+    assert.equal(native.length, 4);
+    for (const text of native) {
+        assert.match(text, /\njest\.mock\('\.\/foo'\);\nconst foo_1 = require\("\.\/foo"\);\n\(0, foo_1\.foo\)\(\);\n/);
+    }
+});
+
+test("imports whose last use a before transformer removes stay in the output like TS 6.0", { skip: ts6Skip }, () => {
+    const files = {
+        "debug.ts": "export function debug(message: string) { return message; }\nexport const unused = 1;\n",
+        "def.ts": "export default function def() { return 1; }\n",
+        "ns.ts": "export function run() { return 1; }\n",
+        "req.ts": "export function go() { return 1; }\n",
+        "types.ts": "export interface Shape { n: number }\n",
+        "setup.ts": "export function setup() { return 1; }\n",
+    };
+    const source = commonJs => [
+        "import { debug, unused } from './debug';",
+        "import def from './def';",
+        "import * as ns from './ns';",
+        ...commonJs ? ["import req = require('./req');"] : [],
+        "import { Shape } from './types';",
+        "import { setup } from './setup';",
+        "setup();",
+        "debug('x');",
+        "def();",
+        "ns.run();",
+        ...commonJs ? ["req.go();"] : [],
+        "export const a: Shape = { n: 1 };",
+        "",
+    ].join("\n");
+    const strip = api => context => sourceFile => api.visitEachChild(sourceFile, statement => {
+        const callee = api.isExpressionStatement(statement) && api.isCallExpression(statement.expression) ? statement.expression.expression : undefined;
+        const name = callee === undefined ? undefined : api.isPropertyAccessExpression(callee) ? api.idText(callee.name) : api.isIdentifier(callee) ? api.idText(callee) : undefined;
+        return name !== undefined && name !== "setup" ? undefined : statement;
+    }, context);
+    for (const module of ["CommonJS", "ESNext"]) {
+        const commonJs = module === "CommonJS";
+        const options = (api, dir) => ({ ...cjs(api, dir), module: api.ModuleKind[module], esModuleInterop: true, sourceMap: true });
+        const { reference, native } = emitBoth({ ...files, "a.ts": source(commonJs) }, options, api => [undefined, undefined, false, { before: [strip(api)] }], ["a.ts"]);
+        assert.deepEqual(texts(native.writes), texts(reference.writes), module);
+        const output = texts(native.writes)["out/a.js"];
+        if (commonJs) {
+            assert.match(output, /require\("\.\/debug"\)[^]*require\("\.\/def"\)[^]*require\("\.\/ns"\)[^]*require\("\.\/req"\)/);
+        }
+        else {
+            assert.match(output, /^import \{ debug \} from '\.\/debug';\nimport def from '\.\/def';\nimport \* as ns from '\.\/ns';\n/m);
+        }
+        assert.doesNotMatch(output, /types|debug\(|void \[/);
+        const transpiled = transpileBoth(source(commonJs), api => ({ compilerOptions: { module: api.ModuleKind[module], esModuleInterop: true, sourceMap: true }, fileName: "a.ts", transformers: { before: [strip(api)] } }));
+        assert.equal(transpiled.native.outputText, transpiled.reference.outputText, module);
+        assert.match(transpiled.native.outputText, commonJs ? /require\("\.\/debug"\)/ : /import \{ debug \} from '\.\/debug';/);
     }
 });
 

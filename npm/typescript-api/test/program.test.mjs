@@ -6,10 +6,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import v8 from "node:v8";
+import vm from "node:vm";
 
 import { packageDir, stockMain, stockSkip } from "./support.mjs";
 
@@ -973,4 +976,365 @@ test("a host's own default lib with other text is not compiled: tsc-rs's lib fil
     assert.ok(names.includes("/lib/lib.es5.d.ts"));
     assert.ok(!names.includes("/lib/lib.d.ts") || program.getSourceFile("/lib/lib.d.ts").text !== "interface Array<T> {}\n");
     assert.deepEqual(program.getSemanticDiagnostics(), []);
+});
+
+// A compiler host over in-memory files under /virtual, made from ts.createCompilerHost (lib files
+// from disk). `files` can be edited between programs; each call gives a new SourceFile, as a
+// host without a cache does.
+function virtualHost(anyTs, files, overrides = {}) {
+    const base = anyTs.createCompilerHost({});
+    const inside = fileName => fileName.startsWith("/virtual/");
+    return {
+        ...base,
+        getCurrentDirectory: () => "/virtual",
+        useCaseSensitiveFileNames: () => true,
+        fileExists: fileName => (inside(fileName) ? fileName in files : base.fileExists(fileName)),
+        readFile: fileName => (inside(fileName) ? files[fileName] : base.readFile(fileName)),
+        getSourceFile: (fileName, options) => {
+            if (!inside(fileName)) {
+                return base.getSourceFile(fileName, options);
+            }
+            return fileName in files ? anyTs.createSourceFile(fileName, files[fileName], options) : undefined;
+        },
+        directoryExists: directory => directory === "/virtual" || Object.keys(files).some(fileName => fileName.startsWith(`${directory}/`)) || (!inside(directory) && base.directoryExists(directory)),
+        getDirectories: directory => (inside(directory) || directory === "/virtual" ? [] : base.getDirectories(directory)),
+        writeFile: () => {},
+        ...overrides,
+    };
+}
+
+function virtualFiles(program) {
+    return program.getSourceFiles().map(file => file.fileName).filter(fileName => fileName.startsWith("/virtual/"));
+}
+
+test("a host whose fileExists and directoryExists answer with values that are not booleans builds its program, like TypeScript 6.0", needsTs6, () => {
+    // tsc-rs panics (and ends the process) on an answer of the wrong type, so each run is a child process.
+    const script = `
+        const ts = require(process.argv[1]);
+        const files = { "/virtual/main.ts": "import { dep } from './dep';\\nexport const value: number = dep;\\n", "/virtual/dep.ts": "export const dep = 'x';\\n" };
+        const base = ts.createCompilerHost({});
+        const inside = fileName => fileName.startsWith("/virtual/");
+        const host = {
+            ...base,
+            getCurrentDirectory: () => "/virtual",
+            // The text of a file that exists, undefined for one that does not.
+            fileExists: fileName => inside(fileName) ? files[fileName] : base.fileExists(fileName) || undefined,
+            readFile: fileName => inside(fileName) ? files[fileName] : base.readFile(fileName),
+            getSourceFile: (fileName, options) => inside(fileName) ? (files[fileName] === undefined ? undefined : ts.createSourceFile(fileName, files[fileName], options)) : base.getSourceFile(fileName, options),
+            directoryExists: directory => directory === "/virtual" ? 1 : inside(directory) ? 0 : base.directoryExists(directory) ? 1 : 0,
+            getDirectories: () => [],
+        };
+        const program = ts.createProgram(["/virtual/main.ts"], { strict: true, types: [], target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler }, host);
+        const files_ = program.getSourceFiles().map(file => file.fileName).filter(inside);
+        console.log(JSON.stringify({ files: files_, codes: ts.getPreEmitDiagnostics(program).map(diagnostic => diagnostic.code) }));
+    `;
+    const run = main => {
+        const child = spawnSync(process.execPath, ["-e", script, main], { encoding: "utf8", timeout: 60_000 });
+        assert.equal(child.status, 0, child.stderr);
+        return JSON.parse(child.stdout);
+    };
+    const actual = run(path.join(packageDir, "lib/typescript.js"));
+    assert.deepEqual(actual, run(stockMain));
+    assert.deepEqual(actual, { files: ["/virtual/dep.ts", "/virtual/main.ts"], codes: [2322] });
+});
+
+test("a host made by ts.createCompilerHost that gets resolveModuleNames afterwards resolves through it, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const dir = writeFixture(`late-resolver-${anyTs === ts ? "tsrs" : "ts6"}`, {
+            "src/main.ts": "import { lib } from \"virtual-lib\";\nexport const value: number = lib;\n",
+            "vendor/lib.d.ts": "export declare const lib: string;\n",
+        });
+        const options = { strict: true, target: anyTs.ScriptTarget.ES2022, module: anyTs.ModuleKind.ESNext, moduleResolution: anyTs.ModuleResolutionKind.Bundler, noEmit: true, types: [] };
+        const host = anyTs.createCompilerHost(options);
+        let calls = 0;
+        host.resolveModuleNames = (names, containingFile) => {
+            calls++;
+            return names.map(name => name === "virtual-lib"
+                ? { resolvedFileName: path.join(dir, "vendor/lib.d.ts"), extension: anyTs.Extension.Dts }
+                : anyTs.resolveModuleName(name, containingFile, options, host).resolvedModule);
+        };
+        const program = anyTs.createProgram([path.join(dir, "src/main.ts")], options, host);
+        return {
+            calls,
+            files: program.getSourceFiles().map(file => relative(dir, file.fileName)).filter(file => !file.startsWith("lib:")),
+            diagnostics: describeDiagnostics(dir, anyTs.getPreEmitDiagnostics(program)),
+        };
+    };
+    const actual = describe(ts);
+    assert.deepEqual(actual, describe(ts6));
+    assert.deepEqual(actual.files, ["vendor/lib.d.ts", "src/main.ts"]);
+});
+
+test("a program made from an oldProgram finds a file created since for a module name that did not resolve, like TypeScript 6.0", needsTs6, () => {
+    const options = anyTs => ({ strict: true, types: [], target: anyTs.ScriptTarget.ES2022, module: anyTs.ModuleKind.ESNext, moduleResolution: anyTs.ModuleResolutionKind.Bundler });
+    const step = (anyTs, program) => [virtualFiles(program), anyTs.getPreEmitDiagnostics(program).map(diagnostic => diagnostic.code), program.structureIsReused];
+    const describe = anyTs => {
+        const results = {};
+        // The importing file changed; then a created directory; then the host's new SourceFile of an unchanged text.
+        for (const scenario of ["edited", "directory", "unedited"]) {
+            const files = { "/virtual/a.ts": `import { y } from "./${scenario === "directory" ? "lib" : "b"}";\nexport const x: number = y;\n` };
+            const host = virtualHost(anyTs, files);
+            const first = anyTs.createProgram(["/virtual/a.ts"], options(anyTs), host);
+            files[scenario === "directory" ? "/virtual/lib/index.ts" : "/virtual/b.ts"] = "export const y = \"text\";\n";
+            if (scenario !== "unedited") {
+                files["/virtual/a.ts"] += "// edited\n";
+            }
+            results[scenario] = [step(anyTs, first), step(anyTs, anyTs.createProgram(["/virtual/a.ts"], options(anyTs), host, first))];
+        }
+        // A language service whose host versions its files (ts-jest).
+        const texts = new Map([["/virtual/a.ts", "import { y } from \"./b\";\nexport const x: number = y;\n"]]);
+        const versions = new Map();
+        const service = anyTs.createLanguageService({
+            getScriptFileNames: () => ["/virtual/a.ts"],
+            getScriptVersion: fileName => String(versions.get(fileName) ?? 0),
+            getScriptSnapshot: fileName => (texts.has(fileName) ? anyTs.ScriptSnapshot.fromString(texts.get(fileName)) : fileName.startsWith("/virtual/") ? undefined : anyTs.ScriptSnapshot.fromString(anyTs.sys.readFile(fileName))),
+            getCurrentDirectory: () => "/virtual",
+            getCompilationSettings: () => options(anyTs),
+            getDefaultLibFileName: compilerOptions => anyTs.getDefaultLibFilePath(compilerOptions),
+            fileExists: fileName => texts.has(fileName) || (!fileName.startsWith("/virtual/") && anyTs.sys.fileExists(fileName)),
+            readFile: fileName => texts.get(fileName) ?? (fileName.startsWith("/virtual/") ? undefined : anyTs.sys.readFile(fileName)),
+            directoryExists: directory => directory === "/virtual" || anyTs.sys.directoryExists(directory),
+            getDirectories: directory => (directory === "/virtual" ? [] : anyTs.sys.getDirectories(directory)),
+        });
+        const before = service.getSemanticDiagnostics("/virtual/a.ts").map(diagnostic => diagnostic.code);
+        texts.set("/virtual/b.ts", "export const y = \"text\";\n");
+        texts.set("/virtual/a.ts", `${texts.get("/virtual/a.ts")}// edited\n`);
+        versions.set("/virtual/a.ts", 1);
+        results.languageService = [before, service.getSemanticDiagnostics("/virtual/a.ts").map(diagnostic => diagnostic.code), virtualFiles(service.getProgram())];
+        return results;
+    };
+    const actual = describe(ts);
+    assert.deepEqual(actual, describe(ts6));
+    assert.deepEqual(actual.edited[1], [["/virtual/b.ts", "/virtual/a.ts"], [2322], ts.StructureIsReused.SafeModules]);
+    assert.deepEqual(actual.languageService[1], [2322]);
+});
+
+test("a program made from an oldProgram does not look for created files while its unresolved names are ambient modules", () => {
+    const files = {
+        "/virtual/a.ts": "import * as fs from \"fs\";\nexport const x: number = fs.size;\n",
+        "/virtual/fs.d.ts": "declare module \"fs\" { export const size: number; }\n",
+    };
+    let asked = 0;
+    const host = virtualHost(ts, files);
+    const fileExists = host.fileExists;
+    host.fileExists = fileName => {
+        asked++;
+        return fileExists(fileName);
+    };
+    const roots = ["/virtual/a.ts", "/virtual/fs.d.ts"];
+    const options = { strict: true, types: [], target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler };
+    const first = ts.createProgram(roots, options, host);
+    files["/virtual/a.ts"] += "// edited\n";
+    asked = 0;
+    const second = ts.createProgram(roots, options, host, first);
+    // Only TS 6.0's own check of the old program's missing files (the default lib).
+    assert.ok(asked <= 1, `${asked} fileExists calls`);
+    assert.deepEqual(ts.getPreEmitDiagnostics(second), []);
+});
+
+test("a program made from an oldProgram follows a package.json \"type\" that changed, like TypeScript 6.0", needsTs6, () => {
+    const describe = (anyTs, edit) => {
+        const files = { "/virtual/a.ts": "export const u = import.meta.url;\n", "/virtual/package.json": "{\"type\":\"commonjs\"}" };
+        const host = virtualHost(anyTs, files);
+        const options = { strict: true, types: [], target: anyTs.ScriptTarget.ES2022, module: anyTs.ModuleKind.NodeNext, moduleResolution: anyTs.ModuleResolutionKind.NodeNext };
+        const first = anyTs.createProgram(["/virtual/a.ts"], options, host);
+        const describeProgram = program => {
+            const emitted = [];
+            program.emit(undefined, (fileName, text) => emitted.push(text));
+            return [program.getSourceFile("/virtual/a.ts").impliedNodeFormat, anyTs.getPreEmitDiagnostics(program).map(diagnostic => diagnostic.code), program.structureIsReused, emitted];
+        };
+        const before = describeProgram(first);
+        files["/virtual/package.json"] = "{\"type\":\"module\"}";
+        if (edit) {
+            files["/virtual/a.ts"] += "// edited\n";
+        }
+        return [before, describeProgram(anyTs.createProgram(["/virtual/a.ts"], options, host, first))];
+    };
+    for (const edit of [false, true]) {
+        const actual = describe(ts, edit);
+        assert.deepEqual(actual, describe(ts6, edit), `edit ${edit}`);
+        assert.deepEqual(actual[1][1], [], `edit ${edit}`);
+    }
+});
+
+// The snapshots that tsc-rs's createSnapshot and updateSnapshot made and that are not released yet.
+function trackSnapshots(session) {
+    const live = new Set();
+    const requestSync = session.channel.requestSync;
+    session.channel.requestSync = function trackedRequestSync(method, payload) {
+        if (method === "release") {
+            live.delete(JSON.parse(payload).snapshot);
+        }
+        const text = requestSync.call(this, method, payload);
+        if ((method === "createSnapshot" || method === "updateSnapshot") && text) {
+            live.add(JSON.parse(text).snapshot);
+        }
+        return text;
+    };
+    return { live, stop: () => delete session.channel.requestSync };
+}
+
+test("a host callback that throws while tsc-rs creates or updates a snapshot leaves no snapshot behind", () => {
+    const files = { "/virtual/a.ts": "import { b } from \"./b\";\nexport const a = b;\n", "/virtual/b.ts": "export const b = 1;\n" };
+    let failing;
+    const host = virtualHost(ts, files);
+    const getSourceFile = host.getSourceFile;
+    host.getSourceFile = (fileName, options) => {
+        if (fileName === failing) {
+            throw new Error(`EIO reading ${fileName}`);
+        }
+        return getSourceFile(fileName, options);
+    };
+    const options = { types: [] };
+    const first = ts.createProgram(["/virtual/a.ts"], options, host);
+    const tracked = trackSnapshots(first.session);
+    try {
+        failing = "/virtual/b.ts";
+        for (let index = 0; index < 3; index++) {
+            assert.throws(() => ts.createProgram(["/virtual/a.ts"], options, host), /EIO reading \/virtual\/b\.ts/);
+        }
+        assert.equal(tracked.live.size, 0);
+        // An update that reads a new file.
+        failing = "/virtual/c.ts";
+        files["/virtual/c.ts"] = "export const c = 1;\n";
+        files["/virtual/a.ts"] = "import { b } from \"./b\";\nimport \"./c\";\nexport const a = b;\n";
+        for (let index = 0; index < 3; index++) {
+            assert.throws(() => ts.createProgram(["/virtual/a.ts"], options, host, first), /EIO reading \/virtual\/c\.ts/);
+        }
+        assert.equal(tracked.live.size, 0);
+        failing = undefined;
+        const second = ts.createProgram(["/virtual/a.ts"], options, host, first);
+        assert.equal(tracked.live.size, 1);
+        assert.deepEqual(virtualFiles(second), ["/virtual/b.ts", "/virtual/c.ts", "/virtual/a.ts"]);
+    }
+    finally {
+        tracked.stop();
+    }
+});
+
+test("a program whose construction throws keeps no module resolver, and the SourceFiles it read answer from the last good program", () => {
+    const files = { "/virtual/a.ts": "import { y } from \"./b\";\nexport const x = y;\n", "/virtual/b.ts": "export const y = 1;\n" };
+    // A host that keeps its SourceFiles, with its own module resolver.
+    const cache = new Map();
+    let failing = false;
+    const host = virtualHost(ts, files, {
+        getSourceFile(fileName, options) {
+            if (failing && fileName === "/virtual/a.ts") {
+                throw new Error("EIO");
+            }
+            if (!fileName.startsWith("/virtual/")) {
+                return ts.createCompilerHost({}).getSourceFile(fileName, options);
+            }
+            if (!cache.has(fileName)) {
+                cache.set(fileName, ts.createSourceFile(fileName, files[fileName], options, true));
+            }
+            return cache.get(fileName);
+        },
+    });
+    host.resolveModuleNames = (names, containingFile) => names.map(name => ts.resolveModuleName(name, containingFile, {}, host).resolvedModule);
+    const options = { types: [] };
+    const first = ts.createProgram(["/virtual/a.ts"], options, host);
+    const declaration = first.getSourceFile("/virtual/b.ts").statements[0].declarationList.declarations[0];
+    assert.equal(declaration.symbol?.name, "y");
+    const { session } = first;
+    const register = session.registerCallback;
+    const unregister = session.unregisterCallback;
+    let callbacks = 0;
+    session.registerCallback = function countedRegister(...args) {
+        callbacks++;
+        return register.apply(this, args);
+    };
+    session.unregisterCallback = function countedUnregister(...args) {
+        callbacks--;
+        return unregister.apply(this, args);
+    };
+    try {
+        failing = true;
+        cache.delete("/virtual/a.ts");
+        for (let index = 0; index < 5; index++) {
+            assert.throws(() => ts.createProgram(["/virtual/a.ts"], options, host, first), /EIO/);
+        }
+        assert.equal(callbacks, 0);
+    }
+    finally {
+        delete session.registerCallback;
+        delete session.unregisterCallback;
+    }
+    assert.equal(declaration.symbol?.name, "y");
+    assert.equal(first.getTypeChecker().typeToString(first.getTypeChecker().getTypeAtLocation(declaration.name)), "1");
+});
+
+test("the SourceFiles a host keeps do not keep alive the programs that newer programs replaced", async () => {
+    v8.setFlagsFromString("--expose-gc");
+    const gc = vm.runInNewContext("gc");
+    const files = {};
+    const cache = new Map();
+    const host = virtualHost(ts, files, {
+        getSourceFile(fileName, options) {
+            if (!fileName.startsWith("/virtual/")) {
+                return ts.createCompilerHost({}).getSourceFile(fileName, options);
+            }
+            const cached = cache.get(fileName);
+            if (cached?.text === files[fileName]) {
+                return cached;
+            }
+            const sourceFile = ts.createSourceFile(fileName, files[fileName], options);
+            cache.set(fileName, sourceFile);
+            return sourceFile;
+        },
+    });
+    const options = { types: [], target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext };
+    const programs = [];
+    let program;
+    // Each program imports a new module and drops the one before, which the host keeps.
+    for (let index = 0; index < 6; index++) {
+        files["/virtual/main.ts"] = `import { v } from "./m${index}";\nexport const x = v;\n`;
+        files[`/virtual/m${index}.ts`] = `export const v = ${index};\n`;
+        program = ts.createProgram(["/virtual/main.ts"], options, host, program);
+        program.getSemanticDiagnostics();
+        programs.push(new WeakRef(program));
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    for (let round = 0; round < 3; round++) {
+        gc();
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    assert.deepEqual(programs.map(ref => ref.deref() !== undefined), [false, false, false, false, false, true]);
+    assert.deepEqual(virtualFiles(program), ["/virtual/m5.ts", "/virtual/main.ts"]);
+});
+
+test("a module resolver that a ts.server plugin gives its project answers module resolution, like TypeScript 6.0", needsTs6, () => {
+    const describe = anyTs => {
+        const dir = writeFixture(`server-plugin-${anyTs === ts ? "tsrs" : "ts6"}`, {
+            "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, module: "esnext", moduleResolution: "bundler", types: [], plugins: [{ name: "css-plugin" }] }, include: ["src"] }),
+            "src/a.ts": "import styles from \"./button.module.css\";\nexport const name: number = styles.button;\n",
+            "shims/button-css.d.ts": "declare const styles: { button: string };\nexport default styles;\n",
+        });
+        // What typescript-plugin-css-modules does: it replaces the project's resolveModuleNameLiterals.
+        const plugin = ({ typescript }) => ({
+            create(info) {
+                const projectHost = info.languageServiceHost;
+                const resolve = projectHost.resolveModuleNameLiterals.bind(projectHost);
+                projectHost.resolveModuleNameLiterals = (literals, ...rest) => {
+                    const resolutions = resolve(literals, ...rest);
+                    return literals.map((literal, index) => literal.text.endsWith(".module.css")
+                        ? { resolvedModule: { extension: typescript.Extension.Dts, isExternalLibraryImport: false, resolvedFileName: path.join(dir, "shims/button-css.d.ts") } }
+                        : resolutions[index]);
+                };
+                return info.languageService;
+            },
+        });
+        const service = projectService(anyTs);
+        service.host.require = (_directory, name) => (name === "css-plugin" ? { module: plugin, error: undefined } : { module: undefined, error: new Error(`no ${name}`) });
+        const fileName = path.join(dir, "src/a.ts");
+        service.openClientFile(fileName);
+        const project = service.getScriptInfo(fileName).getDefaultProject();
+        return {
+            diagnostics: describeDiagnostics(dir, project.getLanguageService().getSemanticDiagnostics(fileName)),
+            files: project.getCurrentProgram().getSourceFiles().map(file => relative(dir, file.fileName)).filter(file => !file.startsWith("lib:")),
+        };
+    };
+    const actual = describe(ts);
+    assert.deepEqual(actual, describe(ts6));
+    assert.deepEqual(actual.files, ["shims/button-css.d.ts", "src/a.ts"]);
 });

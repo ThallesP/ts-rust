@@ -5,15 +5,18 @@ const path = require("node:path");
 const { useOSAnswer } = require("./session.js");
 
 // Compiler hosts made by ts.createCompilerHost over ts.sys, with the methods they were made with.
-// tsc-rs reads the disk itself for those (it gives the same answers, faster).
+// tsc-rs reads the disk itself for those (it gives the same answers, faster). A host that gets its
+// own files or its own module resolver afterwards answers like any other host.
 const defaultHosts = new WeakMap();
-const hostMethods = ["getSourceFile", "readFile", "fileExists", "directoryExists", "getDirectories", "realpath"];
+const hostMethods = ["getSourceFile", "getSourceFileByPath", "readFile", "fileExists", "directoryExists", "getDirectories", "realpath", "resolveModuleNames", "resolveModuleNameLiterals"];
 const bundledPrefix = "bundled:///";
 const bundledLibs = "bundled:///libs/";
 const bundledLibTexts = new Map();
 
-// The ts.server projects whose updateGraph is running, innermost last.
+// The ts.server projects whose updateGraph is running, innermost last, and the module resolver
+// their class has (TS 6.0's resolution cache).
 const serverProjects = [];
+let serverProjectResolver;
 
 function createCompilerHostWorker(ts, original, options, setParentNodes, system = ts.sys) {
     const host = original(options, setParentNodes, system);
@@ -36,6 +39,7 @@ function installServerProjectTracking(ts) {
         return;
     }
     const updateGraph = project.updateGraph;
+    serverProjectResolver = project.resolveModuleNameLiterals;
     project.updateGraph = function updateGraphTracked(...args) {
         serverProjects.push(this);
         try {
@@ -50,13 +54,19 @@ function installServerProjectTracking(ts) {
 
 // Whether the host's own module resolver answers tsc-rs's module resolution. TS 6.0's resolution
 // cache (ts.server projects, watch programs) only memoizes TS 6.0's standard resolution, so those
-// programs resolve with tsc-rs; a custom resolver (ts-loader, webpack aliases) is called.
+// programs resolve with tsc-rs; a custom resolver (ts-loader, webpack aliases, a language service
+// plugin's) is called.
 function usesHostModuleResolution(host) {
     if (host.resolveModuleNames !== undefined) {
         return true;
     }
-    if (host.resolveModuleNameLiterals === undefined || serverProjects.length !== 0) {
+    if (host.resolveModuleNameLiterals === undefined) {
         return false;
+    }
+    // TS 6.0: src/services/services.ts calls the project's resolveModuleNameLiterals, which a plugin
+    // may replace (on the project or on the class) to resolve names of its own.
+    if (serverProjects.length !== 0) {
+        return serverProjects.at(-1).resolveModuleNameLiterals !== serverProjectResolver;
     }
     // TS 6.0: src/compiler/watchPublic.ts createWatchProgram binds the resolution cache to a ResolutionCacheHost.
     return typeof host.watchDirectoryOfFailedLookupLocation !== "function";
@@ -80,15 +90,28 @@ function fileSystemFor(ts, program) {
     }
     // tsc-rs asks with absolute names; the host gets the names TS 6.0 would use.
     const name = path => program.jsNameOf(path);
+    // What tsc-rs found missing, so that a later program can tell it which of those appeared.
+    const checked = (path, exists, isDirectory) => {
+        if (!exists) {
+            program.noteMissing(path, isDirectory);
+        }
+        return exists;
+    };
+    const read = (path, text) => {
+        if (typeof text !== "string") {
+            program.noteMissing(path, false);
+        }
+        return text;
+    };
     return {
         readFile(path) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
             if (host.getSourceFile !== undefined && (isSourceFileName(ts, path) || program.rootNativeToJs.has(path))) {
-                return program.adoptHostSourceFile(path)?.text;
+                return read(path, program.adoptHostSourceFile(path)?.text);
             }
-            return host.readFile(name(path));
+            return read(path, host.readFile(name(path)));
         },
         fileExists(path) {
             if (path.startsWith(bundledPrefix)) {
@@ -96,16 +119,16 @@ function fileSystemFor(ts, program) {
             }
             // TS 6.0 asks the host for root files with getSourceFile only, not fileExists.
             if (program.rootNativeToJs.has(path) && host.getSourceFile !== undefined) {
-                return program.adoptHostSourceFile(path) !== undefined;
+                return checked(path, program.adoptHostSourceFile(path) !== undefined, false);
             }
-            return host.fileExists(name(path));
+            return checked(path, !!host.fileExists(name(path)), false);
         },
         directoryExists(path) {
             if (path.startsWith(bundledPrefix)) {
                 return useOSAnswer;
             }
             // TS 6.0: src/compiler/moduleNameResolver.ts directoryProbablyExists
-            return host.directoryExists === undefined ? true : host.directoryExists(name(path));
+            return host.directoryExists === undefined ? true : checked(path, !!host.directoryExists(name(path)), true);
         },
         getAccessibleEntries(path) {
             if (path.startsWith(bundledPrefix) || host.getDirectories === undefined) {
@@ -135,6 +158,7 @@ function fileSystemFor(ts, program) {
             if (host.directoryExists?.(name(path))) {
                 return { mode: 0o40755, size: 0, mtime: new Date(0) };
             }
+            program.noteMissing(path, false);
             return undefined;
         },
     };
@@ -159,7 +183,13 @@ class HostModuleResolver {
         const target = { resolver: this };
         this.target = target;
         this.callbackName = program.session.registerCallback("resolveModuleName", params => target.resolver?.resolveForNative(params) ?? null);
-        this.id = program.session.request("createModuleResolver", { compilerOptions: program.nativeOptions, resolveModuleNameCallback: this.callbackName });
+        try {
+            this.id = program.session.request("createModuleResolver", { compilerOptions: program.nativeOptions, resolveModuleNameCallback: this.callbackName });
+        }
+        catch (error) {
+            program.session.unregisterCallback(this.callbackName);
+            throw error;
+        }
     }
 
     addFile(nativeFileName, fileName) {

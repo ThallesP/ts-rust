@@ -572,6 +572,7 @@ class ObjectModel {
         this.signatures = new Map();
         this.nodes = new Map();
         this.declarationSymbols = new WeakMap();
+        this.sharedSymbols = new WeakMap();
         this.parameterSignatures = new WeakMap();
         modelsByChecker.set(checker, this);
     }
@@ -614,8 +615,9 @@ class ObjectModel {
     // and also when it was parsed before the node prototype had the field. A language service or a
     // ts.server project shares unchanged SourceFiles between its programs, so the field asks the
     // newest live program of the node's file: a field bound to this program would keep it, and its
-    // tsc-rs snapshot, alive and answer from it after newer programs. A file no program shares
-    // (shadowSourceFile) gets this one's.
+    // tsc-rs snapshot, alive and answer from it after newer programs. The checkers of the other
+    // programs that have the file take that symbol as their own (symbolOfSharedDeclaration). A file
+    // no program shares (shadowSourceFile) gets this one's.
     withSymbolField(node) {
         if (node === undefined) {
             return undefined;
@@ -826,10 +828,37 @@ class ObjectModel {
 
     symbolReference(symbol) {
         const native = this.classes.NativeSymbol.native(symbol);
-        if (native === undefined || native.model !== this) {
+        if (native !== undefined && native.model === this) {
+            return native.data.reference;
+        }
+        const own = native === undefined ? undefined : this.symbolOfSharedDeclaration(symbol);
+        if (own === undefined) {
             throw new Error("tsc-rs: the symbol does not come from this type checker");
         }
-        return native.data.reference;
+        return this.symbolReference(own);
+    }
+
+    // A symbol of another checker whose declaration is in a SourceFile this program has too. The
+    // `symbol` of a declaration in a file that programs share comes from the newest of them
+    // (installNodeSymbols), while TS 6.0's binder symbol is one object that every program's checker
+    // takes (getMergedSymbol(sourceFile.symbol) in forEachExternalModule): it stands for this
+    // checker's symbol of the declaration.
+    symbolOfSharedDeclaration(symbol) {
+        if (this.sharedSymbols.has(symbol)) {
+            return this.sharedSymbols.get(symbol);
+        }
+        let own;
+        if ((symbol.flags & this.ts.SymbolFlags.Transient) === 0) {
+            for (const declaration of symbol.declarations ?? []) {
+                const candidate = this.program.nodeToHandle(declaration) === undefined ? undefined : this.symbolOfNode(declaration);
+                if (candidate !== undefined && candidate.escapedName === symbol.escapedName) {
+                    own = candidate;
+                    break;
+                }
+            }
+        }
+        this.sharedSymbols.set(symbol, own);
+        return own;
     }
 
     signatureId(signature) {

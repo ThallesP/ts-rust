@@ -1,12 +1,4 @@
 #!/usr/bin/env node
 "use strict";
 
-const { runTsc } = require("../src/tsc.js");
-
-try {
-    process.exitCode = runTsc(process.argv.slice(2));
-}
-catch (error) {
-    process.stderr.write(`tsc: ${error instanceof Error ? error.message : String(error)}\n`);
-    process.exitCode = 1;
-}
+require("../src/tsc.js").main(process.argv.slice(2));

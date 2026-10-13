@@ -4,8 +4,10 @@
 // usage: node scripts/build-native.mjs [--no-build] [--profile <name>]
 //        node scripts/build-native.mjs help
 // --no-build copies the library that is already built. --profile picks a Cargo profile (default
-// release). On Linux with systemd the build runs through scripts/run-cargo-capped.sh (TS_CARGO_JOBS
-// defaults to 6 here); elsewhere it runs cargo directly. CARGO_TARGET_DIR is honored when it is set.
+// release). On a Linux host with a systemd user session the build runs through
+// scripts/run-cargo-capped.sh (TS_CARGO_JOBS defaults to 6 here); on CI runners (CI is set), which
+// have systemd-run but no user session, and elsewhere it runs cargo directly. CARGO_TARGET_DIR is
+// honored when it is set.
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -47,13 +49,18 @@ function build(profile) {
     const profileArgs = profile === "release" ? ["--release"] : ["--profile", profile];
     const cargoArgs = ["build", ...profileArgs, "-p", "ts_napi"];
     const env = { ...process.env, TS_CARGO_JOBS: process.env.TS_CARGO_JOBS ?? "6" };
-    const capped = process.platform === "linux" && spawnSync("systemd-run", ["--version"]).status === 0;
+    const capped = process.platform === "linux" && !process.env.CI && hasUserSession();
     const result = capped
         ? spawnSync("bash", [path.join(repoDir, "scripts", "run-cargo-capped.sh"), ...cargoArgs], { cwd: repoDir, env, stdio: "inherit" })
         : spawnSync("cargo", cargoArgs, { cwd: repoDir, env, stdio: "inherit" });
     if (result.status !== 0) {
         throw new Error(`cargo ${cargoArgs.join(" ")} failed (${result.error?.message ?? `exit ${result.status}`})`);
     }
+}
+
+// scripts/run-cargo-capped.sh runs the build in a `systemd-run --user --scope`.
+function hasUserSession() {
+    return spawnSync("systemd-run", ["--user", "--scope", "--quiet", "--collect", "true"], { stdio: "ignore" }).status === 0;
 }
 
 function libraryName() {

@@ -11,4 +11,15 @@ function runTsc(args) {
     return loadAddon().runTsc(args);
 }
 
-module.exports = { runTsc };
+// bin/tsc and lib/tsc.js: runs `args` and sets the exit code.
+function main(args) {
+    try {
+        process.exitCode = runTsc(args);
+    }
+    catch (error) {
+        process.stderr.write(`tsc: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exitCode = 1;
+    }
+}
+
+module.exports = { runTsc, main };

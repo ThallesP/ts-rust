@@ -11,10 +11,17 @@
 //! messages, then gives the thread back (`MemoryConn::read`), and the next
 //! request runs it again (`Command::Work`).
 //!
+//! A callback of one session may make a request to another session. The
+//! thread waits in the first session's callback then, so the JS thread wakes
+//! that wait (`wake_waiting`) and the thread runs the other session inside
+//! it (`SessionThread::run_queued`), as it runs a nested request of the same
+//! session (ts#64299).
+//!
 //! Everything `Rc` of a session lives on that thread. The JS thread holds
 //! only the pipes.
 
 use std::any::Any;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -222,6 +229,32 @@ fn session_thread() -> std::io::Result<Arc<Pipe<Command>>> {
     Ok(commands)
 }
 
+/// Tells the session thread, which waits in a callback of the session that
+/// reads `input`, to run the commands queued meanwhile: the callback made a
+/// request to another session. An empty chunk is the signal; the JS thread
+/// sends only frames, which are never empty.
+pub fn wake_waiting(input: &FramePipe) {
+    let _ = input.send(Vec::new());
+}
+
+/// The state of the session thread.
+struct SessionThread {
+    commands: Arc<Pipe<Command>>,
+    ctx: Context,
+    sessions: RefCell<HashMap<u64, Hosted>>,
+    /// The sessions whose connection runs now, the inner one last. Each
+    /// reads its own input; a `Work` for one of them is old.
+    running: RefCell<Vec<u64>>,
+}
+
+thread_local! {
+    /// The session thread's state, on the session thread.
+    static CURRENT: RefCell<Option<Rc<SessionThread>>> = const { RefCell::new(None) };
+    /// The messages that run now on this thread, in all its sessions. The
+    /// frees wait until the outer one ends (`FreeAfterMessage`).
+    static MESSAGES: Cell<u32> = const { Cell::new(0) };
+}
+
 /// The session thread: opens sessions and runs their messages, until it
 /// retires.
 fn run_sessions(commands: &Arc<Pipe<Command>>) {
@@ -230,9 +263,28 @@ fn run_sessions(commands: &Arc<Pipe<Command>>) {
     ThreadBudget::one_program(1).install();
     ts_goport::gostd::local::keep_garbage();
     ts_goport::ast::free_released_versions_in_background();
-    let ctx = context::background();
-    let mut sessions: HashMap<u64, Hosted> = HashMap::new();
+    let thread = Rc::new(SessionThread {
+        commands: commands.clone(),
+        ctx: context::background(),
+        sessions: RefCell::new(HashMap::new()),
+        running: RefCell::new(Vec::new()),
+    });
+    CURRENT.with(|current| *current.borrow_mut() = Some(thread.clone()));
     while let Ok(command) = commands.pop() {
+        if thread.run_command(command)
+            && thread.sessions.borrow().is_empty()
+            && ts_goport::ast::synthetic_live_slot_count() > RETIRE_SYNTHETIC_NODES
+        {
+            CURRENT.with(|current| current.borrow_mut().take());
+            retire(commands);
+            return;
+        }
+    }
+}
+
+impl SessionThread {
+    /// Runs one command. True when a session ended.
+    fn run_command(&self, command: Command) -> bool {
         let id = match command {
             Command::Start {
                 id,
@@ -241,11 +293,11 @@ fn run_sessions(commands: &Arc<Pipe<Command>>) {
                 output,
             } => {
                 let opened = catch_unwind(AssertUnwindSafe(|| {
-                    open(&ctx, &config, input.clone(), output.clone())
+                    open(&self.ctx, &config, input.clone(), output.clone())
                 }));
                 match opened {
                     Ok(Ok(hosted)) => {
-                        sessions.insert(id, hosted);
+                        self.sessions.borrow_mut().insert(id, hosted);
                     }
                     Ok(Err(err)) => end_pipes(&input, &output, &err.error()),
                     Err(payload) => end_pipes(&input, &output, &panic_text(payload.as_ref())),
@@ -256,26 +308,62 @@ fn run_sessions(commands: &Arc<Pipe<Command>>) {
             }
             Command::Work(id) => id,
         };
-        let Some(hosted) = sessions.get(&id) else {
-            continue;
-        };
-        let ended = match catch_unwind(AssertUnwindSafe(|| hosted.conn.run(&ctx))) {
-            Ok(Ok(())) if !hosted.input.is_finished() => None,
-            Ok(Ok(())) => Some("the session ended".to_string()),
-            Ok(Err(err)) => Some(err.error()),
-            Err(payload) => Some(panic_text(payload.as_ref())),
-        };
-        if let Some(reason) = ended
-            && let Some(hosted) = sessions.remove(&id)
-        {
-            hosted.finish(&ctx, &reason);
-            if sessions.is_empty()
-                && ts_goport::ast::synthetic_live_slot_count() > RETIRE_SYNTHETIC_NODES
-            {
-                retire(commands);
-                return;
-            }
+        self.run(id)
+    }
+
+    /// Runs the messages of session `id` until its input is empty. True
+    /// when the session ended.
+    fn run(&self, id: u64) -> bool {
+        if self.running.borrow().contains(&id) {
+            return false;
         }
+        let Some((conn, input)) = self
+            .sessions
+            .borrow()
+            .get(&id)
+            .map(|hosted| (hosted.conn.clone(), hosted.input.clone()))
+        else {
+            return false;
+        };
+        self.running.borrow_mut().push(id);
+        let result = catch_unwind(AssertUnwindSafe(|| conn.run(&self.ctx)));
+        self.running.borrow_mut().pop();
+        drop(conn);
+        let reason = match result {
+            Ok(Ok(())) if !input.is_finished() => return false,
+            Ok(Ok(())) => "the session ended".to_string(),
+            Ok(Err(err)) => err.error(),
+            Err(payload) => panic_text(payload.as_ref()),
+        };
+        let Some(hosted) = self.sessions.borrow_mut().remove(&id) else {
+            return false;
+        };
+        hosted.finish(&self.ctx, &reason);
+        true
+    }
+
+    /// Runs the commands queued now, inside the wait of a session for its
+    /// callback (`wake_waiting`).
+    fn run_queued(&self) {
+        while let Some(Ok(command)) = self.commands.pop_now() {
+            self.run_command(command);
+        }
+    }
+}
+
+/// `SessionThread::run_queued` on the session thread.
+fn run_queued() {
+    let thread = CURRENT.with(|current| current.borrow().clone());
+    if let Some(thread) = thread {
+        thread.run_queued();
+    }
+}
+
+/// Runs the frees that the messages left, when no message runs on this
+/// thread.
+fn drop_garbage_between_messages() {
+    if MESSAGES.get() == 0 {
+        ts_goport::gostd::local::drop_garbage(|| false);
     }
 }
 
@@ -437,7 +525,9 @@ impl Hosted {
         drop(conn);
         drop(session);
         drop(callback_fs);
-        ts_goport::gostd::local::drop_garbage(|| false);
+        // A session can end inside another session's message
+        // (`SessionThread::run_queued`), whose data the frees may hold.
+        drop_garbage_between_messages();
         end_pipes(&input, &output, reason);
     }
 }
@@ -458,8 +548,9 @@ impl Spawner for OsSystemSpawner {
 }
 
 /// The handler of `api::server` (`FreeAfterMessage`, private there): runs
-/// the frees that a message leaves when the top-level message ends.
-/// `depth` counts the messages that run now; the connection reads it.
+/// the frees that a message leaves when the top-level message of the thread
+/// ends. `depth` counts the messages of this session that run now; the
+/// connection reads it.
 struct FreeAfterMessage {
     inner: Rc<dyn Handler>,
     depth: Arc<AtomicU32>,
@@ -468,6 +559,7 @@ struct FreeAfterMessage {
 impl FreeAfterMessage {
     fn enter(&self) -> MessageGuard<'_> {
         self.depth.fetch_add(1, Ordering::Relaxed);
+        MESSAGES.set(MESSAGES.get() + 1);
         MessageGuard(&self.depth)
     }
 }
@@ -476,9 +568,9 @@ struct MessageGuard<'a>(&'a AtomicU32);
 
 impl Drop for MessageGuard<'_> {
     fn drop(&mut self) {
-        if self.0.fetch_sub(1, Ordering::Relaxed) == 1 {
-            ts_goport::gostd::local::drop_garbage(|| false);
-        }
+        self.0.fetch_sub(1, Ordering::Relaxed);
+        MESSAGES.set(MESSAGES.get() - 1);
+        drop_garbage_between_messages();
     }
 }
 
@@ -550,7 +642,8 @@ const LARGE_WRITE: usize = 4096;
 /// thread, `output` gets the frames for it, one push per flush. Between two
 /// messages (`depth` 0) an empty input reads as the end, so the
 /// connection's run returns and the thread can run other sessions; inside a
-/// message (a callback waits for its answer) a read waits.
+/// message (a callback waits for its answer) a read waits, and runs the
+/// queued commands when `wake_waiting` signals.
 struct MemoryConn {
     input: Arc<FramePipe>,
     output: Arc<FramePipe>,
@@ -589,6 +682,7 @@ impl ReadWriteCloser for MemoryConn {
                 self.input.pop()
             };
             match next {
+                Ok(next) if next.is_empty() => run_queued(),
                 Ok(next) => {
                     *chunk = next;
                     *pos = 0;

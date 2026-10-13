@@ -9,16 +9,20 @@ const { syntaxKindToNative, syntaxKindToTs6 } = require("./flags.js");
 
 const bundledLibs = "bundled:///libs/";
 const maxCachedPaths = 65536;
+// Past this many, the paths tsc-rs found missing are forgotten and it reads everything again.
+const maxMissingProbes = 131072;
 
-// The newest program that gave out each SourceFile. A language service or a ts.server project
+// The programs that have each SourceFile, newest last. A language service or a ts.server project
 // shares unchanged SourceFiles between its programs, as TS 6.0 does, and an older program's
-// compiler state can be released (see NativeProgram). No WeakRef: one keeps its program alive
-// until the end of the current job, and a synchronous loop of programs would keep them all.
+// compiler state can be released (see NativeProgram). A program leaves these lists when a program
+// made from it replaces it, so that the SourceFiles a host keeps do not keep old programs (and their
+// tsc-rs snapshots) alive. No WeakRef: one keeps its program alive until the end of the current job,
+// and a synchronous loop of programs would keep them all.
 const programsOfSourceFiles = new WeakMap();
 
 function programOfSourceFile(sourceFile) {
-    const program = programsOfSourceFiles.get(sourceFile);
-    return program === undefined || program.released ? undefined : program;
+    const programs = programsOfSourceFiles.get(sourceFile);
+    return programs?.findLast(program => !program.released);
 }
 
 // Native state a program holds: its snapshot and, with a custom module resolver, the resolver.
@@ -42,9 +46,11 @@ function releaseNativeState(native) {
     if (--lineage.programs === 0) {
         session.adjustExternalMemory(-lineage.externalMemory);
     }
-    session.request("release", { snapshot });
     if (resolver !== undefined) {
         session.unregisterCallback(resolver.callbackName);
+    }
+    session.request("release", { snapshot });
+    if (resolver !== undefined) {
         session.request("releaseModuleResolver", { resolver: resolver.id });
     }
 }
@@ -89,6 +95,7 @@ function createProgram(ts, rootNamesOrOptions, options, host, oldProgram, config
 // A program made from an oldProgram of this session updates the old snapshot with the files whose
 // text changed instead of reading every file again. A program releases its snapshot when it is
 // garbage collected; it tells V8 about the snapshot's memory, so that collections come often enough.
+// A program whose construction throws releases what it made at once.
 class NativeProgram {
     constructor(ts, { rootNames, options, projectReferences, host, oldProgram, configFileParsingDiagnostics, typeScriptVersion }) {
         // TS 6.0's program members are closures, and TS 6.0 passes some around unbound
@@ -115,6 +122,7 @@ class NativeProgram {
         this.usesDefaultHost = isDefaultHost(this.host);
         this.fileSystem = fileSystemFor(ts, this);
         this.released = false;
+        this.constructed = false;
         this.structureIsReused = ts.StructureIsReused.Not;
         this.rootNativeToJs = new Map();
         this.hostSourceFiles = new Map();
@@ -133,6 +141,9 @@ class NativeProgram {
         this.nativeDiagnostics = new Map();
         this.checker = undefined;
         this.moduleResolutionCache = undefined;
+        // Native path -> whether it is a directory, for what tsc-rs found missing through the host
+        // (see createdFiles); shared with the programs updated from this one.
+        this.missingProbes = new Map();
 
         const nativeOptions = toNativeOptions(ts, options, { currentDirectory: this.nativeDirectory, typeScriptVersion });
         // TS 6.0: src/compiler/program.ts useSourceOfProjectReferenceRedirect. A program compiles the
@@ -148,23 +159,34 @@ class NativeProgram {
             return nativeName;
         });
         this.checkDefaultLib();
-        this.hostResolver = this.fileSystem !== undefined && usesHostModuleResolution(this.host) ? new HostModuleResolver(this) : undefined;
-
         // TS 6.0: src/compiler/program.ts shouldProgramCreateNewSourceFiles
         this.shouldCreateNewSourceFile = previous !== undefined && ts.optionsHaveChanges(previous.options, options, ts.sourceFileAffectingCompilerOptions);
         const base = previous !== undefined && !previous.released && previous.usesDefaultHost === this.usesDefaultHost ? previous : undefined;
+        this.hostResolver = this.fileSystem !== undefined && usesHostModuleResolution(this.host) ? new HostModuleResolver(this) : undefined;
+        try {
+            this.build(previous, base);
+        }
+        catch (error) {
+            this.abandon();
+            throw error;
+        }
+        this.constructed = true;
+        this.joinSourceFiles();
+        if (oldProgram instanceof NativeProgram) {
+            oldProgram.leaveSourceFiles();
+        }
+    }
+
+    build(previous, base) {
         // TS 6.0 asks the host for referenced project configs while it builds the program.
         this.getResolvedProjectReferences();
         const changes = base === undefined ? undefined : this.changesFrom(base);
-        try {
-            const response = this.withFileSystem(() => base === undefined ? this.createSnapshot() : this.updateSnapshot(base, changes));
-            this.snapshot = response.snapshot;
-            this.project = base === undefined ? response.operation.createdPrograms[0] : base.project;
+        if (changes !== undefined && !changes.invalidateAll) {
+            this.missingProbes = base.missingProbes;
         }
-        catch (error) {
-            this.hostResolver?.release();
-            throw error;
-        }
+        const response = this.withFileSystem(() => base === undefined ? this.createSnapshot() : this.updateSnapshot(base, changes));
+        this.snapshot = response.snapshot;
+        this.project = base === undefined ? response.operation.createdPrograms[0] : base.project;
         const lineage = base?.native.lineage ?? { programs: 0, externalMemory: 0 };
         lineage.programs++;
         this.native = { session: this.session, snapshot: this.snapshot, resolver: this.hostResolver?.nativeHandle(), externalMemory: 0, lineage };
@@ -190,6 +212,61 @@ class NativeProgram {
         if (previous !== undefined) {
             this.releaseOldSourceFiles(previous);
         }
+    }
+
+    // What a program whose construction failed made in tsc-rs is released, and its SourceFiles do not
+    // name it (programOfSourceFile).
+    abandon() {
+        this.released = true;
+        if (this.hostResolver !== undefined) {
+            this.hostResolver.target.resolver = undefined;
+        }
+        if (this.native !== undefined) {
+            releaseNative.unregister(this.native);
+            attempt(() => releaseNativeState(this.native));
+            return;
+        }
+        if (this.hostResolver !== undefined) {
+            attempt(() => this.hostResolver.release());
+        }
+        if (this.snapshot !== undefined) {
+            attempt(() => this.session.request("release", { snapshot: this.snapshot }));
+        }
+    }
+
+    // The program's SourceFiles name it (programOfSourceFile) once it is built.
+    joinSourceFiles() {
+        for (const [nativeFileName, sourceFile] of this.hostSourceFiles) {
+            if (sourceFile !== undefined && this.nativeFileNameSet.has(nativeFileName)) {
+                this.joinSourceFile(sourceFile);
+            }
+        }
+        for (const sourceFile of this.sourceFiles.values()) {
+            this.joinSourceFile(sourceFile);
+        }
+    }
+
+    joinSourceFile(sourceFile) {
+        let programs = programsOfSourceFiles.get(sourceFile);
+        if (programs === undefined) {
+            programs = [];
+            programsOfSourceFiles.set(sourceFile, programs);
+        }
+        if (programs.at(-1) !== this) {
+            removeItem(programs, this);
+            programs.push(this);
+        }
+    }
+
+    leaveSourceFiles() {
+        const leave = sourceFile => {
+            const programs = sourceFile === undefined ? undefined : programsOfSourceFiles.get(sourceFile);
+            if (programs !== undefined) {
+                removeItem(programs, this);
+            }
+        };
+        this.hostSourceFiles.forEach(leave);
+        this.sourceFiles.forEach(leave);
     }
 
     reportExternalMemory(base, changes) {
@@ -268,7 +345,7 @@ class NativeProgram {
         return this.session.request("updateSnapshot", {
             snapshot: base.snapshot,
             changes: {
-                fileNotifications: changes.invalidateAll ? { invalidateAll: true } : { changed: changes.changed },
+                fileNotifications: changes.invalidateAll ? { invalidateAll: true } : fileChanges(changes),
                 reconfigurePrograms: [{ id: base.project, ...this.programParams() }],
             },
         });
@@ -278,20 +355,32 @@ class NativeProgram {
     // the old program; the files whose text changed are the ones tsc-rs reads again. Programs that
     // read the disk do not know what changed, so tsc-rs reads every file again.
     changesFrom(base) {
-        const changes = { invalidateAll: this.fileSystem === undefined, changed: [], unchanged: [], fileRemoved: false, resolutionsInvalidated: false };
+        const changes = { invalidateAll: this.fileSystem === undefined, changed: [], created: [], unchanged: [], fileRemoved: false, resolutionsInvalidated: false, formatChanged: false };
         if (changes.invalidateAll) {
             return changes;
         }
         const hasInvalidatedResolutions = this.host.hasInvalidatedResolutions;
+        // TS 6.0 calls a file modified when the host gives another SourceFile for it.
+        const modified = [];
         for (const nativeFileName of base.nativeFileNames) {
             if (nativeFileName.startsWith(bundledLibs)) {
                 continue;
             }
             const sourceFile = this.adoptHostSourceFile(nativeFileName);
+            const baseSourceFile = base.hostSourceFiles.get(nativeFileName);
             if (sourceFile === undefined) {
                 changes.fileRemoved = true;
+                continue;
             }
-            else if (sourceFile.text !== base.hostTexts.get(nativeFileName)) {
+            if (sourceFile !== baseSourceFile) {
+                modified.push(nativeFileName);
+            }
+            // A module format that changed (a package.json "type"): tsc-rs reads package.json files
+            // again only when it reads everything again.
+            if (baseSourceFile !== undefined && sourceFile.impliedNodeFormat !== baseSourceFile.impliedNodeFormat) {
+                changes.formatChanged = true;
+            }
+            if (sourceFile.text !== base.hostTexts.get(nativeFileName)) {
                 changes.changed.push(nativeFileName);
             }
             else if (hasInvalidatedResolutions?.(sourceFile.path)) {
@@ -302,11 +391,14 @@ class NativeProgram {
             }
         }
         // tsc-rs remembers what it found missing; a file that appeared needs everything read again.
-        const missingFileAppeared = this.ts.forEachEntry(base.getMissingFilePaths(), fileName => this.host.fileExists(fileName)) ?? false;
-        changes.invalidateAll = changes.fileRemoved || changes.resolutionsInvalidated || missingFileAppeared;
+        const missingFileAppeared = this.ts.forEachEntry(base.getMissingFilePaths(), fileName => !!this.host.fileExists(fileName)) ?? false;
+        changes.invalidateAll = changes.fileRemoved || changes.resolutionsInvalidated || missingFileAppeared || changes.formatChanged || base.missingProbes.size > maxMissingProbes;
         changes.missingFileAppeared = missingFileAppeared;
+        if (!changes.invalidateAll) {
+            changes.created = this.createdFiles(base, changes, modified);
+        }
         // TS 6.0 keeps the module resolutions of the files that did not change.
-        if (!changes.invalidateAll && !this.ts.changesAffectModuleResolution(base.options, this.options)) {
+        if (!changes.invalidateAll && changes.created.length === 0 && !this.ts.changesAffectModuleResolution(base.options, this.options)) {
             for (const nativeFileName of changes.unchanged) {
                 const resolutions = base.moduleResolutions.get(nativeFileName);
                 if (resolutions !== undefined) {
@@ -315,6 +407,84 @@ class NativeProgram {
             }
         }
         return changes;
+    }
+
+    // TS 6.0: src/compiler/program.ts resolveNamesReusingOldState resolves again the module names that
+    // did not resolve, in the files that changed (in every file when the program's structure
+    // changed), so that it finds a file created since. tsc-rs remembers the files and directories it
+    // found missing; it is told which of those exist now.
+    createdFiles(base, changes, modified) {
+        if (base.missingProbes.size === 0 || !this.resolvesAgain(base, changes, modified)) {
+            return [];
+        }
+        const { host } = this;
+        const created = [];
+        for (const [path, isDirectory] of base.missingProbes) {
+            const fileName = this.jsNameOf(path);
+            if (isDirectory ? host.directoryExists?.(fileName) : host.fileExists(fileName)) {
+                created.push(path);
+                base.missingProbes.delete(path);
+            }
+        }
+        return created;
+    }
+
+    resolvesAgain(base, changes, modified) {
+        if (!this.sameInputsAs(base) || changes.changed.some(name => this.structureKeys.get(name) !== base.structureKeys.get(name))) {
+            return true;
+        }
+        const unknown = modified.filter(nativeFileName => !base.moduleResolutions.has(nativeFileName));
+        if (unknown.length !== 0) {
+            base.resolveModulesOf(unknown);
+        }
+        return modified.some(nativeFileName => base.hasUnresolvedModuleNames(nativeFileName));
+    }
+
+    // Whether a module name of the file resolved neither to a file nor to an ambient module.
+    hasUnresolvedModuleNames(nativeFileName) {
+        let unresolved = false;
+        this.moduleResolutionsOf(nativeFileName).forEach((resolution, moduleName) => {
+            unresolved ||= resolution?.resolvedModule === undefined && !this.isAmbientModuleName(moduleName);
+        });
+        return unresolved;
+    }
+
+    // TS 6.0: src/compiler/checker.ts tryFindAmbientModule, over the `declare module` names of the
+    // program's files (a pattern has one "*").
+    isAmbientModuleName(moduleName) {
+        if (this.ambientModules === undefined) {
+            const names = new Set();
+            const patterns = [];
+            for (const sourceFile of this.hostSourceFiles.values()) {
+                for (const name of sourceFile?.ambientModuleNames ?? []) {
+                    const parts = name.split("*");
+                    if (parts.length === 1) {
+                        names.add(name);
+                    }
+                    else if (parts.length === 2) {
+                        patterns.push(parts);
+                    }
+                }
+            }
+            this.ambientModules = { names, patterns };
+        }
+        const { names, patterns } = this.ambientModules;
+        return names.has(moduleName)
+            || patterns.some(([prefix, suffix]) => moduleName.length >= prefix.length + suffix.length && moduleName.startsWith(prefix) && moduleName.endsWith(suffix));
+    }
+
+    // Whether the program compiles the same roots with the same options as `base`.
+    sameInputsAs(base) {
+        const { ts } = this;
+        return this.currentDirectory === base.currentDirectory
+            && this.libLocation === base.libLocation
+            && ts.arrayIsEqualTo(base.rootNames, this.rootNames)
+            && ts.arrayIsEqualTo(base.projectReferences, this.projectReferences, ts.projectReferenceIsEqualTo)
+            && JSON.stringify(base.nativeOptions) === JSON.stringify(this.nativeOptions);
+    }
+
+    noteMissing(nativeFileName, isDirectory) {
+        this.missingProbes.set(nativeFileName, isDirectory);
     }
 
     // TS 6.0: src/compiler/program.ts createProgram releases the old program's files that this one
@@ -374,6 +544,7 @@ class NativeProgram {
         // Each program has its own module resolver; unchanged files keep their resolutions.
         const compiled = program => JSON.stringify({ ...program.programParams(), options: { ...program.programParams().options, moduleResolver: undefined } });
         return changes.changed.length === 0
+            && changes.created.length === 0
             && this.structureIsReused === this.ts.StructureIsReused.Completely
             && this.ts.arrayIsEqualTo(base.nativeFileNames, this.nativeFileNames)
             && compiled(base) === compiled(this);
@@ -399,6 +570,7 @@ class NativeProgram {
         }
         if (
             changes.resolutionsInvalidated
+            || changes.formatChanged
             || !sameFiles
             || changes.changed.some(name => this.structureKeys.get(name) !== base.structureKeys.get(name))
             || ts.changesAffectingProgramStructure(base.options, this.options)
@@ -413,14 +585,10 @@ class NativeProgram {
     // when no file changed its imports or references; tsc-rs's program then has the old files too.
     // A host's module resolver may answer differently each time, so its programs ask tsc-rs.
     keepsFilesOf(base, changes) {
-        const { ts } = this;
         return !changes.invalidateAll
+            && changes.created.length === 0
             && this.hostResolver === undefined
-            && this.currentDirectory === base.currentDirectory
-            && this.libLocation === base.libLocation
-            && ts.arrayIsEqualTo(base.rootNames, this.rootNames)
-            && ts.arrayIsEqualTo(base.projectReferences, this.projectReferences, ts.projectReferenceIsEqualTo)
-            && JSON.stringify(base.nativeOptions) === JSON.stringify(this.nativeOptions)
+            && this.sameInputsAs(base)
             && changes.changed.every(name => this.structureKeys.get(name) === base.structureKeys.get(name))
             && !this.host.hasChangedAutomaticTypeDirectiveNames?.();
     }
@@ -475,6 +643,7 @@ class NativeProgram {
             return;
         }
         this.released = true;
+        this.leaveSourceFiles();
         releaseNative.unregister(this.native);
         releaseNativeState(this.native);
         this.nativeFiles.clear();
@@ -660,7 +829,9 @@ class NativeProgram {
     // TS 6.0: src/compiler/program.ts findSourceFileWorker sets these on every program file.
     prepareSourceFile(sourceFile, nativeFileName, fileName) {
         const { ts } = this;
-        programsOfSourceFiles.set(sourceFile, this);
+        if (this.constructed) {
+            this.joinSourceFile(sourceFile);
+        }
         const sourceFileOptions = this.sourceFileOptions.get(nativeFileName);
         sourceFile.fileName = fileName;
         sourceFile.path = this.toPath(fileName);
@@ -1821,6 +1992,27 @@ function structureKey(ts, sourceFile) {
         names(sourceFile.imports),
         names(sourceFile.moduleAugmentations),
     ].join("\n");
+}
+
+function fileChanges({ changed, created }) {
+    return created.length === 0 ? { changed } : { changed, created };
+}
+
+// A release after a failed construction: the construction's own exception is the one the caller sees.
+function attempt(run) {
+    try {
+        run();
+    }
+    catch {
+        // Nothing to report it to.
+    }
+}
+
+function removeItem(list, item) {
+    const index = list.lastIndexOf(item);
+    if (index !== -1) {
+        list.splice(index, 1);
+    }
 }
 
 // TS 6.0's PackageId leaves peerDependencies undefined when there are none.

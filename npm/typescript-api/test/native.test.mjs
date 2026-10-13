@@ -180,6 +180,232 @@ test("a serverFS.error answer or sentinel fails the request instead of ending th
     }
 });
 
+// A project whose files tsc-rs lists with getAccessibleEntries.
+const globbedProject = {
+    "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, include: ["*.ts"] }),
+    "a.ts": project["a.ts"],
+};
+
+// tsc-rs panics on any answer that it does not take, and inside program loading a panic ends the
+// process: each of these must fail the request instead.
+const invalidAnswers = {
+    readFile: [
+        JSON.stringify({ kind: "error" }, null, 1),
+        '{"kind":"error","value":null}',
+        '{"kind":"bogus"}',
+        '{"kind":"value","value":5}',
+        '{"kind":"value"}',
+        "not json",
+        "null",
+    ],
+    fileExists: ['{"kind":"value","value":1}', '{"kind":"missing"}'],
+    directoryExists: ['{"kind":"value","value":"yes"}'],
+    getAccessibleEntries: ['{"kind":"value","value":null}', '{"kind":"value","value":{"files":"a.ts"}}', '{"kind":"value","value":[]}'],
+    realpath: ['{"kind":"value","value":""}', '{"kind":"value","value":7}'],
+};
+
+test("a filesystem answer that tsc-rs does not take fails the request instead of ending the process", () => {
+    const root = "/virtual/invalid";
+    for (const [name, answers] of Object.entries(invalidAnswers)) {
+        for (const answer of answers) {
+            const { channel, vfs } = openProject(root, globbedProject);
+            let given = false;
+            channel.registerCallback(name, (_, payload) => {
+                const file = JSON.parse(payload);
+                if (given || (file !== root && !file.startsWith(`${root}/`))) return vfs.handle(name, payload);
+                given = true;
+                return answer;
+            });
+            try {
+                request(channel, "initialize", null);
+                const result = (() => {
+                    try {
+                        return semanticDiagnostics(channel, `${root}/tsconfig.json`);
+                    }
+                    catch (error) {
+                        return error;
+                    }
+                })();
+                assert.ok(given, `${name} was asked`);
+                assert.ok(result instanceof Error, `${name} answer ${answer} fails the request`);
+                assert.match(result.message, new RegExp(`filesystem callback (returned serverFS\\.error: |\`)${name}`));
+                assert.equal(channel.requestSync("echo", "12"), "12");
+            }
+            finally {
+                channel.close();
+            }
+        }
+    }
+});
+
+// No request of a program asks stat; this calls the channel's callback entry (what the native side
+// calls) directly.
+test("a stat answer that tsc-rs does not take becomes a missing answer", () => {
+    const channel = createChannel(["--api", "--cwd", os.tmpdir()]);
+    const stat = value => JSON.stringify({ kind: "value", value });
+    const invalid = [
+        stat({ mode: -1, size: 0, mtime: "1970-01-01T00:00:00Z" }),
+        stat({ mode: 0o100644, size: 1.5, mtime: "1970-01-01T00:00:00Z" }),
+        stat({ mode: 0o100644, size: 0, mtime: "yesterday" }),
+        stat({ mode: 0o100644, size: 0, mtime: "2023-02-29T00:00:00Z" }),
+        stat({ mode: 0o100644, size: 0, mtime: "2024-01-02T03:04:05+24:00" }),
+        stat({ mode: 0o100644, size: 0 }),
+        stat(null),
+        JSON.stringify({ kind: "identity" }),
+    ];
+    try {
+        for (const answer of invalid) {
+            channel.registerCallback("stat", () => answer);
+            channel.callbackFailure = undefined;
+            assert.equal(channel.onCall("stat", JSON.stringify("/a.ts")), JSON.stringify({ kind: "missing" }), answer);
+            assert.match(channel.callbackFailure.error.message, /filesystem callback `stat` gave an invalid answer/);
+        }
+        const valid = stat({ mode: 0o100644, size: 3, mtime: "2024-01-02T05:04:05.123456789+02:00" });
+        channel.registerCallback("stat", () => valid);
+        channel.callbackFailure = undefined;
+        assert.equal(channel.onCall("stat", JSON.stringify("/a.ts")), valid);
+        assert.equal(channel.callbackFailure, undefined);
+        channel.registerCallback("stat", () => JSON.stringify({ kind: "fakeStat", value: 1 }));
+        assert.equal(channel.onCall("stat", JSON.stringify("/a.ts")), JSON.stringify({ kind: "fakeStat" }));
+    }
+    finally {
+        channel.close();
+    }
+});
+
+test("a valid filesystem answer in another form reaches tsc-rs in the form it reads", () => {
+    const root = "/virtual/forms";
+    const { channel, vfs } = openProject(root, globbedProject);
+    const asked = new Set();
+    channel.registerCallback("readFile", (_, payload) => {
+        if (JSON.parse(payload) !== `${root}/a.ts`) return vfs.handle("readFile", payload);
+        asked.add("readFile");
+        return `{ "value": "export const x: number = 1;", "kind": "value", "extra": [1], "value": ${JSON.stringify(project["a.ts"])} }`;
+    });
+    channel.registerCallback("getAccessibleEntries", (_, payload) => {
+        if (JSON.parse(payload) !== root) return vfs.handle("getAccessibleEntries", payload);
+        asked.add("getAccessibleEntries");
+        return JSON.stringify({ kind: "value", value: { files: ["tsconfig.json", "a.ts"], symlinks: null } }, null, 2);
+    });
+    try {
+        assert.deepEqual(semanticDiagnostics(channel, `${root}/tsconfig.json`).map(d => d.code), [2322]);
+        assert.deepEqual([...asked].sort(), ["getAccessibleEntries", "readFile"]);
+    }
+    finally {
+        channel.close();
+    }
+});
+
+test("an invalid writeFile answer fails the emit request", () => {
+    const root = "/virtual/write";
+    const writes = [];
+    const vfs = virtualFileSystem(root, {
+        "tsconfig.json": JSON.stringify({ compilerOptions: { outDir: "out" }, files: ["a.ts"] }),
+        "a.ts": "export const x = 1;\n",
+    });
+    const channel = createChannel(["--api", "--cwd", root, "--useCaseSensitiveFileNames=true", `--callbacks=${[...fsCallbacks, "writeFile"].join(",")}`]);
+    for (const name of fsCallbacks) channel.registerCallback(name, (_, payload) => vfs.handle(name, payload));
+    let answer = '{"kind":"bogus"}';
+    channel.registerCallback("writeFile", (_, payload) => {
+        writes.push(JSON.parse(payload).path);
+        return answer;
+    });
+    try {
+        request(channel, "initialize", null);
+        const snapshot = request(channel, "createSnapshot", { openProjects: [`${root}/tsconfig.json`] });
+        const params = { snapshot: snapshot.snapshot, project: snapshot.projects[0].id };
+        assert.throws(() => request(channel, "emit", params), /filesystem callback `writeFile` gave an invalid answer/);
+        answer = JSON.stringify({ kind: "noop" });
+        request(channel, "emit", params);
+        assert.deepEqual(writes, [`${root}/out/a.js`, `${root}/out/a.js`]);
+    }
+    finally {
+        channel.close();
+    }
+});
+
+test("lone surrogates in requests and callback answers reach tsc-rs as U+FFFD", () => {
+    const text = "const s = \"broken \uD83D emoji \uDE00\";\nexport const x: number = 'no';\n";
+    const { channel } = openProject("/virtual/surrogate", { ...project, "a.ts": text });
+    try {
+        const diagnostics = semanticDiagnostics(channel, "/virtual/surrogate/tsconfig.json");
+        assert.deepEqual(diagnostics.map(d => [d.code, d.pos]), [[2322, text.indexOf("x:")]], "positions stay UTF-16 offsets");
+        const params = { input: "export const s = \"broken \uD83D emoji\";\n", options: { compilerOptions: {}, fileName: "module.ts" } };
+        const fromText = request(channel, "transpileModule", params);
+        assert.equal(fromText.outputText, "export const s = \"broken \uFFFD emoji\";\n");
+        const bytes = channel.requestBinarySync("transpileModule", new TextEncoder().encode(JSON.stringify(params)));
+        assert.equal(JSON.parse(Buffer.from(bytes).toString("utf8")).outputText, fromText.outputText);
+        // An escaped backslash before `u` is not an escape, and an escaped pair stays.
+        assert.equal(channel.requestSync("echo", '"\\\\ud83d \\ud83d\\ude00 \\uDC00"'), '"\\\\ud83d \\ud83d\\ude00 \\ufffd"');
+    }
+    finally {
+        channel.close();
+    }
+});
+
+// The channel's own callback guard needs JS to run. When JS execution terminates during a callback,
+// the native side still answers a read callback harmlessly: a CALL_ERROR is a Go panic in tsc-rs,
+// which inside program loading ends the whole process.
+const slowReadScript = (channelPath, onRead) => `
+    const fs = require("node:fs");
+    const os = require("node:os");
+    const path = require("node:path");
+    const { createChannel } = require(${JSON.stringify(channelPath)});
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tsrs-terminate-"));
+    const file = path.join(dir, "a.ts");
+    fs.writeFileSync(file, "export const a = 1;\\n");
+    const channel = createChannel(["--api", "--cwd", dir, "--callbacks=readFile,fileExists"]);
+    for (const name of ["readFile", "fileExists"]) {
+        channel.registerCallback(name, (_, payload) => {
+            if (JSON.parse(payload) === file) {
+                ${onRead}
+                const end = Date.now() + 2000;
+                while (Date.now() < end);
+            }
+            return JSON.stringify({ kind: "useOS" });
+        });
+    }
+    channel.requestSync("initialize", "null");
+    const createSnapshot = () => channel.requestSync("createSnapshot", JSON.stringify({ createPrograms: [{ rootFiles: [file] }] }));`;
+const channelPath = path.join(packageDir, "src", "native", "channel.js");
+
+test("a vm timeout inside a read callback fails the request and the process goes on", { skip: process.env.TSRS_API_CHANNEL === "process" }, () => {
+    const script = `${slowReadScript(channelPath, "")}
+        const vm = require("node:vm");
+        try {
+            vm.runInNewContext("createSnapshot()", { createSnapshot }, { timeout: 200 });
+            console.log("no timeout");
+        }
+        catch (error) {
+            console.log("caught: " + error.message);
+        }
+        console.log("echo " + channel.requestSync("echo", JSON.stringify("after")));
+        channel.close();`;
+    const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 60_000 });
+    assert.equal(child.status, 0, child.stdout + child.stderr);
+    assert.match(child.stdout, /caught: Script execution timed out after 200ms/);
+    assert.match(child.stdout, /echo "after"/);
+});
+
+for (const [how, onRead] of [["terminating", 'require("node:worker_threads").parentPort.postMessage("in-callback");'], ["process.exit in", "process.exit(3);"]]) {
+    test(`${how} a worker inside a read callback ends only the worker`, { skip: process.env.TSRS_API_CHANNEL === "process" }, () => {
+        const workerScript = `${slowReadScript(channelPath, onRead)}\ncreateSnapshot();`;
+        const script = `
+            const { Worker } = require("node:worker_threads");
+            const worker = new Worker(${JSON.stringify(workerScript)}, { eval: true });
+            worker.on("message", () => setTimeout(() => worker.terminate(), 50));
+            worker.on("exit", code => {
+                console.log("worker exit " + code);
+                setTimeout(() => console.log("main alive"), 200);
+            });
+            process.on("exit", code => console.log("main exit " + code));`;
+        const child = spawnSync(process.execPath, ["-e", script], { encoding: "utf8", timeout: 60_000 });
+        assert.equal(child.status, 0, child.stdout + child.stderr);
+        assert.match(child.stdout, how === "terminating" ? /worker exit 1/ : /worker exit 3/);
+        assert.match(child.stdout, /main alive\nmain exit 0/);
+    });
+}
+
 test("close inside a callback ends the session after the request", () => {
     let closeNow = true;
     const { channel } = openProject("/virtual/close", project, {
@@ -219,25 +445,62 @@ test("two channels run in one process", () => {
     }
 });
 
-// All in-process sessions run on one thread, and it waits in the callback.
-test("a callback of one session cannot call another session", { skip: process.env.TSRS_API_CHANNEL === "process" }, () => {
-    const other = createChannel(["--api", "--cwd", os.tmpdir()]);
+// All in-process sessions run on one thread, which waits in the callback; the other session runs
+// inside that wait.
+test("a callback of one session can make requests to another session", () => {
+    const other = openProject("/virtual/other", {
+        "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, noEmit: true }, files: ["b.ts"] }),
+        "b.ts": "export const y: string = 1;\n",
+    });
+    const inner = {};
+    let opened;
     const { channel } = openProject("/virtual/cross", project, {
         onRead: file => {
-            if (file === "/virtual/cross/a.ts") other.requestSync("echo", "5");
+            if (file !== "/virtual/cross/a.ts") return;
+            inner.echo = other.channel.requestSync("echo", "5");
+            inner.diagnostics = semanticDiagnostics(other.channel, "/virtual/other/tsconfig.json").map(d => [d.fileName, d.code]);
+            // A session that starts inside the callback.
+            opened = createChannel(["--api", "--cwd", os.tmpdir()]);
+            inner.opened = opened.requestSync("echo", "6");
         },
     });
     try {
-        request(channel, "initialize", null);
-        assert.throws(
-            () => request(channel, "createSnapshot", { openProjects: ["/virtual/cross/tsconfig.json"] }),
-            /cannot make a request to another session/,
-        );
-        assert.equal(other.requestSync("echo", "6"), "6");
+        assert.deepEqual(semanticDiagnostics(channel, "/virtual/cross/tsconfig.json").map(d => [d.fileName, d.code]), [["/virtual/cross/a.ts", 2322]]);
+        assert.deepEqual(inner, { echo: "5", diagnostics: [["/virtual/other/b.ts", 2322]], opened: "6" });
+        assert.equal(other.channel.requestSync("echo", "7"), "7");
+        assert.equal(opened.requestSync("echo", "8"), "8");
     }
     finally {
         channel.close();
-        other.close();
+        other.channel.close();
+        opened?.close();
+    }
+});
+
+test("a session that waits for another session's callback refuses requests from it", { skip: process.env.TSRS_API_CHANNEL === "process" }, () => {
+    let outer;
+    const inner = openProject("/virtual/inner", project, {
+        onRead: file => {
+            if (file === "/virtual/inner/a.ts") outer.channel.requestSync("echo", "9");
+        },
+    });
+    outer = openProject("/virtual/outer", project, {
+        onRead: file => {
+            if (file === "/virtual/outer/a.ts") semanticDiagnostics(inner.channel, "/virtual/inner/tsconfig.json");
+        },
+    });
+    try {
+        request(outer.channel, "initialize", null);
+        assert.throws(
+            () => request(outer.channel, "createSnapshot", { openProjects: ["/virtual/outer/tsconfig.json"] }),
+            /cannot make a request to a session that waits for that callback/,
+        );
+        assert.equal(outer.channel.requestSync("echo", "10"), "10");
+        assert.equal(inner.channel.requestSync("echo", "11"), "11");
+    }
+    finally {
+        outer.channel.close();
+        inner.channel.close();
     }
 });
 

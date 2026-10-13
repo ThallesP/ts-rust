@@ -57,7 +57,8 @@ function transformSources(ts, { options, emitHost, directory, files, factories, 
             continue;
         }
         cancellationToken?.throwIfCancellationRequested();
-        const change = transformSource(ts, { options, emitHost, sourceFile: file.sourceFile, factories });
+        const originalScript = file.outputs.find(output => isScriptOutput(ts, output.fileName))?.text;
+        const change = transformSource(ts, { options, emitHost, sourceFile: file.sourceFile, factories, originalScript });
         file.scriptDiagnostics = change.diagnostics;
         if (change.splice !== undefined) {
             changed.push({ file, change });
@@ -102,13 +103,14 @@ function transformSources(ts, { options, emitHost, directory, files, factories, 
 
 // TS 6.0: src/compiler/emitter.ts emitJsFileOrBundle runs `before` ahead of its own transformers;
 // here they run alone, and a file whose tree changed becomes new source text for tsc-rs.
-function transformSource(ts, { options, emitHost, sourceFile, factories }) {
+// `originalScript` is tsc-rs's JS output of the unchanged file.
+function transformSource(ts, { options, emitHost, sourceFile, factories, originalScript }) {
     const state = { helpers: undefined, printerHooks: false, context: undefined };
     const captureHelpers = context => node => {
         state.helpers = context.readEmitHelpers();
         return node;
     };
-    const originalStatements = [...sourceFile.statements];
+    const originalStatements = parsedStatements(sourceFile);
     const transform = ts.transformNodes(
         unsupportedResolver(),
         emitHost,
@@ -140,7 +142,7 @@ function transformSource(ts, { options, emitHost, sourceFile, factories }) {
             printerOptions: { ...scriptPrinterOptions(ts, options), removeComments: false, noEmitHelpers: true },
             printAll,
             keptAs: specifiers?.statements,
-            keepAlive: true,
+            keepAlive: { retained: retainedImportNames(ts, sourceFile, originalStatements, originalScript) },
         });
         return { diagnostics: transform.diagnostics, helpers: helpers.filter(helper => !helper.scoped), splice, specifiers: specifiers?.edits };
     }
@@ -779,8 +781,9 @@ function addedReferenceDirectives(ts, parsed, result, newLine) {
 // reference directives) and the end of the file keep their text too. All changed statements print
 // in one pass, as TS 6.0 prints a file, so generated names do not collide.
 // `keptAs` maps transformed statements whose text stays the original statement's (only their
-// module specifiers changed) to that statement.
-function printSpliced(ts, { file, originalStatements, result, transform, printerOptions, printAll, keptAs, extraHeader = "", keepAlive = false }) {
+// module specifiers changed) to that statement. `keepAlive` ({ retained }, see
+// keptImportNames) is for text that tsc-rs compiles again.
+function printSpliced(ts, { file, originalStatements, result, transform, printerOptions, printAll, keptAs, extraHeader = "", keepAlive }) {
     const text = file.text;
     // TS 6.0: src/compiler/emitter.ts emitBodyWithDetachedComments prints the detached comments and
     // the comments at the end of the file only when the statement list kept its text range; a
@@ -803,11 +806,11 @@ function printSpliced(ts, { file, originalStatements, result, transform, printer
             return statement;
         }
         used.add(source);
-        kept.push(keptRange(ts, file, source, original, headerEnd));
+        kept.push({ ...keptRange(ts, file, source, original, headerEnd), statement: source, at: index });
         return ts.factory.createExpressionStatement(ts.factory.createIdentifier(`${marker}${kept.length - 1}`));
     });
-    const keepAliveMarker = keepAlive ? `${marker}keep_alive` : undefined;
-    const keepAliveNames = keepAlive ? statements.flatMap(statement => synthesizedImportNames(ts, statement)) : [];
+    const keepAliveMarker = keepAlive === undefined ? undefined : `${marker}keep_alive`;
+    const keepAliveNames = keepAlive === undefined ? [] : result.statements.flatMap(statement => keptImportNames(ts, statement, keepAlive.retained));
     if (keepAliveNames.length !== 0) {
         const { factory } = ts;
         const list = factory.createArrayLiteralExpression([factory.createStringLiteral(keepAliveMarker), ...keepAliveNames]);
@@ -846,7 +849,16 @@ function printSpliced(ts, { file, originalStatements, result, transform, printer
             throw new Error("tsc-rs: internal error: a kept statement was not printed");
         }
         builder.printed(cursor, at);
-        builder.original(kept[index].start, kept[index].end);
+        const { start, end, statement } = kept[index];
+        // Pasted before other code, a statement that ASI ended needs its `;`.
+        if (kept[index].at < statements.length - 1 && endsWithoutSemicolon(ts, text, statement)) {
+            builder.original(start, statement.end);
+            builder.inserted(";", statement.end);
+            builder.original(statement.end, end);
+        }
+        else {
+            builder.original(start, end);
+        }
         cursor = at + name.length;
     }
     builder.printed(cursor, printed.length);
@@ -889,14 +901,58 @@ function markSynthesizedNodes(ts, statements) {
 const synthesizedSourceName = "\0tsc-rs synthesized";
 const synthesizedRange = { pos: 0, end: 0, source: { fileName: synthesizedSourceName, text: "", skipTrivia: pos => pos } };
 
-// TS 6.0 never elides an import that a transformer created (src/compiler/checker.ts emit resolver
-// isReferencedAliasDeclaration answers true for a node with no parse tree node); tsc-rs elides
-// unused imports in the text it gets. These are the local names of such imports in a printed
-// statement: a statement at the end of the printed text uses them, and its output is removed.
-function synthesizedImportNames(ts, statement) {
+// Whether the source text of a statement ends where ASI ended it, not at a `;` or at the `}` of a
+// block or declaration body.
+function endsWithoutSemicolon(ts, text, statement) {
+    if (text[statement.end - 1] === ";") {
+        return false;
+    }
+    let last = statement;
+    for (;;) {
+        if (ts.isIfStatement(last)) {
+            last = last.elseStatement ?? last.thenStatement;
+        }
+        else if (ts.isIterationStatement(last, /*lookInLabeledStatements*/ false) && !ts.isDoStatement(last)) {
+            last = last.statement;
+        }
+        else if (ts.isLabeledStatement(last) || ts.isWithStatement(last)) {
+            last = last.statement;
+        }
+        else {
+            break;
+        }
+    }
+    switch (last.kind) {
+        case ts.SyntaxKind.Block:
+        case ts.SyntaxKind.ClassDeclaration:
+        case ts.SyntaxKind.InterfaceDeclaration:
+        case ts.SyntaxKind.EnumDeclaration:
+        case ts.SyntaxKind.TryStatement:
+        case ts.SyntaxKind.SwitchStatement:
+        case ts.SyntaxKind.EmptyStatement:
+            return false;
+        case ts.SyntaxKind.FunctionDeclaration:
+        case ts.SyntaxKind.ModuleDeclaration:
+            return last.body === undefined;
+        default:
+            return true;
+    }
+}
+
+// The local names of a printed import statement that tsc-rs must not elide from the text it
+// compiles again: a statement at the end of that text uses them, and its output is removed. TS 6.0
+// decides elision before custom transformers run (src/compiler/checker.ts emit resolver
+// isReferencedAliasDeclaration), so it keeps an import whose last use a transformer removed
+// (`retained`: retainedImportNames), and never elides one that a transformer created (no parse
+// tree node).
+function keptImportNames(ts, statement, retained) {
     const names = [];
     const add = (node, name) => {
-        if (name !== undefined && ts.getParseTreeNode(node) === undefined) {
+        if (name === undefined) {
+            return;
+        }
+        const original = ts.getParseTreeNode(node);
+        if (original === undefined || (original.name !== undefined && retained.has(ts.idText(original.name)))) {
             names.push(name);
         }
     };
@@ -926,8 +982,119 @@ function synthesizedImportNames(ts, statement) {
     return names;
 }
 
-// Removes the line of the statement that kept synthesized imports alive (see
-// synthesizedImportNames) from tsc-rs's output and its map.
+// The local names of the import bindings of the file that tsc-rs's emit of its unchanged text
+// (`script`) kept, as TS 6.0 does for the bindings the original program references. An import
+// declaration in the output keeps its local names. Under CommonJS, the variable that holds the
+// require of a namespace import or of `import x = require()` keeps the local name, and a default or
+// named import is read as `<variable>.<imported name>`.
+function retainedImportNames(ts, sourceFile, originalStatements, script) {
+    const names = new Set();
+    if (script === undefined || originalStatements.every(statement => importSpecifierText(ts, statement) === undefined)) {
+        return names;
+    }
+    const { body } = splitSourceMappingUrl(script.startsWith(byteOrderMark) ? script.slice(1) : script);
+    const output = ts.createSourceFile(sourceFile.fileName, body, ts.ScriptTarget.Latest, /*setParentNodes*/ false, ts.ScriptKind.JS);
+    const required = new Map();
+    for (const statement of output.statements) {
+        if (ts.isImportDeclaration(statement) || ts.isImportEqualsDeclaration(statement)) {
+            for (const name of importBindingNames(ts, statement)) {
+                names.add(name);
+            }
+        }
+        else if (ts.isVariableStatement(statement)) {
+            for (const declaration of statement.declarationList.declarations) {
+                const specifier = requiredSpecifier(ts, declaration.initializer);
+                if (specifier !== undefined && ts.isIdentifier(declaration.name)) {
+                    required.set(ts.idText(declaration.name), specifier);
+                }
+            }
+        }
+    }
+    if (required.size === 0) {
+        return names;
+    }
+    const reads = new Set();
+    const visit = node => {
+        const member = ts.isPropertyAccessExpression(node) ? ts.idText(node.name)
+            : ts.isElementAccessExpression(node) && ts.isStringLiteralLike(node.argumentExpression) ? node.argumentExpression.text
+            : undefined;
+        if (member !== undefined && ts.isIdentifier(node.expression) && required.has(ts.idText(node.expression))) {
+            reads.add(`${required.get(ts.idText(node.expression))}\0${member}`);
+        }
+        ts.forEachChild(node, visit);
+    };
+    ts.forEachChild(output, visit);
+    for (const statement of originalStatements) {
+        const specifier = importSpecifierText(ts, statement);
+        if (specifier === undefined) {
+            continue;
+        }
+        if (ts.isImportEqualsDeclaration(statement)) {
+            if (required.get(ts.idText(statement.name)) === specifier) {
+                names.add(ts.idText(statement.name));
+            }
+            continue;
+        }
+        const clause = statement.importClause;
+        if (clause?.name !== undefined && reads.has(`${specifier}\0default`)) {
+            names.add(ts.idText(clause.name));
+        }
+        const bindings = clause?.namedBindings;
+        if (bindings !== undefined && ts.isNamespaceImport(bindings)) {
+            if (required.get(ts.idText(bindings.name)) === specifier) {
+                names.add(ts.idText(bindings.name));
+            }
+        }
+        else if (bindings !== undefined) {
+            for (const element of bindings.elements) {
+                if (reads.has(`${specifier}\0${ts.moduleExportNameTextUnescaped(element.propertyName ?? element.name)}`)) {
+                    names.add(ts.idText(element.name));
+                }
+            }
+        }
+    }
+    return names;
+}
+
+function importBindingNames(ts, statement) {
+    if (ts.isImportEqualsDeclaration(statement)) {
+        return [ts.idText(statement.name)];
+    }
+    const clause = statement.importClause;
+    const bindings = clause?.namedBindings;
+    const names = clause?.name === undefined ? [] : [ts.idText(clause.name)];
+    if (bindings !== undefined && ts.isNamespaceImport(bindings)) {
+        names.push(ts.idText(bindings.name));
+    }
+    else if (bindings !== undefined) {
+        names.push(...bindings.elements.map(element => ts.idText(element.name)));
+    }
+    return names;
+}
+
+// The module specifier of an import declaration or of `import x = require("...")`.
+function importSpecifierText(ts, statement) {
+    const specifier = ts.isImportDeclaration(statement) ? statement.moduleSpecifier
+        : ts.isImportEqualsDeclaration(statement) && ts.isExternalModuleReference(statement.moduleReference) ? statement.moduleReference.expression
+        : undefined;
+    return specifier !== undefined && ts.isStringLiteralLike(specifier) ? specifier.text : undefined;
+}
+
+// The module of a `require("...")` call, also inside the helpers that wrap it (__importDefault,
+// __importStar, tslib's).
+function requiredSpecifier(ts, expression) {
+    while (expression !== undefined && ts.isCallExpression(expression)) {
+        if (ts.isIdentifier(expression.expression) && ts.idText(expression.expression) === "require") {
+            const [argument] = expression.arguments;
+            return argument !== undefined && ts.isStringLiteralLike(argument) ? argument.text : undefined;
+        }
+        expression = expression.arguments[0];
+    }
+    return undefined;
+}
+
+// Removes the line of the statement that kept imports alive (see keptImportNames) from tsc-rs's
+// output and its map.
 function removeKeepAlive(ts, output, mapOutput, marker) {
     const hasByteOrderMark = output.text.startsWith(byteOrderMark);
     const { body, url } = splitSourceMappingUrl(hasByteOrderMark ? output.text.slice(1) : output.text);
@@ -949,6 +1116,23 @@ function removeKeepAlive(ts, output, mapOutput, marker) {
         lines.splice(line, 1);
         return { ...json, mappings: encodeMappings(lines) };
     });
+}
+
+// The top-level statements of each source file in the order of its text (what tsc-rs compiles),
+// as first seen: a transformer that reorders or edits the array in place leaves it so for every
+// later emit of the same SourceFile, which TS 6.0 prints as it is.
+const parsedStatementsOf = new WeakMap();
+
+function parsedStatements(sourceFile) {
+    let statements = parsedStatementsOf.get(sourceFile);
+    if (statements === undefined) {
+        statements = [...sourceFile.statements];
+        if (statements.every(statement => statement.pos >= 0)) {
+            statements.sort((a, b) => a.pos - b.pos);
+        }
+        parsedStatementsOf.set(sourceFile, statements);
+    }
+    return statements;
 }
 
 // Some transformers reorder or edit node arrays of the parse tree in place (ts-jest's hoist-jest
@@ -1110,12 +1294,17 @@ class SpliceBuilder {
         }
     }
 
-    inserted(text) {
+    // Text that is in neither source. With `end`, a position of the original text, the end of the
+    // text maps there (a `;` that ends a statement maps as the end of the statement).
+    inserted(text, end) {
+        if (end !== undefined && text.length !== 0) {
+            this.pieces.push({ kind: "inserted", start: this.text.length, length: text.length, source: end });
+        }
         this.text += text;
     }
 
-    // `keepAlive` is the marker of the statement that keeps synthesized imports (see
-    // synthesizedImportNames), if the text has one.
+    // `keepAlive` is the marker of the statement that keeps imports (see keptImportNames), if the
+    // text has one.
     finish(keepAlive) {
         return new SplicedText(this.ts, this.text, this.pieces, this.originalText, this.printedText, this.recorder, keepAlive);
     }
@@ -1182,6 +1371,9 @@ class SplicedText {
     }
 
     originalPositionIn(piece, position) {
+        if (piece.kind === "inserted") {
+            return position === piece.start + piece.length ? { source: 0, ...lineAndCharacter(this.ts, this.originalLineStarts, piece.source) } : undefined;
+        }
         if (piece.kind === "original") {
             return { source: 0, ...lineAndCharacter(this.ts, this.originalLineStarts, piece.source + position - piece.start) };
         }
@@ -1214,6 +1406,9 @@ class SplicedText {
             (result[line] ??= []).push([character, ...segment.slice(1)]);
         };
         for (const piece of this.pieces) {
+            if (piece.kind === "inserted") {
+                continue;
+            }
             const isOriginal = piece.kind === "original";
             const lineStarts = isOriginal ? this.originalLineStarts : this.printedLineStarts;
             const sourceMappings = isOriginal ? mappings : this.printedMappings;

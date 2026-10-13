@@ -3,7 +3,8 @@
 //! session's pipes. The JS thread blocks in `request`, and answers each
 //! callback of the session inline through `on_call`, on the JS thread. A
 //! callback may make requests of its own (ts#64299): the protocol is last
-//! in, first out, so they nest.
+//! in, first out, so they nest. A request to another session runs inside the
+//! wait of the session whose callback makes it (`session::wake_waiting`).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -16,8 +17,25 @@ use crate::session::{self, FramePipe, Handle};
 
 thread_local! {
     /// The sessions whose callbacks run on this JS thread now, the inner
-    /// one last.
-    static IN_CALLBACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    /// one last, with their inputs.
+    static IN_CALLBACK: RefCell<Vec<(u64, Arc<FramePipe>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What a read callback answers when `on_call` fails, as `channel.js`
+/// `readAnswers` answers a callback that throws. `on_call` fails when JS
+/// cannot run (its execution terminates: `worker.terminate()`, a `vm`
+/// timeout), and `tsc-rs` reads a failed read callback as a Go panic, which
+/// inside program loading ends the process (`api/callbackfs.rs`
+/// `call_decoded`). The other callbacks get `CALL_ERROR`, which `tsc-rs`
+/// returns as an error.
+fn read_answer(name: &str) -> Option<&'static str> {
+    match name {
+        "readFile" | "stat" => Some(r#"{"kind":"missing"}"#),
+        "fileExists" | "directoryExists" => Some(r#"{"kind":"value","value":false}"#),
+        "getAccessibleEntries" => Some(r#"{"kind":"value","value":{"files":[],"directories":[]}}"#),
+        "realpath" => Some(r#"{"kind":"identity"}"#),
+        _ => None,
+    }
 }
 
 pub struct Channel {
@@ -51,8 +69,9 @@ impl Channel {
 
     /// Sends a request and returns the payload of its response. `on_call`
     /// answers each callback the session makes meanwhile. When it fails,
-    /// the session gets a `CALL_ERROR`, the request runs to its end, and the
-    /// first failure is the result.
+    /// the session gets a harmless answer (`read_answer`) or a
+    /// `CALL_ERROR`, the request runs to its end, and the first failure is
+    /// the result.
     pub fn request(
         &self,
         method: &str,
@@ -62,15 +81,9 @@ impl Channel {
         if self.to_session.is_closed() {
             return Err(self.closed_error());
         }
-        // All sessions run on one thread, and it waits in the callback.
-        let id = self.session.id();
-        if IN_CALLBACK.with(|stack| stack.borrow().last().is_some_and(|&inner| inner != id)) {
-            return Err(Error::from_reason(
-                "a callback of one tsc-rs API session cannot make a request to another session",
-            ));
-        }
+        let waiting = self.waiting_session()?;
         self.depth.fetch_add(1, Ordering::SeqCst);
-        let result = self.exchange(method, payload, on_call);
+        let result = self.exchange(method, payload, waiting.as_deref(), on_call);
         if self.depth.fetch_sub(1, Ordering::SeqCst) == 1
             && self.close_pending.swap(false, Ordering::SeqCst)
         {
@@ -79,16 +92,39 @@ impl Channel {
         result
     }
 
+    /// The input of the session whose callback makes this request, when that
+    /// is another session: all sessions run on one thread, and it waits in
+    /// that callback. A session below it on the stack waits for the inner
+    /// one and cannot run.
+    fn waiting_session(&self) -> napi::Result<Option<Arc<FramePipe>>> {
+        let id = self.session.id();
+        IN_CALLBACK.with(|stack| {
+            let stack = stack.borrow();
+            match stack.last() {
+                Some((inner, _)) if *inner == id => Ok(None),
+                Some(_) if stack.iter().any(|(outer, _)| *outer == id) => Err(Error::from_reason(
+                    "a callback of one tsc-rs API session cannot make a request to a session that waits for that callback",
+                )),
+                Some((_, input)) => Ok(Some(input.clone())),
+                None => Ok(None),
+            }
+        })
+    }
+
     fn exchange(
         &self,
         method: &str,
         payload: &[u8],
+        waiting: Option<&FramePipe>,
         on_call: &mut dyn FnMut(String, String) -> napi::Result<String>,
     ) -> napi::Result<Vec<u8>> {
         self.send(frame::REQUEST, method.as_bytes(), payload)?;
         self.session.schedule().map_err(|err| {
             Error::from_reason(format!("cannot reach the tsc-rs API session thread: {err}"))
         })?;
+        if let Some(waiting) = waiting {
+            session::wake_waiting(waiting);
+        }
         let mut failure: Option<Error> = None;
         loop {
             let frame = self.read_frame()?;
@@ -105,8 +141,8 @@ impl Channel {
                 }
                 frame::CALL => {
                     let name = text(frame.method);
-                    let id = self.session.id();
-                    IN_CALLBACK.with(|stack| stack.borrow_mut().push(id));
+                    let entry = (self.session.id(), self.to_session.clone());
+                    IN_CALLBACK.with(|stack| stack.borrow_mut().push(entry));
                     let answer = on_call(name.clone(), text(frame.payload));
                     IN_CALLBACK.with(|stack| stack.borrow_mut().pop());
                     match answer {
@@ -114,8 +150,16 @@ impl Channel {
                             self.send(frame::CALL_RESPONSE, name.as_bytes(), answer.as_bytes())?;
                         }
                         Err(err) => {
-                            let message = err.reason.trim().to_string();
-                            self.send(frame::CALL_ERROR, name.as_bytes(), message.as_bytes())?;
+                            if let Some(answer) = read_answer(&name) {
+                                self.send(
+                                    frame::CALL_RESPONSE,
+                                    name.as_bytes(),
+                                    answer.as_bytes(),
+                                )?;
+                            } else {
+                                let message = err.reason.trim().to_string();
+                                self.send(frame::CALL_ERROR, name.as_bytes(), message.as_bytes())?;
+                            }
                             failure.get_or_insert(err);
                         }
                     }

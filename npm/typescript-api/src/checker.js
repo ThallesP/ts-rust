@@ -269,33 +269,83 @@ function createChecker(program) {
 
     // TS 6.0 isNullableType = hasTypeFacts(type, TypeFacts.IsUndefinedOrNull).
     function isNullableType(type) {
-        if (type.flags & (TypeFlags.Any | TypeFlags.Unknown | TypeFlags.Nullable | TypeFlags.Void)) {
-            return true;
-        }
-        if (type.flags & TypeFlags.Union) {
-            return type.types.some(isNullableType);
-        }
-        if (type.flags & TypeFlags.Intersection) {
-            return type.types.every(isNullableType);
-        }
-        if (type.flags & TypeFlags.Instantiable) {
-            const constraint = getBaseConstraintOfType(type);
-            return constraint === undefined || constraint === type || isNullableType(constraint);
-        }
-        return false;
+        return undefinedOrNullFacts(type) !== 0;
     }
 
-    // TS 6.0 removeOptionalTypeMarker: tsc-rs exposes no optional marker type, so a type only keeps
-    // one when it is a union with an `undefined` member that is not the undefined type.
+    // TS 6.0: src/compiler/checker.ts getTypeFactsWorker, for the IsUndefined (1) and IsNull (2)
+    // facts. Only the undefined and null types have them: any, unknown and void (UnknownFacts,
+    // VoidFacts) do not, and a type variable has those of its constraint, else of unknown.
+    function undefinedOrNullFacts(typeIn) {
+        let type = typeIn;
+        if (type.flags & (TypeFlags.Intersection | TypeFlags.Instantiable)) {
+            const constraint = getBaseConstraintOfType(type);
+            type = constraint === undefined || (constraint === type && constraint.flags & TypeFlags.Instantiable) ? getUnknownType() : constraint;
+        }
+        const { flags } = type;
+        const notNullable = TypeFlags.String | TypeFlags.StringMapping | TypeFlags.StringLiteral | TypeFlags.TemplateLiteral | TypeFlags.Number | TypeFlags.Enum
+            | TypeFlags.NumberLiteral | TypeFlags.BigInt | TypeFlags.BigIntLiteral | TypeFlags.BooleanLike | TypeFlags.Object | TypeFlags.Void;
+        if (flags & notNullable) {
+            return 0;
+        }
+        if (flags & TypeFlags.Undefined) {
+            return 1;
+        }
+        if (flags & TypeFlags.Null) {
+            return 2;
+        }
+        if (flags & TypeFlags.Union) {
+            return type.types.reduce((facts, member) => facts | undefinedOrNullFacts(member), 0);
+        }
+        if (flags & TypeFlags.Intersection) {
+            return intersectionUndefinedOrNullFacts(type);
+        }
+        return 0;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getIntersectionTypeFacts: these facts are and-facts, and an
+    // intersection with a primitive member ignores its object members.
+    function intersectionUndefinedOrNullFacts(type) {
+        const ignoreObjects = maybeTypeOfKind(type, TypeFlags.Primitive);
+        let facts = 3;
+        for (const member of type.types) {
+            if (!(ignoreObjects && member.flags & TypeFlags.Object)) {
+                facts &= undefinedOrNullFacts(member);
+            }
+        }
+        return facts;
+    }
+
+    // TS 6.0: src/compiler/checker.ts maybeTypeOfKind
+    function maybeTypeOfKind(type, kind) {
+        return (type.flags & kind) !== 0 || ((type.flags & TypeFlags.UnionOrIntersection) !== 0 && type.types.some(member => maybeTypeOfKind(member, kind)));
+    }
+
+    // TS 6.0: src/compiler/checker.ts removeOptionalTypeMarker removes the optional chain marker,
+    // its own `undefined` type (optionalType), from a union; tsc-rs cannot make the union of the
+    // other members when more than one is left.
     function getNonOptionalType(type) {
-        if (!(type.flags & TypeFlags.Union)) {
+        if (!ts.getStrictOptionValue(program.getCompilerOptions(), "strictNullChecks")) {
             return type;
         }
-        const undefinedType = intrinsic("getUndefinedType");
-        if (type.types.some(member => member.flags & TypeFlags.Undefined && member !== undefinedType)) {
-            throw unsupported("getNonOptionalType", "tsc-rs cannot create a union type");
+        const isMarker = member => typeId(member) === optionalTypeMarkerId();
+        if (isMarker(type)) {
+            return intrinsic("getNeverType");
         }
-        return type;
+        if (!(type.flags & TypeFlags.Union) || !type.types.some(isMarker)) {
+            return type;
+        }
+        const rest = type.types.filter(member => !isMarker(member));
+        if (rest.length === 1) {
+            return rest[0];
+        }
+        throw unsupported("getNonOptionalType", "tsc-rs cannot create a union type");
+    }
+
+    // tsc-rs's checker makes its optional chain marker right before its null type, as TypeScript
+    // 7.1 does (internal/checker/checker.go NewChecker: undefinedType, undefinedWideningType,
+    // missingType, optionalType, nullType), and type ids count the types in the order they are made.
+    function optionalTypeMarkerId() {
+        return typeId(intrinsic("getNullType")) - 1;
     }
 
     function getAwaitedType(type) {
@@ -1007,18 +1057,15 @@ function createChecker(program) {
         return writeSymbol(symbol, enclosingDeclaration, meaning, flags, undefined);
     }
 
-    // TS 6.0: src/compiler/checker.ts symbolToString. The entity name it prints writes each name
-    // with its symbol (writer.writeSymbol), which gives display parts their kinds; with
-    // AllowAnyNodeKind a module is its module specifier, and with WriteTypeParametersOrArguments a
-    // container is written with its type parameters (lookupTypeParameterNodes; tsc-rs does not send
-    // the type arguments of an instantiated member's container, which is then written without).
+    // TS 6.0: src/compiler/checker.ts symbolToString prints the entity of the symbol chain: an
+    // expression with AllowAnyNodeKind (symbolToNode), else an entity name. Each identifier carries
+    // its symbol, so the printer writes it with writer.writeSymbol, which gives display parts their
+    // kinds. With WriteTypeParametersOrArguments a container is written with its type parameters
+    // (lookupTypeParameterNodes; tsc-rs does not send the type arguments of an instantiated
+    // member's container, which is then written without).
     function writeSymbol(symbol, enclosingDeclaration, meaning, flags = ts.SymbolFormatFlags.AllowAnyNodeKind, writer) {
-        const chain = symbolChain(symbol, enclosingDeclaration, flags);
+        const chain = symbolChain(symbol, enclosingDeclaration, flags, meaning);
         const sourceFile = sourceFileOf(enclosingDeclaration);
-        const [first] = chain;
-        const specifier = flags & ts.SymbolFormatFlags.AllowAnyNodeKind && first.name.startsWith("\"") && first.symbol.declarations?.some(isExternalModuleDeclaration)
-            ? specifierForModuleSymbol(first.symbol, sourceFile)
-            : undefined;
         const typeParameters = chain.map((part, index) => {
             const next = chain[index + 1];
             if (!(flags & ts.SymbolFormatFlags.WriteTypeParametersOrArguments) || next === undefined || (next.symbol.links?.checkFlags ?? 0) & CheckFlags.Instantiated) {
@@ -1026,30 +1073,59 @@ function createChecker(program) {
             }
             return symbolToTypeParameterDeclarations(part.symbol, enclosingDeclaration, NodeBuilderFlags.IgnoreErrors);
         });
-        return printTo(writer, target => {
-            chain.forEach(({ name, symbol: part }, index) => {
-                if (index === 0) {
-                    if (specifier === undefined) {
-                        target.writeSymbol(name, part);
-                    }
-                    else {
-                        target.writeStringLiteral(`"${ts.escapeString(specifier, 34)}"`);
-                    }
-                }
-                else if (ts.isIdentifierText(part.name, ts.ScriptTarget.ESNext)) {
-                    target.writePunctuation(".");
-                    target.writeSymbol(name, part);
-                }
-                else {
-                    target.writePunctuation("[");
-                    target.writeStringLiteral(/^\d+$/.test(part.name) || name.startsWith("\"") ? name : JSON.stringify(part.name));
-                    target.writePunctuation("]");
-                }
-                if (typeParameters[index]?.length) {
-                    ts.createPrinterWithRemoveComments().writeList(ts.ListFormat.TypeParameters, typeParameters[index], sourceFile, target);
-                }
-            });
-        });
+        const entity = flags & ts.SymbolFormatFlags.AllowAnyNodeKind
+            ? expressionFromSymbolChain(chain, typeParameters, sourceFile)
+            : entityNameFromSymbolChain(chain, typeParameters);
+        const printer = enclosingDeclaration?.kind === SyntaxKind.SourceFile ? ts.createPrinterWithRemoveCommentsNeverAsciiEscape() : ts.createPrinterWithRemoveComments();
+        return printTo(writer, target => printer.writeNode(ts.EmitHint.Unspecified, entity, sourceFile, target));
+    }
+
+    // An identifier of a name as written in a symbol chain (TS 6.0 createEntityNameFromSymbolChain).
+    function chainIdentifier(name, symbol, typeParameters) {
+        const identifier = ts.setEmitFlags(ts.factory.createIdentifier(name), ts.EmitFlags.NoAsciiEscaping);
+        if (typeParameters !== undefined && typeParameters.length > 0) {
+            ts.setIdentifierTypeArguments(identifier, ts.factory.createNodeArray(typeParameters));
+        }
+        identifier.symbol = symbol;
+        return identifier;
+    }
+
+    // TS 6.0: src/compiler/checker.ts createEntityNameFromSymbolChain
+    function entityNameFromSymbolChain(chain, typeParameters = []) {
+        return chain.reduce((left, { name, symbol }, index) => {
+            const identifier = chainIdentifier(name, symbol, typeParameters[index]);
+            return index === 0 ? identifier : ts.factory.createQualifiedName(left, identifier);
+        }, undefined);
+    }
+
+    // TS 6.0: src/compiler/checker.ts createExpressionFromSymbolChain: a module is its module
+    // specifier, and a name that is no property access is an element access: a late-bound name
+    // (`[Symbol.iterator]`, `[s1]`) with the expression in its brackets, a quoted name as a string
+    // literal, a numeric one as a number.
+    function expressionFromSymbolChain(chain, typeParameters = [], sourceFile) {
+        const { factory } = ts;
+        const languageVersion = ts.getEmitScriptTarget(program.getCompilerOptions());
+        return chain.reduce((left, { name: nameAsWritten, symbol }, index) => {
+            if (index === 0 && nameAsWritten.startsWith("\"") && symbol.declarations?.some(isExternalModuleDeclaration)) {
+                return factory.createStringLiteral(specifierForModuleSymbol(symbol, sourceFile));
+            }
+            if (index === 0 || ts.canUsePropertyAccess(nameAsWritten, languageVersion)) {
+                const identifier = chainIdentifier(nameAsWritten, symbol, typeParameters[index]);
+                return index === 0 ? identifier : factory.createPropertyAccessExpression(left, identifier);
+            }
+            const name = nameAsWritten.startsWith("[") ? nameAsWritten.slice(1, -1) : nameAsWritten;
+            let argument;
+            if (ts.isSingleOrDoubleQuote(name.charCodeAt(0)) && !(symbol.flags & SymbolFlags.EnumMember)) {
+                argument = factory.createStringLiteral(ts.stripQuotes(name).replace(/\\./g, escaped => escaped.substring(1)), name.startsWith("'"));
+            }
+            else if (String(Number(name)) === name) {
+                argument = factory.createNumericLiteral(Number(name));
+            }
+            else {
+                argument = chainIdentifier(name, symbol, typeParameters[index]);
+            }
+            return factory.createElementAccessExpression(left, argument);
+        }, undefined);
     }
 
     // TS 6.0: src/compiler/checker.ts hasNonGlobalAugmentationExternalModuleSymbol
@@ -1098,9 +1174,10 @@ function createChecker(program) {
     // TS 6.0 symbolToString prints the accessible symbol chain (src/compiler/checker.ts
     // getAccessibleSymbolChain), each name with its symbol. Without an enclosing declaration that
     // is the symbol's own name; with one, a symbol that its name does not reach from there is
-    // qualified by its container: a class, interface, enum or namespace, or the alias of its module.
-    function symbolChain(symbol, enclosingDeclaration, flags) {
-        const name = splitQualifiedName(getFullyQualifiedName(symbol)).at(-1);
+    // qualified by its container: a class, interface, enum or namespace, the alias of its module,
+    // or for a value, the variable that declares its object literal.
+    function symbolChain(symbol, enclosingDeclaration, flags, meaning = 0) {
+        const name = nameAsWritten(symbol);
         const location = ts.getParseTreeNode(enclosingDeclaration);
         if (location === undefined || flags & ts.SymbolFormatFlags.DoNotIncludeSymbolChain || symbol.flags & SymbolFlags.TypeParameter || isAccessibleByName(symbol, location)) {
             return [{ name, symbol }];
@@ -1118,9 +1195,21 @@ function createChecker(program) {
             return moduleAlias === undefined ? [{ name, symbol }] : [{ name: moduleAlias.name, symbol: moduleAlias }, { name, symbol }];
         }
         if (!(container.flags & (SymbolFlags.Class | SymbolFlags.Interface | SymbolFlags.Enum | SymbolFlags.Module))) {
-            return [{ name, symbol }];
+            const variable = variableOfObjectLiteral(container, meaning);
+            return variable === undefined ? [{ name, symbol }] : [...symbolChain(variable, location, flags, SymbolFlags.Value), { name, symbol }];
         }
-        return [...symbolChain(container, location, flags), { name, symbol }];
+        return [...symbolChain(container, location, flags, meaning === SymbolFlags.Value ? meaning : SymbolFlags.Namespace), { name, symbol }];
+    }
+
+    // TS 6.0: src/compiler/checker.ts getVariableDeclarationOfObjectLiteral: the value of a member of
+    // an object literal (or type literal) that a variable declares is qualified by the variable.
+    function variableOfObjectLiteral(container, meaning) {
+        const declaration = container.declarations?.[0];
+        if (!(meaning & SymbolFlags.Value) || declaration?.parent === undefined || !ts.isVariableDeclaration(declaration.parent)) {
+            return undefined;
+        }
+        const declared = (ts.isObjectLiteralExpression(declaration) && declaration === declaration.parent.initializer) || (ts.isTypeLiteralNode(declaration) && declaration === declaration.parent.type);
+        return declared ? getSymbolOfDeclaration(declaration.parent) : undefined;
     }
 
     // TS 6.0: src/compiler/checker.ts getAccessibleSymbolChain, as symbolToString finds the chain:
@@ -1192,23 +1281,44 @@ function createChecker(program) {
             .map(alias => [alias, getAliasedSymbol(alias)]));
     }
 
-    function qualify(left, symbol, right) {
-        if (ts.isIdentifierText(symbol.name, ts.ScriptTarget.ESNext)) {
-            return `${left}.${right}`;
-        }
-        return /^\d+$/.test(symbol.name) ? `${left}[${symbol.name}]` : `${left}[${right.startsWith("\"") ? right : JSON.stringify(symbol.name)}]`;
+    // TS 6.0: src/compiler/checker.ts getNameOfSymbolAsWritten. getFullyQualifiedName joins the
+    // parent's name and this name as written with a dot, and a name can have dots of its own
+    // (`1.5`, `[Symbol.iterator]`): it is what follows the parent's name.
+    function nameAsWritten(symbol) {
+        const fullName = getFullyQualifiedName(symbol);
+        const parent = symbol.parent;
+        const prefix = parent === undefined ? undefined : `${getFullyQualifiedName(parent)}.`;
+        return prefix !== undefined && fullName.startsWith(prefix) ? fullName.slice(prefix.length) : splitQualifiedName(fullName).at(-1);
     }
 
+    // The names a fully qualified name joins with dots, each as written (TS 6.0
+    // getNameOfSymbolAsWritten): an identifier, a quoted name, or a late-bound name in brackets,
+    // whose expression has dots of its own (`Array.[Symbol.iterator]`).
     function splitQualifiedName(name) {
         const segments = [];
         let start = 0;
-        let quoted = false;
+        let quote;
+        let depth = 0;
         for (let index = 0; index < name.length; index++) {
             const char = name[index];
-            if (char === "\"" && name[index - 1] !== "\\") {
-                quoted = !quoted;
+            if (quote !== undefined) {
+                if (char === "\\") {
+                    index++;
+                }
+                else if (char === quote) {
+                    quote = undefined;
+                }
             }
-            else if (char === "." && !quoted) {
+            else if (char === "\"" || char === "'") {
+                quote = char;
+            }
+            else if (char === "[") {
+                depth++;
+            }
+            else if (char === "]") {
+                depth--;
+            }
+            else if (char === "." && depth === 0) {
                 segments.push(name.slice(start, index));
                 start = index + 1;
             }
@@ -1222,14 +1332,19 @@ function createChecker(program) {
     }
 
     // TS 6.0 symbolToEntityName: the name tsc-rs's node builder writes for the symbol's type or
-    // value, else the qualified name of its containers.
+    // value, else the qualified name of the symbol chain.
     function symbolToEntityName(symbol, meaning, enclosingDeclaration, flags = NodeBuilderFlags.None) {
         const fromTypeNode = entityNameFromTypeNode(symbol, meaning, enclosingDeclaration, flags);
         if (fromTypeNode !== undefined) {
             return fromTypeNode;
         }
-        const segments = symbolToString(symbol, enclosingDeclaration ?? program.getSourceFiles()[0], meaning, ts.SymbolFormatFlags.None).split(".");
-        return segments.slice(1).reduce((left, right) => ts.factory.createQualifiedName(left, right), ts.factory.createIdentifier(segments[0]));
+        return entityNameFromSymbolChain(symbolChain(symbol, chainLocation(enclosingDeclaration, flags), ts.SymbolFormatFlags.None, meaning));
+    }
+
+    // TS 6.0: src/compiler/checker.ts lookupSymbolChain qualifies a symbol only from an enclosing
+    // declaration, or with UseFullyQualifiedType from the global scope (here, a program file's).
+    function chainLocation(enclosingDeclaration, flags) {
+        return enclosingDeclaration ?? (flags & NodeBuilderFlags.UseFullyQualifiedType ? program.getSourceFiles()[0] : undefined);
     }
 
     function entityNameFromTypeNode(symbol, meaning, enclosingDeclaration, flags) {
@@ -1245,10 +1360,16 @@ function createChecker(program) {
         return undefined;
     }
 
-    // TS 6.0 symbolToExpression: the entity name as identifiers and property accesses.
-    function symbolToExpression(symbol, meaning, enclosingDeclaration, flags) {
-        const toExpression = name => ts.isIdentifier(name) ? name : ts.factory.createPropertyAccessExpression(toExpression(name.left), name.right);
-        return toExpression(symbolToEntityName(symbol, meaning, enclosingDeclaration, flags));
+    // TS 6.0 symbolToExpression: the entity name tsc-rs's node builder writes as identifiers and
+    // property accesses, else the expression of the symbol chain.
+    function symbolToExpression(symbol, meaning, enclosingDeclaration, flags = NodeBuilderFlags.None) {
+        const fromTypeNode = entityNameFromTypeNode(symbol, meaning, enclosingDeclaration, flags);
+        if (fromTypeNode !== undefined) {
+            const toExpression = name => ts.isIdentifier(name) ? name : ts.factory.createPropertyAccessExpression(toExpression(name.left), name.right);
+            return toExpression(fromTypeNode);
+        }
+        const chain = symbolChain(symbol, chainLocation(enclosingDeclaration, flags), ts.SymbolFormatFlags.None, meaning);
+        return expressionFromSymbolChain(chain, [], sourceFileOf(enclosingDeclaration));
     }
 
     // TS 6.0 typeParameterToDeclaration, from tsc-rs's nodes for the name, constraint and default.
@@ -1359,6 +1480,91 @@ function createChecker(program) {
 
     function getExportsOfModule(moduleSymbol) {
         return cached(`exportsOfModule:${symbolKey(moduleSymbol)}`, () => symbolsOf(request("getExportsOfModule", { symbol: reference(moduleSymbol) })));
+    }
+
+    // TS 6.0: src/compiler/checker.ts resolveExternalModuleSymbol: what the module's `export =`
+    // names, else the module itself.
+    function resolveExternalModuleSymbol(moduleSymbol, dontResolveAlias) {
+        const exports = moduleSymbol?.exports;
+        if (exports === undefined) {
+            return undefined;
+        }
+        const exportEquals = exports.get("export=");
+        const resolved = exportEquals === undefined || dontResolveAlias ? exportEquals : resolveSymbol(exportEquals);
+        const exported = commonJsExportEquals(resolved && getMergedSymbol(resolved), getMergedSymbol(moduleSymbol));
+        return exported === undefined ? moduleSymbol : getMergedSymbol(exported);
+    }
+
+    // TS 6.0: src/compiler/checker.ts getCommonJsExportEquals merges the other exports of a
+    // CommonJS module into a clone of what `module.exports =` assigns, which tsc-rs cannot make.
+    function commonJsExportEquals(exported, moduleSymbol) {
+        if (exported === undefined || isWellKnown(exported, "unknown") || exported === moduleSymbol || moduleSymbol.exports.size === 1 || exported.flags & SymbolFlags.Alias) {
+            return exported;
+        }
+        throw unsupported("resolveExternalModuleSymbol", "tsc-rs cannot merge the other exports of a CommonJS module into what `module.exports =` assigns");
+    }
+
+    // TS 6.0: src/compiler/checker.ts getExportsAndPropertiesOfModule
+    function getExportsAndPropertiesOfModule(moduleSymbol) {
+        return [...getExportsOfModule(moduleSymbol), ...propertiesOfExportEquals(moduleSymbol)];
+    }
+
+    // TS 6.0: src/compiler/checker.ts forEachExportAndPropertyOfModule
+    function forEachExportAndPropertyOfModule(moduleSymbol, callback) {
+        for (const symbol of getExportsOfModule(moduleSymbol)) {
+            if (!isReservedMemberName(symbol.escapedName)) {
+                callback(symbol, symbol.escapedName);
+            }
+        }
+        for (const property of propertiesOfExportEquals(moduleSymbol)) {
+            callback(property, property.escapedName);
+        }
+    }
+
+    // TS 6.0: src/compiler/checker.ts isReservedMemberName: an internal name (`__call`), not the
+    // name of a well-known symbol, a private name or a name that starts with three underscores.
+    function isReservedMemberName(name) {
+        const third = name.charAt(2);
+        return name.startsWith("__") && third !== "_" && third !== "@" && third !== "#";
+    }
+
+    // TS 6.0: src/compiler/checker.ts tryGetMemberInModuleExportsAndProperties
+    function tryGetMemberInModuleExportsAndProperties(memberName, moduleSymbol) {
+        const symbol = tryGetMemberInModuleExports(memberName, moduleSymbol);
+        if (symbol !== undefined) {
+            return symbol;
+        }
+        const exportEquals = resolveExternalModuleSymbol(moduleSymbol);
+        if (exportEquals === moduleSymbol) {
+            return undefined;
+        }
+        const type = getTypeOfSymbol(exportEquals);
+        return shouldTreatPropertiesOfExternalModuleAsExports(type) ? getPropertyOfType(type, memberName) : undefined;
+    }
+
+    function tryGetMemberInModuleExports(memberName, moduleSymbol) {
+        return cached(`memberInModuleExports:${symbolKey(moduleSymbol)}:${memberName}`, () => symbolOf(request("getMemberInModuleExports", { symbol: reference(moduleSymbol), name: memberName })));
+    }
+
+    // The properties of what the module's `export =` names, which auto-imports offer as exports.
+    function propertiesOfExportEquals(moduleSymbol) {
+        const exportEquals = resolveExternalModuleSymbol(moduleSymbol);
+        if (exportEquals === moduleSymbol) {
+            return [];
+        }
+        const type = getTypeOfSymbol(exportEquals);
+        return shouldTreatPropertiesOfExternalModuleAsExports(type) ? getPropertiesOfType(type) : [];
+    }
+
+    // TS 6.0: src/compiler/checker.ts shouldTreatPropertiesOfExternalModuleAsExports
+    function shouldTreatPropertiesOfExternalModuleAsExports(type) {
+        return !(type.flags & TypeFlags.Primitive || getObjectFlags(type) & ts.ObjectFlags.Class || checker.isArrayType(type) || checker.isTupleType(type));
+    }
+
+    // TS 6.0: src/compiler/checker.ts isNonLocalAlias
+    function isNonLocalAlias(symbol) {
+        const excludes = SymbolFlags.Value | SymbolFlags.Type | SymbolFlags.Namespace;
+        return (symbol.flags & (SymbolFlags.Alias | excludes)) === SymbolFlags.Alias || ((symbol.flags & SymbolFlags.Alias) !== 0 && (symbol.flags & SymbolFlags.Assignment) !== 0);
     }
 
     // TS 6.0: src/compiler/checker.ts getRootSymbols. tsc-rs keeps no link from a synthetic union
@@ -1505,11 +1711,84 @@ function createChecker(program) {
         return getIndexInfosOfType(type).filter(info => info.declaration !== undefined && declarations.includes(info.declaration));
     }
 
-    // TS 6.0: src/compiler/checker.ts getJsxIntrinsicTagNamesAt, with the global JSX namespace.
-    function getJsxIntrinsicTagNamesAt(location) {
-        const jsx = resolveName("JSX", location, SymbolFlags.Namespace, false);
-        const intrinsics = jsx?.exports?.get("IntrinsicElements");
+    // TS 6.0: src/compiler/checker.ts getJsxIntrinsicTagNamesAt and getJsxType
+    function getJsxIntrinsicTagNamesAt(locationIn) {
+        const location = ts.getParseTreeNode(locationIn);
+        const namespace = getJsxNamespaceAt(location);
+        const intrinsics = namespace === undefined ? undefined : exportOfSymbol(namespace, "IntrinsicElements", SymbolFlags.Type);
         return intrinsics === undefined ? [] : getPropertiesOfType(getDeclaredTypeOfSymbol(intrinsics));
+    }
+
+    // TS 6.0: src/compiler/checker.ts getJsxNamespaceAt: the JSX namespace that the jsx-runtime
+    // module of the file's JSX import source exports (react-jsx), else the one of the namespace of
+    // its JSX factory (React.JSX), else the global one.
+    function getJsxNamespaceAt(location) {
+        const container = location === undefined ? undefined : jsxImplicitImportContainer(location) ?? resolveName(jsxNamespaceName(location), location, SymbolFlags.Namespace, false);
+        const namespace = container === undefined ? undefined : exportOfSymbol(resolveSymbol(container), "JSX", SymbolFlags.Namespace);
+        if (namespace !== undefined) {
+            return resolveSymbol(namespace);
+        }
+        const global = resolveName("JSX", undefined, SymbolFlags.Namespace, false);
+        return global === undefined || isWellKnown(global, "unknown") ? undefined : resolveSymbol(global);
+    }
+
+    // TS 6.0: src/compiler/checker.ts getJsxNamespaceContainerForImplicitImport: the module that the
+    // file's synthesized jsx-runtime import resolves to (src/program.js adds it to file.imports).
+    function jsxImplicitImportContainer(location) {
+        const file = ts.getSourceFileOfNode(location);
+        const options = program.getCompilerOptions();
+        const runtimeImport = ts.getJSXRuntimeImport(ts.getJSXImplicitImportBase(options, file), options);
+        if (runtimeImport === undefined) {
+            return undefined;
+        }
+        const specifier = file.imports?.find(literal => ts.nodeIsSynthesized(literal) && literal.text === runtimeImport);
+        const resolved = specifier === undefined ? undefined : program.getResolvedModuleFromModuleSpecifier(specifier, file)?.resolvedModule;
+        const moduleFile = resolved === undefined ? undefined : program.getSourceFile(resolved.resolvedFileName);
+        return moduleFile === undefined ? undefined : getSymbolOfDeclaration(moduleFile);
+    }
+
+    // TS 6.0: src/compiler/checker.ts getJsxNamespace: the first name of the file's @jsx pragma (of
+    // its @jsxFrag pragma or the jsxFragmentFactory option at a fragment), of the jsxFactory
+    // option, the reactNamespace option, or React.
+    function jsxNamespaceName(location) {
+        const file = ts.getSourceFileOfNode(location);
+        const options = program.getCompilerOptions();
+        const languageVersion = ts.getEmitScriptTarget(options);
+        const entityName = text => text === undefined ? undefined : ts.parseIsolatedEntityName(text, languageVersion);
+        const pragmaFactory = name => {
+            const pragma = file?.pragmas?.get(name);
+            return (ts.isArray(pragma) ? pragma[0] : pragma)?.arguments.factory;
+        };
+        const local = ts.isJsxOpeningFragment(location)
+            ? entityName(pragmaFactory("jsxfrag")) ?? entityName(options.jsxFragmentFactory)
+            : entityName(pragmaFactory("jsx"));
+        if (local !== undefined) {
+            return ts.idText(ts.getFirstIdentifier(local));
+        }
+        const factory = entityName(options.jsxFactory);
+        if (factory !== undefined) {
+            return ts.idText(ts.getFirstIdentifier(factory));
+        }
+        return options.reactNamespace ?? "React";
+    }
+
+    // TS 6.0: src/compiler/checker.ts getSymbol(getExportsOfSymbol(symbol), name, meaning): an export
+    // with that meaning, or an alias whose target has it.
+    function exportOfSymbol(symbol, name, meaning) {
+        const exports = symbol.flags & SymbolFlags.Module ? getExportsOfModule(symbol) : [...symbol.exports?.values() ?? []];
+        const candidate = exports.find(member => member.escapedName === name);
+        if (candidate === undefined) {
+            return undefined;
+        }
+        if (candidate.flags & meaning) {
+            return candidate;
+        }
+        return candidate.flags & SymbolFlags.Alias && (getAliasedSymbol(candidate)?.flags ?? 0) & meaning ? candidate : undefined;
+    }
+
+    // TS 6.0: src/compiler/checker.ts resolveSymbol
+    function resolveSymbol(symbol) {
+        return isNonLocalAlias(symbol) ? getAliasedSymbol(symbol) ?? symbol : symbol;
     }
 
     // TS 6.0: src/compiler/checker.ts getAmbientModules: the global `declare module "x"` symbols.
@@ -1545,7 +1824,7 @@ function createChecker(program) {
         if (node === undefined) {
             return false;
         }
-        return (type.flags & TypeFlags.Any) !== 0 || isPropertyAccessible(node, node.expression.kind === SyntaxKind.SuperKeyword, type, property);
+        return isPropertyAccessible(node, node.expression.kind === SyntaxKind.SuperKeyword, false, type, property);
     }
 
     // TS 6.0: src/compiler/checker.ts getContextualTypeForObjectLiteralElement. The contextual type
@@ -1593,65 +1872,176 @@ function createChecker(program) {
             return true;
         }
         const property = getPropertyOfType(getApparentType(type), propertyName);
-        return property !== undefined && isPropertyAccessible(node, isSuper, type, property);
+        return property !== undefined && isPropertyAccessible(node, isSuper, false, type, property);
     }
 
-    // TS 6.0: src/compiler/checker.ts checkPropertyAccessibilityAtLocation, for declared members.
-    function isPropertyAccessible(location, isSuper, containingType, property) {
+    // TS 6.0: src/compiler/checker.ts isPropertyAccessible
+    function isPropertyAccessible(location, isSuper, isWrite, containingType, property) {
+        if (containingType.flags & TypeFlags.Any) {
+            return true;
+        }
         const declaration = property.valueDeclaration;
-        if (declaration === undefined) {
+        if (declaration !== undefined && ts.isPrivateIdentifierClassElementDeclaration(declaration)) {
+            const declaringClass = ts.getContainingClass(declaration);
+            return !ts.isOptionalChain(location) && ts.findAncestor(location, node => node === declaringClass) !== undefined;
+        }
+        return checkPropertyAccessibilityAtLocation(location, isSuper, isWrite, containingType, property);
+    }
+
+    // TS 6.0: src/compiler/checker.ts checkPropertyAccessibilityAtLocation (without errors)
+    function checkPropertyAccessibilityAtLocation(location, isSuper, writing, containingTypeIn, property) {
+        const { ModifierFlags } = ts;
+        const flags = ts.getDeclarationModifierFlagsFromSymbol(property, writing);
+        if (isSuper) {
+            if (ts.getEmitScriptTarget(program.getCompilerOptions()) < ts.ScriptTarget.ES2015 && symbolHasNonMethodDeclaration(property)) {
+                return false;
+            }
+            if (flags & ModifierFlags.Abstract) {
+                return false;
+            }
+            if (!(flags & ModifierFlags.Static) && property.declarations?.some(ts.isClassInstanceProperty)) {
+                return false;
+            }
+        }
+        if (flags & ModifierFlags.Abstract && symbolHasNonMethodDeclaration(property) && isThisAccessInClassInitialization(location)) {
+            const parent = getParentOfSymbol(property);
+            if (parent !== undefined && parent.flags & SymbolFlags.Class) {
+                return false;
+            }
+        }
+        if (!(flags & ModifierFlags.NonPublicAccessibilityModifier)) {
             return true;
         }
-        if (declaration.name !== undefined && ts.isPrivateIdentifier(declaration.name)) {
-            return ts.findAncestor(location, node => node === declaration.parent) !== undefined;
-        }
-        const modifiers = ts.getCombinedModifierFlags(declaration);
-        if (isSuper && modifiers & ts.ModifierFlags.Abstract) {
-            return false;
-        }
-        if (!(modifiers & ts.ModifierFlags.NonPublicAccessibilityModifier)) {
-            return true;
-        }
-        const declaringClass = declaration.parent;
-        if (modifiers & ts.ModifierFlags.Private) {
-            return ts.findAncestor(location, node => node === declaringClass) !== undefined;
+        if (flags & ModifierFlags.Private) {
+            const declaringClass = ts.getClassLikeDeclarationOfSymbol(getParentOfSymbol(property));
+            return forEachEnclosingClass(location, container => container === declaringClass) === true;
         }
         if (isSuper) {
             return true;
         }
-        const declaringSymbol = getSymbolOfDeclaration(declaringClass);
-        let enclosingClass;
-        for (let container = ts.getContainingClass(location); container !== undefined && enclosingClass === undefined; container = ts.getContainingClass(container)) {
-            const classType = getDeclaredTypeOfSymbol(getSymbolOfDeclaration(container));
-            if (derivesFrom(classType, declaringSymbol, new Set())) {
-                enclosingClass = classType;
+        let enclosingClass = forEachEnclosingClass(location, container => isClassDerivedFromDeclaringClasses(getDeclaredTypeOfSymbol(getSymbolOfDeclaration(container)), property, writing));
+        if (enclosingClass === undefined) {
+            const fromThisParameter = getEnclosingClassFromThisParameter(location);
+            enclosingClass = fromThisParameter && isClassDerivedFromDeclaringClasses(fromThisParameter, property, writing);
+            if (flags & ModifierFlags.Static || enclosingClass === undefined) {
+                return false;
             }
         }
-        if (enclosingClass === undefined) {
-            return false;
-        }
-        if (modifiers & ts.ModifierFlags.Static) {
+        if (flags & ModifierFlags.Static) {
             return true;
         }
-        let type = containingType;
-        if (type.flags & TypeFlags.TypeParameter) {
-            type = type.isThisType ? getConstraintOfTypeParameter(type) : getBaseConstraintOfType(type);
+        let containingType = containingTypeIn;
+        if (containingType.flags & TypeFlags.TypeParameter) {
+            containingType = containingType.isThisType ? getConstraintOfTypeParameter(containingType) : getBaseConstraintOfType(containingType);
         }
-        return type !== undefined && derivesFrom(type.target ?? type, enclosingClass.symbol, new Set());
+        return containingType !== undefined && hasBaseType(containingType, enclosingClass);
     }
 
-    function derivesFrom(type, symbol, seen) {
-        if (type === undefined || seen.has(type)) {
-            return false;
+    // TS 6.0 checks these locations for an abstract property read while the class initializes.
+    function isThisAccessInClassInitialization(location) {
+        const isThisAccess = ts.isThisProperty(location)
+            || ts.isThisInitializedObjectBindingExpression(location)
+            || (ts.isObjectBindingPattern(location.parent) && ts.isThisInitializedDeclaration(location.parent.parent));
+        return isThisAccess && isNodeUsedDuringClassInitialization(location);
+    }
+
+    // TS 6.0: src/compiler/checker.ts isNodeUsedDuringClassInitialization
+    function isNodeUsedDuringClassInitialization(node) {
+        return ts.findAncestor(node, element => {
+            if ((ts.isConstructorDeclaration(element) && ts.nodeIsPresent(element.body)) || ts.isPropertyDeclaration(element)) {
+                return true;
+            }
+            return ts.isClassLike(element) || ts.isFunctionLikeDeclaration(element) ? "quit" : false;
+        }) !== undefined;
+    }
+
+    // TS 6.0: src/compiler/checker.ts forEachEnclosingClass
+    function forEachEnclosingClass(node, callback) {
+        for (let container = ts.getContainingClass(node); container !== undefined; container = ts.getContainingClass(container)) {
+            const result = callback(container);
+            if (result) {
+                return result;
+            }
         }
-        seen.add(type);
-        if (type.symbol === symbol) {
-            return true;
+        return undefined;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getParentOfSymbol
+    function getParentOfSymbol(symbol) {
+        return symbol.parent === undefined ? undefined : getMergedSymbol(symbol.parent);
+    }
+
+    // TS 6.0: src/compiler/checker.ts forEachProperty. tsc-rs keeps no containing type on a
+    // synthetic union or intersection property; its constituents are its declarations' symbols.
+    function forEachProperty(property, callback) {
+        if (ts.getCheckFlags(property) & CheckFlags.Synthetic) {
+            for (const constituent of immediateRootSymbols(property) ?? []) {
+                const result = forEachProperty(constituent, callback);
+                if (result) {
+                    return result;
+                }
+            }
+            return undefined;
         }
-        if (type.flags & TypeFlags.Intersection) {
-            return type.types.some(member => derivesFrom(member, symbol, seen));
+        return callback(property);
+    }
+
+    // TS 6.0: src/compiler/checker.ts symbolHasNonMethodDeclaration
+    function symbolHasNonMethodDeclaration(symbol) {
+        return forEachProperty(symbol, property => !(property.flags & SymbolFlags.Method)) === true;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getDeclaringClass
+    function getDeclaringClass(property) {
+        return property.parent !== undefined && property.parent.flags & SymbolFlags.Class ? getDeclaredTypeOfSymbol(getParentOfSymbol(property)) : undefined;
+    }
+
+    // TS 6.0: src/compiler/checker.ts isClassDerivedFromDeclaringClasses
+    function isClassDerivedFromDeclaringClasses(checkClass, property, writing) {
+        const notDerived = forEachProperty(property, constituent => (ts.getDeclarationModifierFlagsFromSymbol(constituent, writing) & ts.ModifierFlags.Protected) !== 0 && !hasBaseType(checkClass, getDeclaringClass(constituent)));
+        return notDerived ? undefined : checkClass;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getEnclosingClassFromThisParameter
+    function getEnclosingClassFromThisParameter(node) {
+        const container = ts.getThisContainer(node, false, false);
+        const thisParameter = container !== undefined && ts.isFunctionLike(container) ? ts.getThisParameter(container) : undefined;
+        let thisType;
+        if (thisParameter?.type !== undefined) {
+            thisType = getTypeFromTypeNode(thisParameter.type);
+            if (thisType.flags & TypeFlags.TypeParameter) {
+                thisType = getConstraintOfTypeParameter(thisType);
+            }
         }
-        return type.isClassOrInterface() && getBaseTypes(type).some(base => derivesFrom(base.target ?? base, symbol, seen));
+        else if (ts.isFunctionLike(container)) {
+            thisType = contextualThisType(container);
+        }
+        if (thisType !== undefined && getObjectFlags(thisType) & (ts.ObjectFlags.ClassOrInterface | ts.ObjectFlags.Reference)) {
+            return getTargetType(thisType);
+        }
+        return undefined;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getObjectFlags
+    function getObjectFlags(type) {
+        return type.flags & TypeFlags.ObjectFlagsType ? type.objectFlags ?? 0 : 0;
+    }
+
+    // TS 6.0: src/compiler/checker.ts getTargetType
+    function getTargetType(type) {
+        return getObjectFlags(type) & ts.ObjectFlags.Reference ? type.target : type;
+    }
+
+    // TS 6.0: src/compiler/checker.ts hasBaseType
+    function hasBaseType(type, checkBase) {
+        const check = candidate => {
+            if (getObjectFlags(candidate) & (ts.ObjectFlags.ClassOrInterface | ts.ObjectFlags.Reference)) {
+                const target = getTargetType(candidate);
+                return target === checkBase || getBaseTypes(target).some(check);
+            }
+            return candidate.flags & TypeFlags.Intersection ? candidate.types.some(check) : false;
+        };
+        return check(type);
     }
 
     // TS 6.0: src/compiler/checker.ts getTypeArgumentsForResolvedSignature. tsc-rs sends no
@@ -1777,16 +2167,21 @@ function createChecker(program) {
         getConstantValue,
         isValidPropertyAccess,
         isValidPropertyAccessForCompletions,
+        isPropertyAccessible,
         getAccessibleSymbolChain,
         getContextualTypeForObjectLiteralElement,
         getIndexInfosAtLocation,
         getAliasedSymbol,
         getImmediateAliasedSymbol,
         getExportsOfModule,
+        resolveExternalModuleSymbol,
         getJsxIntrinsicTagNamesAt,
         isOptionalParameter,
         getAmbientModules,
-        tryGetMemberInModuleExports: (memberName, moduleSymbol) => cached(`memberInModuleExports:${symbolKey(moduleSymbol)}:${memberName}`, () => symbolOf(request("getMemberInModuleExports", { symbol: reference(moduleSymbol), name: memberName }))),
+        tryGetMemberInModuleExports,
+        tryGetMemberInModuleExportsAndProperties,
+        getExportsAndPropertiesOfModule,
+        forEachExportAndPropertyOfModule,
         getApparentType,
         getBaseConstraintOfType,
         getConstraintOfTypeParameter,

@@ -8,19 +8,24 @@
 const fileSystemCallbacks = ["readFile", "fileExists", "directoryExists", "getAccessibleEntries", "realpath", "stat", "writeFile", "removeFile"];
 const useOS = JSON.stringify({ kind: "useOS" });
 const missing = JSON.stringify({ kind: "missing" });
+const exists = JSON.stringify({ kind: "value", value: true });
+const doesNotExist = JSON.stringify({ kind: "value", value: false });
+const identity = JSON.stringify({ kind: "identity" });
 // What a callback that threw answers: tsc-rs panics on an answer of the wrong kind
 // (crates/ts_goport/src/api/callbackfs.rs).
 const fallbackAnswers = {
     readFile: missing,
-    fileExists: JSON.stringify({ kind: "value", value: false }),
-    directoryExists: JSON.stringify({ kind: "value", value: false }),
+    fileExists: doesNotExist,
+    directoryExists: doesNotExist,
     getAccessibleEntries: JSON.stringify({ kind: "value", value: { files: [], directories: [] } }),
-    realpath: JSON.stringify({ kind: "identity" }),
+    realpath: identity,
     stat: missing,
     writeFile: JSON.stringify({ kind: "noop" }),
     removeFile: JSON.stringify({ kind: "noop" }),
 };
 const done = JSON.stringify({ kind: "value" });
+// The requests whose response holds a new snapshot.
+const snapshotMethods = new Set(["createSnapshot", "updateSnapshot"]);
 const encoder = new TextEncoder();
 const { loadAddon } = require("./native/addon.js");
 
@@ -63,15 +68,47 @@ class Session {
     }
 
     request(method, params) {
-        const text = this.channel.requestSync(method, JSON.stringify(params));
-        this.throwCallbackError();
+        const text = this.send(() => this.channel.requestSync(method, JSON.stringify(params)));
+        if (this.callbackError !== undefined) {
+            this.releaseSnapshotOf(method, text);
+            this.throwCallbackError();
+        }
         return text === "" ? undefined : JSON.parse(text);
     }
 
     requestBinary(method, params) {
-        const bytes = this.channel.requestBinarySync(method, encoder.encode(JSON.stringify(params)));
+        const bytes = this.send(() => this.channel.requestBinarySync(method, encoder.encode(JSON.stringify(params))));
         this.throwCallbackError();
         return bytes.length === 0 ? undefined : bytes;
+    }
+
+    // A request that fails after a callback threw fails because of the callback's answer: the
+    // callback's exception is the one to throw, and the next request must not see it.
+    send(run) {
+        try {
+            return run();
+        }
+        catch (error) {
+            this.callbackError ??= error;
+            this.throwCallbackError();
+        }
+    }
+
+    // tsc-rs finishes a snapshot whose callbacks threw (they answered harmlessly); the request throws,
+    // so nobody else could release it.
+    releaseSnapshotOf(method, text) {
+        if (!snapshotMethods.has(method) || text === "") {
+            return;
+        }
+        try {
+            const { snapshot } = JSON.parse(text);
+            if (snapshot !== undefined) {
+                this.channel.requestSync("release", JSON.stringify({ snapshot }));
+            }
+        }
+        catch {
+            // The callback's exception is what the caller sees.
+        }
     }
 
     // Results of several requests in one round trip; a failed request gives an Error in its slot.
@@ -152,14 +189,33 @@ class Session {
             return handler(JSON.parse(payload)) === useOSAnswer ? useOS : done;
         }
         const result = handler(JSON.parse(payload));
-        if (result === useOSAnswer) {
-            return useOS;
-        }
-        if (result === undefined) {
+        return result === useOSAnswer ? useOS : answers[name](result);
+    }
+}
+
+// tsc-rs takes only answers of the operation's type and panics on any other
+// (crates/ts_goport/src/api/callbackfs.rs). Hosts answer as TS 6.0 reads them: fileExists and
+// directoryExists by truthiness, readFile with a string or nothing.
+const answers = {
+    readFile: result => (typeof result === "string" ? valueAnswer(result) : missing),
+    fileExists: result => (result ? exists : doesNotExist),
+    directoryExists: result => (result ? exists : doesNotExist),
+    getAccessibleEntries: result => valueAnswer({ files: names(result?.files), directories: names(result?.directories) }),
+    realpath: result => (typeof result === "string" && result !== "" ? valueAnswer(result) : identity),
+    stat: result => {
+        if (!Number.isInteger(result?.mode)) {
             return missing;
         }
-        return JSON.stringify({ kind: "value", value: result });
-    }
+        return valueAnswer({ mode: result.mode, size: Number.isInteger(result.size) ? result.size : 0, mtime: result.mtime instanceof Date ? result.mtime : new Date(0) });
+    },
+};
+
+function valueAnswer(value) {
+    return JSON.stringify({ kind: "value", value });
+}
+
+function names(list) {
+    return Array.isArray(list) ? list.filter(name => typeof name === "string") : [];
 }
 
 // A file system handler returns this to let the operating system answer one call.

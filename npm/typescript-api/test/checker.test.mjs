@@ -1689,3 +1689,274 @@ declare function spread(...args: [a: string, b?: number]): void;
     const nativeChecker = native.getTypeChecker();
     assert.throws(() => nativeChecker.getExpandedParameters(nativeChecker.getSignatureFromDeclaration(spread)), /^Error: tsc-rs: getExpandedParameters is not supported: /);
 });
+
+// A language service over the files of `dir` with these root files, sharing `registry`.
+function serviceOfRoots(api, dir, roots, options, registry) {
+    const host = {
+        getScriptFileNames: () => roots.map(root => path.join(dir, root)),
+        getScriptVersion: () => "1",
+        getScriptSnapshot: name => fs.existsSync(name) ? api.ScriptSnapshot.fromString(fs.readFileSync(name, "utf8")) : undefined,
+        getCurrentDirectory: () => dir,
+        getCompilationSettings: () => options,
+        getDefaultLibFileName: settings => api.getDefaultLibFilePath(settings),
+        fileExists: name => api.sys.fileExists(name),
+        readFile: name => api.sys.readFile(name),
+        readDirectory: (...args) => api.sys.readDirectory(...args),
+        directoryExists: name => api.sys.directoryExists(name),
+        getDirectories: name => api.sys.getDirectories(name),
+    };
+    return api.createLanguageService(host, registry);
+}
+
+function completionNames(service, fileName, position, preferences = {}) {
+    return service.getCompletionsAtPosition(fileName, position, preferences)?.entries.map(entry => entry.source ? `${entry.name}@${entry.source}` : entry.name) ?? [];
+}
+
+test("the symbol of a declaration in a SourceFile that two language services share works in either program's checker", { skip: ts6Skip }, () => {
+    const files = {
+        "shared.ts": "export const sharedValue = 1;\nexport function helper() {}\n",
+        "eq.d.ts": "declare const box: { boxed: number };\nexport = box;\n",
+        "a.ts": "import { sharedValue } from './shared';\nsharedValue;\nhel",
+        "b.ts": "import { helper } from './shared';\nhelper();\nbox",
+    };
+    const describe = (api, name) => {
+        const dir = writeFixture(name, files);
+        const registry = api.createDocumentRegistry();
+        const options = { strict: true, target: api.ScriptTarget.ES2022, module: api.ModuleKind.ESNext, moduleResolution: api.ModuleResolutionKind.Bundler, types: [] };
+        const serviceA = serviceOfRoots(api, dir, ["a.ts", "shared.ts"], options, registry);
+        const serviceB = serviceOfRoots(api, dir, ["b.ts", "shared.ts", "eq.d.ts"], options, registry);
+        const programA = serviceA.getProgram();
+        const programB = serviceB.getProgram();
+        const shared = programA.getSourceFile(path.join(dir, "shared.ts"));
+        assert.equal(programB.getSourceFile(path.join(dir, "shared.ts")), shared, "one SourceFile for both programs");
+        const checkerA = programA.getTypeChecker();
+        const checkerB = programB.getTypeChecker();
+        const moduleSymbol = checkerA.getMergedSymbol(shared.symbol);
+        assert.equal(moduleSymbol, checkerA.getSymbolAtLocation(shared), "the module symbol of checker A");
+        const helper = shared.statements[1];
+        const eq = programB.getSourceFile(path.join(dir, "eq.d.ts"));
+        return {
+            exports: checkerA.getExportsOfModule(moduleSymbol).map(symbol => symbol.name).sort(),
+            typeInA: checkerA.typeToString(checkerA.getTypeOfSymbol(helper.symbol)),
+            typeInB: checkerB.typeToString(checkerB.getTypeOfSymbol(helper.symbol)),
+            exportEquals: checkerB.resolveExternalModuleSymbol(checkerB.getSymbolAtLocation(eq)).name,
+            exportEqualsProperty: checkerB.tryGetMemberInModuleExportsAndProperties("boxed", checkerB.getSymbolAtLocation(eq))?.name,
+            autoImportsA: completionNames(serviceA, path.join(dir, "a.ts"), files["a.ts"].length, { includeCompletionsForModuleExports: true }).filter(name => name.includes("@")).sort(),
+            autoImportsB: completionNames(serviceB, path.join(dir, "b.ts"), files["b.ts"].length, { includeCompletionsForModuleExports: true }).filter(name => name.includes("@")).sort(),
+        };
+    };
+    const expected = describe(ts6, "shared-registry-ts6");
+    assert.deepEqual(expected.autoImportsA.includes("helper@./shared"), true);
+    assert.deepEqual(describe(ts, "shared-registry"), expected);
+});
+
+test("property accessibility follows TS 6.0: parameter properties, fields through super, this parameters and binding patterns", { skip: ts6Skip }, () => {
+    const text = `class S { run() {} }
+class Base { field = 1; method() {} protected pm() {} private priv() {} static protected sp = 1; #own = 1; own() { return this.#own; } }
+abstract class Shape { abstract area: number; read = this.area; }
+class Ctl extends Base {
+    constructor(private readonly service: S, protected other: S) { super(); this.service; }
+    go() { this.service.run(); this.other.run(); super.field; super.method; Base.sp; const { service } = this; this./*this*/; super./*super*/; }
+}
+class Sub extends Ctl { more() { this.other; this./*sub*/; } }
+function withThis(this: Ctl) { this.other; this.pm; this./*thisParameter*/; }
+function outside(ctl: Ctl, sub: Sub) { ctl.field; ctl.pm; ctl.service; Base.sp; sub.other; }
+`;
+    const describe = (api, name) => {
+        const dir = writeFixture(name, { "main.ts": text });
+        const fileName = path.join(dir, "main.ts");
+        const service = serviceOfRoots(api, dir, ["main.ts"], { ...baseOptions, types: [] });
+        const program = service.getProgram();
+        const checker = program.getTypeChecker();
+        const results = [];
+        const visit = node => {
+            if (api.isPropertyAccessExpression(node) && node.name.text !== "") {
+                const enclosing = api.findAncestor(node, ancestor => api.isFunctionLike(ancestor) && ancestor.name !== undefined)?.name?.getText() ?? "class";
+                results.push(`${enclosing} ${node.getText()}: ${checker.isValidPropertyAccess(node, node.name.text)}`);
+            }
+            if (api.isObjectBindingPattern(node)) {
+                const type = checker.getTypeAtLocation(node.parent.initializer);
+                results.push(`binding: ${checker.getPropertiesOfType(type).filter(property => checker.isPropertyAccessible(node, false, false, type, property)).map(property => property.name)}`);
+            }
+            api.forEachChild(node, visit);
+        };
+        visit(program.getSourceFile(fileName));
+        for (const match of text.matchAll(/\/\*(\w+)\*\//g)) {
+            results.push(`${match[1]}: ${completionNames(service, fileName, match.index).filter(entry => !/^(constructor|run)$/.test(entry)).sort()}`);
+        }
+        return results;
+    };
+    const expected = describe(ts6, "accessibility-ts6");
+    assert.ok(expected.includes("go this.service: true") && expected.includes("go super.field: false") && expected.includes("withThis this.pm: true"));
+    assert.deepEqual(describe(ts, "accessibility"), expected);
+});
+
+test("getNonOptionalType removes only the optional chain marker, so member completions work with exactOptionalPropertyTypes", { skip: ts6Skip }, () => {
+    const text = `declare const opt: { p?: { q: number } };
+declare const chain: { b: { c: number } } | undefined;
+declare const maybe: { m?: number | undefined };
+const missing = opt.p;
+const marked = chain?.b.c;
+const explicit = maybe.m;
+opt.p./*member*/;
+opt.p?./*optionalChain*/;
+`;
+    const describe = (api, name, options) => {
+        const dir = writeFixture(name, { "main.ts": text });
+        const fileName = path.join(dir, "main.ts");
+        const service = serviceOfRoots(api, dir, ["main.ts"], { ...baseOptions, types: [], ...options });
+        const checker = service.getProgram().getTypeChecker();
+        const sourceFile = service.getProgram().getSourceFile(fileName);
+        const results = [];
+        const visit = node => {
+            if (api.isPropertyAccessExpression(node) && node.name.text !== "") {
+                const type = checker.getTypeAtLocation(node);
+                results.push(`${node.getText()}: ${checker.typeToString(type)} -> ${checker.typeToString(checker.getNonOptionalType(type))}`);
+            }
+            api.forEachChild(node, visit);
+        };
+        visit(sourceFile);
+        for (const match of text.matchAll(/\/\*(\w+)\*\//g)) {
+            results.push(`${match[1]}: ${completionNames(service, fileName, match.index)}`);
+        }
+        return results;
+    };
+    for (const [label, options] of [["exact", { exactOptionalPropertyTypes: true }], ["strict", {}], ["loose", { strict: false }]]) {
+        const expected = describe(ts6, `non-optional-${label}-ts6`, options);
+        assert.ok(expected.includes("member: q"), label);
+        assert.deepEqual(describe(ts, `non-optional-${label}`, options), expected, label);
+    }
+});
+
+test("isNullableType answers TS 6.0's type facts: any, unknown, void and unconstrained type parameters are not nullable", { skip: ts6Skip }, () => {
+    const text = `declare const any: any;
+declare const unknownValue: unknown;
+declare const voidValue: void;
+declare const nullValue: null;
+declare const undefinedValue: undefined;
+declare const optional: string | undefined;
+declare const neverValue: never;
+declare const nonNull: (string | undefined) & {};
+declare const nullOrObject: { x: 1 } & null;
+declare const branded: string & { __brand: 1 };
+function generic<T, U extends string | null, W extends unknown, Z extends {}, V extends T, A extends any>(t: T, u: U, w: W, z: Z, v: V, a: A, tu: T & U, un: U & null, tz: T & {}) {}
+declare const a: { b: any; c: unknown; d: string | undefined } | undefined;
+const b = a ? a.b : undefined;
+const c = a ? a.c : undefined;
+const d = a ? a.d : undefined;
+`;
+    const describe = (api, name) => {
+        const dir = writeFixture(name, { "main.ts": text });
+        const fileName = path.join(dir, "main.ts");
+        const service = serviceOfRoots(api, dir, ["main.ts"], { ...baseOptions, types: [] });
+        const checker = service.getProgram().getTypeChecker();
+        const results = [];
+        const visit = node => {
+            if ((api.isVariableDeclaration(node) || api.isParameter(node)) && api.isIdentifier(node.name)) {
+                const type = checker.getTypeAtLocation(node.name);
+                results.push(`${node.name.text}: ${checker.typeToString(type)} ${checker.isNullableType(type)} ${type.isNullableType()}`);
+            }
+            if (api.isConditionalExpression(node)) {
+                const refactors = service.getApplicableRefactors(fileName, { pos: node.getStart(), end: node.end }, {}).flatMap(refactor => refactor.actions.map(action => action.description));
+                results.push(`${node.getText()}: ${refactors.includes("Convert to optional chain expression")}`);
+            }
+            api.forEachChild(node, visit);
+        };
+        visit(service.getProgram().getSourceFile(fileName));
+        return results;
+    };
+    const expected = describe(ts6, "nullable-ts6");
+    assert.ok(expected.includes("any: any false false") && expected.includes("a ? a.c : undefined: true"));
+    assert.deepEqual(describe(ts, "nullable"), expected);
+});
+
+// React 19's shape: no global JSX; React.JSX, re-exported by react/jsx-runtime.
+const jsxPackages = {
+    "node_modules/react/package.json": JSON.stringify({ name: "react", version: "19.0.0", types: "index.d.ts", exports: { ".": { types: "./index.d.ts" }, "./jsx-runtime": { types: "./jsx-runtime.d.ts" } } }),
+    "node_modules/react/index.d.ts": "export = React;\nexport as namespace React;\ndeclare namespace React { namespace JSX { interface Element {} interface IntrinsicElements { div: {}; span: {} } } }\n",
+    "node_modules/react/jsx-runtime.d.ts": "export { JSX } from \"./\";\nexport function jsx(): any;\nexport function jsxs(): any;\n",
+    "node_modules/preact/package.json": JSON.stringify({ name: "preact", version: "10.0.0", exports: { "./jsx-runtime": { types: "./jsx-runtime.d.ts" } } }),
+    "node_modules/preact/jsx-runtime.d.ts": "export namespace JSX { interface Element {} interface IntrinsicElements { pre: {} } }\nexport function jsx(): any;\n",
+    "h.d.ts": "export declare function h(): any;\nexport declare namespace h { namespace JSX { interface Element {} interface IntrinsicElements { p: {} } } }\n",
+};
+
+test("getJsxIntrinsicTagNamesAt reads the JSX namespace of the jsx-runtime module, of the factory's namespace or the global one", { skip: ts6Skip }, () => {
+    const jsx = { module: 99, moduleResolution: 100, types: [] };
+    const cases = [
+        ["react-jsx", { ...jsxPackages, "main.tsx": "export const el = <div />;\n" }, { ...jsx, jsx: 4 }],
+        ["import source pragma", { ...jsxPackages, "main.tsx": "/** @jsxImportSource preact */\nexport const el = <pre />;\n" }, { ...jsx, jsx: 4 }],
+        ["React namespace", { ...jsxPackages, "main.tsx": "import * as React from \"react\";\nexport const el = <div />;\nexport const fragment = <></>;\n" }, { ...jsx, jsx: 2 }],
+        ["jsx pragma", { ...jsxPackages, "main.tsx": "/** @jsx h */\nimport { h } from \"./h\";\nexport const el = <p />;\n" }, { ...jsx, jsx: 2 }],
+        ["jsxFactory", { ...jsxPackages, "main.tsx": "import { h } from \"./h\";\nexport const el = <p />;\n" }, { ...jsx, jsx: 2, jsxFactory: "h" }],
+        ["global", { "main.tsx": "export const el = <g />;\ndeclare global { namespace JSX { interface Element {} interface IntrinsicElements { g: {} } } }\n" }, { ...jsx, jsx: 1 }],
+    ];
+    for (const [label, files, options] of cases) {
+        const { rootNames, reference, native } = createPrograms(`jsx-${label.replaceAll(" ", "-")}`, files, options);
+        const describe = (api, program) => {
+            const checker = program.getTypeChecker();
+            const sourceFile = program.getSourceFile(rootNames.find(name => name.endsWith("main.tsx")));
+            const names = [];
+            const visit = node => {
+                if (api.isJsxSelfClosingElement(node) || api.isJsxOpeningFragment(node)) {
+                    names.push(checker.getJsxIntrinsicTagNamesAt(node).map(symbol => symbol.name).join(","));
+                }
+                api.forEachChild(node, visit);
+            };
+            visit(sourceFile);
+            return names;
+        };
+        const expected = describe(ts6, reference);
+        assert.ok(expected.every(names => names !== ""), label);
+        assert.deepEqual(describe(ts, native), expected, label);
+    }
+    const dir = writeFixture("jsx-completions", { ...jsxPackages, "main.tsx": "export const el = <d" });
+    const complete = api => completionNames(serviceOfRoots(api, dir, ["main.tsx"], { ...baseOptions, ...jsx, jsx: 4 }), path.join(dir, "main.tsx"), "export const el = <d".length).filter(name => /^(div|span)$/.test(name));
+    assert.deepEqual(complete(ts), complete(ts6));
+    assert.deepEqual(complete(ts), ["div", "span"]);
+});
+
+test("symbolToString, symbolToEntityName, symbolToExpression and display parts write late-bound and quoted member names like TS 6.0", { skip: ts6Skip }, () => {
+    const { rootNames, reference, native } = createPrograms("member-names", {
+        "main.ts": `declare const arr: string[];
+const it = arr[Symbol.iterator];
+const s1: unique symbol = Symbol();
+class K { [s1] = 1; [Symbol.asyncIterator]() { return null as any; } "a.b" = 2; 0 = 3; 1.5 = 4; "it's" = 5; "\\u00e9" = 6; plain = 7; }
+declare const k: K;
+enum E { "a b" = 1, c = 2 }
+namespace N { export const inner = { [s1]: 1 }; }
+`,
+    });
+    const describe = (api, program) => {
+        const checker = program.getTypeChecker();
+        const sourceFile = program.getSourceFile(rootNames[0]);
+        const printer = api.createPrinter({ removeComments: true });
+        const print = node => node === undefined ? "none" : printer.printNode(api.EmitHint.Unspecified, node, sourceFile);
+        const parts = (symbol, enclosing, flags) => api.symbolToDisplayParts(checker, symbol, enclosing, undefined, flags).map(part => `${part.text}:${part.kind}`).join("|");
+        const typeOf = name => checker.getTypeAtLocation(sourceFile.statements.find(statement => api.isVariableStatement(statement) && statement.declarationList.declarations[0].name.text === name).declarationList.declarations[0].name);
+        const enumSymbol = checker.getSymbolAtLocation(sourceFile.statements[5].name);
+        const inner = checker.getSymbolAtLocation(sourceFile.statements[6].name).exports.get("inner");
+        const symbols = [
+            checker.getPropertiesOfType(typeOf("arr")).find(property => property.escapedName.startsWith("__@iterator")),
+            ...checker.getPropertiesOfType(typeOf("k")),
+            ...enumSymbol.exports.values(),
+            inner,
+            ...checker.getPropertiesOfType(checker.getTypeOfSymbol(inner)),
+        ];
+        const enclosing = sourceFile.statements[1];
+        return symbols.map(symbol => [
+            checker.symbolToString(symbol),
+            checker.symbolToString(symbol, enclosing),
+            checker.symbolToString(symbol, sourceFile),
+            checker.symbolToString(symbol, enclosing, undefined, api.SymbolFormatFlags.None),
+            checker.getFullyQualifiedName(symbol),
+            print(checker.symbolToEntityName(symbol, api.SymbolFlags.Value, enclosing)),
+            print(checker.symbolToEntityName(symbol, api.SymbolFlags.Value, undefined)),
+            print(checker.symbolToExpression(symbol, api.SymbolFlags.Value, enclosing)),
+            parts(symbol, enclosing),
+            parts(symbol, enclosing, api.SymbolFormatFlags.AllowAnyNodeKind),
+        ].join("  ").replace(/@\d+/g, "@N"));
+    };
+    const expected = describe(ts6, reference);
+    assert.ok(expected[0].startsWith("[Symbol.iterator]  Array[Symbol.iterator]"), expected[0]);
+    assert.deepEqual(describe(ts, native), expected);
+});

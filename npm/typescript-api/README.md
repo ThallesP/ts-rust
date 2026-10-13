@@ -15,7 +15,7 @@ Build the addon and the package, then pack it:
 
 ```sh
 node npm/typescript-api/scripts/build-native.mjs   # crates/ts_napi -> native/ts_napi.<platform>-<arch>.node
-node npm/typescript-api/scripts/build.mjs          # lib/: typescript@6.0.3 with hook points, the tsc-rs lib files
+node npm/typescript-api/scripts/build.mjs          # lib/: typescript@6.0.3 with hook points, its tsserver and locale files, the tsc-rs lib files
 cd npm/typescript-api && npm pack                  # typescript-6.0.3.tgz
 ```
 
@@ -37,14 +37,17 @@ With pnpm, `overrides: { typescript: "file:..." }` in `pnpm-workspace.yaml`; wit
 needs the override, or npm installs a second copy under it.
 
 `ts.version` is `"6.0.3"` and `ts.versionMajorMinor` `"6.0"`: tools check them (typescript-eslint
-refuses 7.0). `bin/tsc` runs tsc-rs's own command line in the Node process.
+refuses 7.0). `bin/tsc` (`lib/tsc.js`) runs tsc-rs's own command line in the Node process.
+`bin/tsserver` (`lib/tsserver.js`) is TypeScript 6.0's tsserver on this package, for editors that
+use the workspace TypeScript.
 
 ## What runs where
 
 - **TypeScript 6.0.3's own code** (`lib/typescript.js`): the whole API surface except what is
   listed below. The scanner, parser, node factory, visitors, printer, utilities, config parsing,
   `ts.sys`, the module resolution functions, the watch API, the solution builder, the language
-  service and `ts.server`. Nodes, source files and diagnostics are TypeScript 6.0 objects.
+  service, `ts.server`, `lib/tsserver.js`, `lib/typingsInstaller.js` and the translated messages in
+  `lib/<locale>/`. Nodes, source files and diagnostics are TypeScript 6.0 objects.
 - **tsc-rs**: every program (`ts.createProgram` and each TypeScript 6.0 function that calls it),
   the type checker, emit, `transpileModule` and `transpileDeclaration`, and builder programs. The
   TypeScript 6.0 type checker never runs: `createTypeChecker` throws.
@@ -89,6 +92,10 @@ tested (the NestJS paths, swagger and graphql plugins, ts-jest), but not in ever
 transformer that only replaces module specifiers gets them rewritten in tsc-rs's output of the
 original file. `after` and `afterDeclarations` transformers see tsc-rs's output parsed again.
 
+Text sent to tsc-rs cannot hold a lone UTF-16 surrogate (half of a pair); it becomes U+FFFD, which
+keeps every position. A host callback of one directory's session can call into another directory's
+session, but not back into a session that is itself waiting for a callback.
+
 Each program holds a snapshot in tsc-rs. It is released when the program is garbage collected,
 which needs a turn of the event loop: a synchronous loop that creates thousands of programs holds
 all of them until it returns.
@@ -98,7 +105,8 @@ all of them until it returns.
 - `scripts/build.mjs` turns seven functions of TypeScript 6.0.3's bundle into hook points:
   `createProgram`, `createBuilderProgram`, `readBuilderProgram`, `createTypeChecker`,
   `createCompilerHostWorker`, `transpileWorker` and `createLanguageService`. Each calls
-  `__tsrsHooks.<name>` when it is set. `src/index.js` sets them when the bundle loads. Because the
+  `__tsrsHooks.<name>` when it is set. `src/index.js` sets them when the bundle loads. The build
+  also copies TypeScript 6.0.3's tsserver, typingsInstaller and locale files and writes `lib/tsc.js`. Because the
   hooks are inside the bundle, TypeScript 6.0's own callers (watch, the language service,
   `ts.server`, `transpileModule`) reach them too.
 - `crates/ts_napi` runs tsc-rs's API server (the server behind `tsgo --api`) on a thread of the

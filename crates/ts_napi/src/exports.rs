@@ -13,7 +13,9 @@ use crate::channel::{Channel, text};
 use crate::hooks;
 
 /// The callback that answers the session's callbacks: `(name, payload)` to
-/// the answer text. Throwing sends `CALL_ERROR`.
+/// the answer text. Throwing (or JS that cannot run) sends a harmless
+/// answer to a read callback and `CALL_ERROR` to the others
+/// (`channel::read_answer`).
 type OnCall<'a> = Function<'a, FnArgs<(String, String)>, String>;
 
 /// One tsc-rs API session in this process, on its own thread. The methods
