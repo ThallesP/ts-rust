@@ -2836,137 +2836,297 @@ pub const LANGUAGE_FEATURE_MINIMUM_TARGET: LanguageFeatureMinimumTargetMap =
 // Go: checker/types.go:1495 StringLiteralType
 pub type StringLiteralType = Type;
 
-// PORT: no Go counterpart. Go allocates each `Type` and `TypeMapper` on its
-// own; the port keeps them in index arenas. A plain `Vec` arena doubles and
-// copies every entry when it grows, and keeps up to half its capacity unused.
-// `ChunkedArena` stores entries in chunks of `ARENA_CHUNK_LEN`, so growing it
-// never moves an entry of a later chunk. Index 0 is the nil dummy, like the
-// other arenas.
+// PORT: no Go counterpart. Go allocates each `Type`, `TypeMapper` and
+// inference context on its own; the port keeps them in index arenas
+// (`ChunkedArena`). Index 0 is the nil dummy, like the other arenas.
 //
-// PERF (rss2): the first chunk starts at `ARENA_FIRST_CAPACITY` entries. It
-// doubles up to `ARENA_CHUNK_STEP` entries, then grows in steps of as many
-// until it is full. A first chunk made at full size was mostly allocated but
-// never written in a small program (query: about 5,300 of 8,192 `Type` slots
-// in each checker), and jemalloc gives the heap huge pages, which make such
-// memory resident. Later chunks are made at full size: a program that fills
-// the first chunk is large, and growing each chunk too cost about 1.5% of
-// check time on hono, zod and effect (rss2 grid: copies and page faults).
-pub struct ChunkedArena<T> {
-    chunks: Vec<Vec<T>>,
-    len: usize,
+// PERF (flatarena1, layout1 B2): on 64-bit targets that are not Windows, the
+// arena is one flat `Vec` (`flat_arena`), so a read is the arena base, one
+// bounds check and the entry. With chunks, each read loaded the chunk table
+// and the chunk before the entry (the port issued 1.5 to 1.9x Go's loads on
+// type records). Flat, VS Code st took 5.7% fewer instructions and 2.9% fewer
+// cycles (PGO+BOLT, flatarena1). Windows (its allocator commits a large
+// allocation at once) and 32-bit targets (no room for the reserve) keep the
+// chunks (`chunked_arena`).
+#[cfg(not(all(target_pointer_width = "64", not(windows))))]
+pub use chunked_arena::ChunkedArena;
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+pub use flat_arena::ChunkedArena;
+
+/// Keeps each arena near its size for the rest of the process: past the
+/// small phase it doubles, with no reserve. The LSP and API servers call it
+/// at start, because they make checkers for many programs in one long run
+/// (`editor-long-growth`). It has no effect where the arena keeps chunks.
+pub fn use_bounded_arenas() {
+    #[cfg(all(target_pointer_width = "64", not(windows)))]
+    flat_arena::RESERVE.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
-// PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
-// entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
-// 1,440). One chunk of each element type stays under 2 MiB, so a small project
-// does not get a 2 MiB huge page for each arena. `Type` is 128 bytes, so 13 is
-// the largest shift under that limit.
-const ARENA_CHUNK_SHIFT: usize = 13;
-const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
-const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
-const ARENA_CHUNK_MAX_BYTES: usize = 2 << 20;
-/// Each step of the first chunk after it has this many entries adds as many.
-const ARENA_CHUNK_STEP: usize = ARENA_CHUNK_LEN / 4;
-/// The room of the first chunk when the arena is made.
-const ARENA_FIRST_CAPACITY: usize = 64;
-const _: () = assert!(std::mem::size_of::<Type>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
-const _: () = assert!(std::mem::size_of::<TypeMapper>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
+#[cfg(all(target_pointer_width = "64", not(windows)))]
+mod flat_arena {
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-impl<T> ChunkedArena<T> {
-    /// Creates an arena that holds only `nil`, the dummy entry at index 0.
-    pub fn with_nil(nil: T) -> Self {
-        let mut arena = ChunkedArena {
-            chunks: vec![Vec::with_capacity(ARENA_FIRST_CAPACITY)],
-            len: 1,
-        };
-        arena.chunks[0].push(nil);
-        arena
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    // PERF: always inlined, so the caller builds `value` straight in its
-    // chunk slot. Out of line, the caller wrote the value to the stack with
-    // small stores and this function read it back at once with 16-byte
-    // loads (a store forwarding stall), or copied a `Type` with `memmove`.
-    // The rare new-chunk path stays out of line.
-    #[inline(always)]
-    pub fn push(&mut self, value: T) {
-        self.push_with(move || value);
-    }
-
-    /// Pushes the value `make` returns. `make` runs after the chunk slot is
-    /// ready, so a large value (a `Type`) is built straight in its slot.
+    /// One flat `Vec`.
     ///
-    /// PERF: with `push(make())` the value is built first, and the grow
-    /// branch of `Vec::push` then sits between building and storing, so the
-    /// value goes to the stack and is copied with `memcpy`. Here the room
-    /// tests come first. The second one never fails: a full first chunk gets
-    /// its next step (`grow_chunk`), a later chunk is made with room for
-    /// `ARENA_CHUNK_LEN` entries, and the entry after a full chunk gets a new
-    /// chunk. When `make` makes no call, LLVM knows the chunk did not change
-    /// after the second test and drops the grow branch of the `Vec::push`
-    /// below. When the first test fails (no step), the second one is known to
-    /// fail too, so the hot path makes one test, as before.
-    #[inline(always)]
-    pub fn push_with(&mut self, make: impl FnOnce() -> T) {
-        if self.len & ARENA_CHUNK_MASK == 0 {
-            self.add_chunk();
-        }
-        let chunk = self.chunks.last_mut().expect("arena chunk");
-        if chunk.len() == chunk.capacity() {
-            grow_chunk(chunk);
-        }
-        if chunk.len() == chunk.capacity() {
-            arena_chunk_full();
-        }
-        chunk.push(make());
-        self.len += 1;
+    /// PERF (rss2, layout1): it starts at `ARENA_FIRST_CAPACITY` entries and
+    /// doubles while it is smaller than `ARENA_SMALL_BYTES`, so a small
+    /// program keeps a small arena (query: about 5,300 `Type`s in each
+    /// checker; jemalloc gives the heap huge pages, which make allocated
+    /// memory resident). Then it moves once into a room of
+    /// `ARENA_RESERVE_BYTES`. That is virtual memory: jemalloc maps it
+    /// untouched, only the written entries become resident, and no later push
+    /// copies. Each arena in its room costs about one 2 MiB huge page more
+    /// than chunks did (flatarena1: hono st +1.9% peak RSS). It doubles as a
+    /// `Vec` does when it cannot get the room (`ulimit -v`, strict
+    /// overcommit), after `use_bounded_arenas`, and past the room.
+    pub struct ChunkedArena<T> {
+        items: Vec<T>,
     }
 
-    /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries.
+    /// The room of the arena when it is made.
+    const ARENA_FIRST_CAPACITY: usize = 64;
+    /// The arena doubles while it is smaller than this.
+    const ARENA_SMALL_BYTES: usize = 2 << 20;
+    /// The room that the arena moves into after the small phase.
+    const ARENA_RESERVE_BYTES: usize = 1 << 31;
+
+    /// Whether an arena moves into its room after the small phase
+    /// (`use_bounded_arenas` turns it off).
+    pub(super) static RESERVE: AtomicBool = AtomicBool::new(true);
+
+    impl<T> ChunkedArena<T> {
+        /// Creates an arena that holds only `nil`, the dummy entry at index 0.
+        pub fn with_nil(nil: T) -> Self {
+            let mut items = Vec::with_capacity(ARENA_FIRST_CAPACITY);
+            items.push(nil);
+            ChunkedArena { items }
+        }
+
+        pub fn len(&self) -> usize {
+            self.items.len()
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.items.is_empty()
+        }
+
+        // PERF: always inlined, so the caller builds `value` straight in its
+        // slot, and the rare grow path stays out of line.
+        #[inline(always)]
+        pub fn push(&mut self, value: T) {
+            self.push_with(move || value);
+        }
+
+        /// Pushes the value `make` returns. `make` runs after the room test.
+        #[inline(always)]
+        pub fn push_with(&mut self, make: impl FnOnce() -> T) {
+            if self.items.len() == self.items.capacity() {
+                self.grow();
+            }
+            self.items.push(make());
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn grow(&mut self) {
+            self.grow_with(RESERVE.load(Ordering::Relaxed));
+        }
+
+        /// Gives the full arena room for more entries: the room of
+        /// `ARENA_RESERVE_BYTES` when `reserve` is on and the small phase is
+        /// over, else twice its capacity.
+        fn grow_with(&mut self, reserve: bool) {
+            let size = size_of::<T>().max(1);
+            let cap = self.items.capacity();
+            let room = ARENA_RESERVE_BYTES / size;
+            if reserve
+                && cap * size >= ARENA_SMALL_BYTES
+                && cap < room
+                && self.items.try_reserve_exact(room - cap).is_ok()
+            {
+                return;
+            }
+            self.items.reserve_exact(cap);
+        }
+    }
+
+    impl<T> std::ops::Index<usize> for ChunkedArena<T> {
+        type Output = T;
+
+        #[inline]
+        fn index(&self, i: usize) -> &T {
+            &self.items[i]
+        }
+    }
+
+    impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
+        #[inline]
+        fn index_mut(&mut self, i: usize) -> &mut T {
+            &mut self.items[i]
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        // The entries keep their indexes through the small phase, the move
+        // into the room (or its doubling fallback) and the doubling of
+        // `use_bounded_arenas`.
+        #[test]
+        fn flat_arena_keeps_entries_when_it_grows() {
+            for reserve in [true, false] {
+                let mut arena = ChunkedArena::with_nil(0u64);
+                for i in 1..300_000u64 {
+                    if arena.items.len() == arena.items.capacity() {
+                        arena.grow_with(reserve);
+                    }
+                    arena.push(i);
+                }
+                assert_eq!(arena.len(), 300_000);
+                assert!((0..300_000).all(|i| arena[i] == i as u64));
+                let cap = arena.items.capacity();
+                let doubled = cap.is_power_of_two();
+                let in_room = cap == ARENA_RESERVE_BYTES / 8;
+                assert!(if reserve { in_room || doubled } else { doubled });
+            }
+        }
+    }
+}
+
+#[cfg(not(all(target_pointer_width = "64", not(windows))))]
+mod chunked_arena {
+    use super::{Type, TypeMapper};
+
+    // `ChunkedArena` stores entries in chunks of `ARENA_CHUNK_LEN`, so growing
+    // it never moves an entry of a later chunk.
+    //
+    // PERF (rss2): the first chunk starts at `ARENA_FIRST_CAPACITY` entries. It
+    // doubles up to `ARENA_CHUNK_STEP` entries, then grows in steps of as many
+    // until it is full. A first chunk made at full size was mostly allocated but
+    // never written in a small program (query: about 5,300 of 8,192 `Type` slots
+    // in each checker), and jemalloc gives the heap huge pages, which make such
+    // memory resident. Later chunks are made at full size: a program that fills
+    // the first chunk is large, and growing each chunk too cost about 1.5% of
+    // check time on hono, zod and effect (rss2 grid: copies and page faults).
+    pub struct ChunkedArena<T> {
+        chunks: Vec<Vec<T>>,
+        len: usize,
+    }
+
+    // PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
+    // entry, so a smaller table stays in L1 more (elysia: 720 chunks, 17 KB, was
+    // 1,440). One chunk of each element type stays under 2 MiB, so a small project
+    // does not get a 2 MiB huge page for each arena. `Type` is 128 bytes, so 13 is
+    // the largest shift under that limit.
+    const ARENA_CHUNK_SHIFT: usize = 13;
+    const ARENA_CHUNK_LEN: usize = 1 << ARENA_CHUNK_SHIFT;
+    const ARENA_CHUNK_MASK: usize = ARENA_CHUNK_LEN - 1;
+    const ARENA_CHUNK_MAX_BYTES: usize = 2 << 20;
+    /// Each step of the first chunk after it has this many entries adds as many.
+    const ARENA_CHUNK_STEP: usize = ARENA_CHUNK_LEN / 4;
+    /// The room of the first chunk when the arena is made.
+    const ARENA_FIRST_CAPACITY: usize = 64;
+    const _: () = assert!(std::mem::size_of::<Type>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
+    const _: () =
+        assert!(std::mem::size_of::<TypeMapper>() * ARENA_CHUNK_LEN < ARENA_CHUNK_MAX_BYTES);
+
+    impl<T> ChunkedArena<T> {
+        /// Creates an arena that holds only `nil`, the dummy entry at index 0.
+        pub fn with_nil(nil: T) -> Self {
+            let mut arena = ChunkedArena {
+                chunks: vec![Vec::with_capacity(ARENA_FIRST_CAPACITY)],
+                len: 1,
+            };
+            arena.chunks[0].push(nil);
+            arena
+        }
+
+        pub fn len(&self) -> usize {
+            self.len
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.len == 0
+        }
+
+        // PERF: always inlined, so the caller builds `value` straight in its
+        // chunk slot. Out of line, the caller wrote the value to the stack with
+        // small stores and this function read it back at once with 16-byte
+        // loads (a store forwarding stall), or copied a `Type` with `memmove`.
+        // The rare new-chunk path stays out of line.
+        #[inline(always)]
+        pub fn push(&mut self, value: T) {
+            self.push_with(move || value);
+        }
+
+        /// Pushes the value `make` returns. `make` runs after the chunk slot is
+        /// ready, so a large value (a `Type`) is built straight in its slot.
+        ///
+        /// PERF: with `push(make())` the value is built first, and the grow
+        /// branch of `Vec::push` then sits between building and storing, so the
+        /// value goes to the stack and is copied with `memcpy`. Here the room
+        /// tests come first. The second one never fails: a full first chunk gets
+        /// its next step (`grow_chunk`), a later chunk is made with room for
+        /// `ARENA_CHUNK_LEN` entries, and the entry after a full chunk gets a new
+        /// chunk. When `make` makes no call, LLVM knows the chunk did not change
+        /// after the second test and drops the grow branch of the `Vec::push`
+        /// below. When the first test fails (no step), the second one is known to
+        /// fail too, so the hot path makes one test, as before.
+        #[inline(always)]
+        pub fn push_with(&mut self, make: impl FnOnce() -> T) {
+            if self.len & ARENA_CHUNK_MASK == 0 {
+                self.add_chunk();
+            }
+            let chunk = self.chunks.last_mut().expect("arena chunk");
+            if chunk.len() == chunk.capacity() {
+                grow_chunk(chunk);
+            }
+            if chunk.len() == chunk.capacity() {
+                arena_chunk_full();
+            }
+            chunk.push(make());
+            self.len += 1;
+        }
+
+        /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries.
+        #[cold]
+        #[inline(never)]
+        fn add_chunk(&mut self) {
+            self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+        }
+    }
+
+    /// Gives the full first chunk room for its next `ARENA_CHUNK_STEP` entries,
+    /// or doubles it while it is smaller than that. Later chunks are made full
+    /// size and never get here.
     #[cold]
     #[inline(never)]
-    fn add_chunk(&mut self) {
-        self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+    fn grow_chunk<T>(chunk: &mut Vec<T>) {
+        chunk.reserve_exact(chunk.len().min(ARENA_CHUNK_STEP));
     }
-}
 
-/// Gives the full first chunk room for its next `ARENA_CHUNK_STEP` entries,
-/// or doubles it while it is smaller than that. Later chunks are made full
-/// size and never get here.
-#[cold]
-#[inline(never)]
-fn grow_chunk<T>(chunk: &mut Vec<T>) {
-    chunk.reserve_exact(chunk.len().min(ARENA_CHUNK_STEP));
-}
-
-/// The last arena chunk has no room after `grow_chunk`. `push_with` never
-/// gets here.
-#[cold]
-#[inline(never)]
-fn arena_chunk_full() -> ! {
-    panic!("arena chunk is full")
-}
-
-impl<T> std::ops::Index<usize> for ChunkedArena<T> {
-    type Output = T;
-
-    #[inline]
-    fn index(&self, i: usize) -> &T {
-        &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    /// The last arena chunk has no room after `grow_chunk`. `push_with` never
+    /// gets here.
+    #[cold]
+    #[inline(never)]
+    fn arena_chunk_full() -> ! {
+        panic!("arena chunk is full")
     }
-}
 
-impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
-    #[inline]
-    fn index_mut(&mut self, i: usize) -> &mut T {
-        &mut self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+    impl<T> std::ops::Index<usize> for ChunkedArena<T> {
+        type Output = T;
+
+        #[inline]
+        fn index(&self, i: usize) -> &T {
+            &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+        }
+    }
+
+    impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
+        #[inline]
+        fn index_mut(&mut self, i: usize) -> &mut T {
+            &mut self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+        }
     }
 }

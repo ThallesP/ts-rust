@@ -168,10 +168,14 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 - `type_predicates: Vec<TypePredicate>` -> `self.pred(p)`, `self.pred_mut(p)`.
 - `mappers: ChunkedArena<TypeMapper>` -> `self.mapper(m)`, `self.mapper_mut(m)`.
 - `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
-A `ChunkedArena` (`checker/types.rs`) keeps its entries in chunks of
-8,192, so it does not copy every entry when it grows, as a doubling `Vec`
+A `ChunkedArena` (`checker/types.rs`) is one flat `Vec` on 64-bit targets
+that are not Windows (flatarena1), so a read is the base, one bounds check
+and the entry. It doubles up to 2 MiB, then moves once into a 2 GiB virtual
+reserve, so it does not copy every entry when it grows, as a doubling `Vec`
 does (infermem1: the `inference_contexts` `Vec` kept buffers of 512 and
-256 MiB on typebox).
+256 MiB on typebox). When the reserve fails, after `use_bounded_arenas`
+(the LSP and API servers call it) and past the reserve, it doubles.
+Windows and 32-bit targets keep chunks of 8,192 entries.
 Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `TypeId(len as u32)` etc. Go `c.newType`, `c.newSignature`,
 `newIndexInfo`, `newTypePredicate`, mapper constructors push into these.
