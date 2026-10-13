@@ -669,7 +669,7 @@ pub fn is_whitespace_only_jsx_text(node: Node) -> bool {
     node.kind() == SyntaxKind::JsxText && node.contains_only_trivia_white_spaces()
 }
 
-// Go: ast/utilities.go:2209 GetNewTargetContainer
+// Go: ast/utilities.go:2240 GetNewTargetContainer
 pub fn get_new_target_container(node: Node) -> Node {
     let container = get_this_container(
         node, false, /*includeArrowFunctions*/
@@ -688,7 +688,7 @@ pub fn get_new_target_container(node: Node) -> Node {
     Node::NIL
 }
 
-// Go: ast/utilities.go:2220 GetEnclosingBlockScopeContainer
+// Go: ast/utilities.go:2251 GetEnclosingBlockScopeContainer
 // PERF: checkid1. Each node and its parent are read through views
 // (`find_ancestor_ref`); the parent is read only for a `Block`, the one
 // kind whose test reads it. Same tests as `is_block_scope`.
@@ -698,7 +698,7 @@ pub fn get_enclosing_block_scope_container(node: Node) -> Node {
     })
 }
 
-// Go: ast/utilities.go:2226 IsBlockScope
+// Go: ast/utilities.go:2257 IsBlockScope
 // Kept as the port of the Go function. Its one Go caller at fed0bf24149f,
 // GetEnclosingBlockScopeContainer (utilities.go:2251), is ported above and
 // runs the same tests by kind (`is_block_scope_kind`), so no crate code

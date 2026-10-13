@@ -972,10 +972,18 @@ macro_rules! other_column_match {
 }
 
 /// `Node::name_data` and `Node::name_data_in`: Go `Name()` from the node
-/// data, over the `name_arms!` arms.
+/// data, over the `name_arms!` arms. `name_data` is not inlined, so
+/// `Node::name` stays small enough to inline.
+// PERF (followups57): noderead2 made `by_data!` larger, and the R207 PGO
+// builds inlined `name_data` into `Node::name` (1,067 bytes), which then no
+// longer inlined into its callers. The Effect plugin calls it often: effect
+// st instructions:u +0.29%, 56M in `Node::name` alone. The R206 builds
+// called `name_data` out of line too. A published store node takes the
+// store column and never calls it.
 macro_rules! name_data_accessor {
     ($($arms:tt)*) => {
         data_accessor! {
+            #[inline(never)]
             fn name_data, name_data_in(n) -> Node {
                 Node::NIL,
                 // PORT: a QualifiedName that Go parses as a PropertyAccessExpression.

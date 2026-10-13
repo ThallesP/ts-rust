@@ -137,34 +137,37 @@ pub fn install_print_pack(pack: PrintPack) {
             debug_assert!(a.shared.is_some(), "a print pack goes to a d.ts twin");
             for (index, slot) in pack.slots {
                 let (c, i) = (index as usize / SLOT_CHUNK, index as usize % SLOT_CHUNK);
-                if a.slots.get(c).is_none_or(Option::is_none) {
-                    set_chunk(&mut a.slots, c as u32, vec![Slot::Absent; SLOT_CHUNK]);
-                    if a.slot_owner.len() <= c {
-                        a.slot_owner.resize(c + 1, OwnerKey::Base);
-                    }
+                if a.slots.get(c).is_none() {
+                    a.slots.set(
+                        c,
+                        SlotChunk {
+                            owner: OwnerKey::Base,
+                            slots: vec![Slot::Absent; SLOT_CHUNK],
+                        },
+                    );
                     slot_chunks.push(c as u32);
                 } else if c == NIL_SLOT as usize && slot_chunks.first() != Some(&NIL_SLOT) {
                     // Chunk 0 has the nil slot: `release_print_packs` resets it.
                     slot_chunks.insert(0, NIL_SLOT);
                 }
-                a.slots[c].as_mut().expect(FREED)[i] = slot;
+                a.slots.get_mut(c).expect(FREED).slots[i] = slot;
             }
             for (index, node) in pack.datas {
                 let (c, i) = (index as usize / DATA_CHUNK, index as usize % DATA_CHUNK);
-                if a.datas.get(c).is_none_or(Option::is_none) {
-                    set_chunk(&mut a.datas, c as u32, empty_data_chunk());
+                if a.datas.get(c).is_none() {
+                    a.datas.set(c, empty_data_chunk());
                     data_chunks.push(c as u32);
                 }
                 // A filled cell holds this same node.
-                let _ = a.datas[c].as_ref().expect(FREED)[i].set(node);
+                let _ = a.datas.get(c).expect(FREED)[i].set(node);
             }
             for (index, list) in pack.lists {
                 let (c, i) = (index as usize / LIST_CHUNK, index as usize % LIST_CHUNK);
-                if a.lists.get(c).is_none_or(Option::is_none) {
-                    set_chunk(&mut a.lists, c as u32, vec![OwnList::Absent; LIST_CHUNK]);
+                if a.lists.get(c).is_none() {
+                    a.lists.set(c, vec![OwnList::Absent; LIST_CHUNK]);
                     list_chunks.push(c as u32);
                 }
-                a.lists[c].as_mut().expect(FREED)[i] = OwnList::List(list);
+                a.lists.get_mut(c).expect(FREED)[i] = OwnList::List(list);
             }
         });
     });
@@ -183,20 +186,16 @@ pub fn release_print_packs() {
     ARENA.with(|a| {
         let mut a = a.borrow_mut();
         for c in slot_chunks {
-            let chunk = if c == NIL_SLOT {
-                let mut nil_chunk = vec![Slot::Absent; SLOT_CHUNK];
-                nil_chunk[NIL_SLOT as usize] = Slot::Nil;
-                Some(nil_chunk)
-            } else {
-                None
-            };
-            freed.push(std::mem::replace(&mut a.slots[c as usize], chunk));
+            freed.push(a.slots.take(c as usize));
+            if c == NIL_SLOT {
+                a.slots.set(c as usize, twin_nil_chunk());
+            }
         }
         for c in data_chunks {
-            freed_data.push(a.datas[c as usize].take());
+            freed_data.push(a.datas.take(c as usize));
         }
         for c in list_chunks {
-            freed_lists.push(a.lists[c as usize].take());
+            freed_lists.push(a.lists.take(c as usize));
         }
     });
 }

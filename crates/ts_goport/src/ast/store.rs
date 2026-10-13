@@ -1499,9 +1499,10 @@ fn is_storeless_id(file: usize) -> bool {
 // and 4 MiB more `.data`, and cost 0.1% fewer `goport -p` instructions.
 struct FileBlock {
     /// AST node records, step 4: `FileStore::kinds`. A `Node::kind` read
-    /// reads only this (`FileBlock::kind`). Empty in a node shell whose
-    /// kinds are in its pooled block (`plain_kinds`,
-    /// `BlockFile::shell_kinds`).
+    /// reads only this (`FileBlock::kind`). In a node shell whose kinds are
+    /// in its pooled block (`plain_kinds`, `BlockFile::shell_kinds`), only
+    /// the slots before its first new kind: a prefix of an earlier column of
+    /// its file, maybe empty.
     kinds: &'static [SyntaxKind],
     /// `FileStore::records`. The header reads (`Node::kind`, `parent`,
     /// `loc`, `flags`) and the binder fields in the records read only
@@ -1570,7 +1571,7 @@ impl FileBlock {
     }
 
     /// Go `node.Kind` of slot `index`: from the plain column, or from the
-    /// pooled block of a node shell that has none (`plain_kinds`,
+    /// pooled block of a node shell past its plain prefix (`plain_kinds`,
     /// `BlockFile::shell_kinds`).
     // PERF: edleak1. A plain read is the compare, branch and load of
     // `kinds[index]`: the branch to the pooled read takes the place of the
@@ -1599,13 +1600,118 @@ impl BlockFile {
 
     /// `FileBlock::kind` of slot `index` of a node shell. Past the column it
     /// panics, as `kinds[index]` does.
+    // PERF (edleak3): a table read, with no call. `SyntaxKind::try_from`
+    // is in goport_util, so it was a call, and `expect` a second branch.
+    // The read stays out of line: inline at each kind read (as `try_from`
+    // or as this table read), `--singleThreaded --noEmit` cost up to
+    // +0.40% instructions on effect, +0.15% on hono, with no pooled column.
     #[cold]
     #[inline(never)]
     fn shell_kind(&self, index: usize) -> SyntaxKind {
-        SyntaxKind::try_from(self.shell_kinds[index].load(Ordering::Relaxed))
-            .expect("a pooled kind column holds kinds")
+        let word = self.shell_kinds[index].load(Ordering::Relaxed);
+        KIND_OF_WORD[usize::from(word) & (KIND_OF_WORD.len() - 1)]
     }
 }
+
+/// Each `SyntaxKind` at the index of its value, then `Unknown`: the kind of
+/// a word of a pooled kind column (`BlockFile::shell_kind`). Only
+/// `node_shell` writes the column, from kinds. A test checks the table
+/// against `SyntaxKind::try_from` (`pooled_kind_table_has_every_kind`).
+static KIND_OF_WORD: [SyntaxKind; 512] = {
+    use SyntaxKind as K;
+    #[rustfmt::skip]
+    const ALL: [SyntaxKind; SyntaxKind::COUNT] = [
+        K::Unknown, K::EndOfFile, K::SingleLineCommentTrivia, K::MultiLineCommentTrivia,
+        K::NewLineTrivia, K::WhitespaceTrivia, K::ConflictMarkerTrivia, K::NonTextFileMarkerTrivia,
+        K::NumericLiteral, K::BigIntLiteral, K::StringLiteral, K::JsxText, K::JsxTextAllWhiteSpaces,
+        K::RegularExpressionLiteral, K::NoSubstitutionTemplateLiteral, K::TemplateHead,
+        K::TemplateMiddle, K::TemplateTail, K::OpenBraceToken, K::CloseBraceToken, K::OpenParenToken,
+        K::CloseParenToken, K::OpenBracketToken, K::CloseBracketToken, K::DotToken, K::DotDotDotToken,
+        K::SemicolonToken, K::CommaToken, K::QuestionDotToken, K::LessThanToken, K::LessThanSlashToken,
+        K::GreaterThanToken, K::LessThanEqualsToken, K::GreaterThanEqualsToken, K::EqualsEqualsToken,
+        K::ExclamationEqualsToken, K::EqualsEqualsEqualsToken, K::ExclamationEqualsEqualsToken,
+        K::EqualsGreaterThanToken, K::PlusToken, K::MinusToken, K::AsteriskToken,
+        K::AsteriskAsteriskToken, K::SlashToken, K::PercentToken, K::PlusPlusToken, K::MinusMinusToken,
+        K::LessThanLessThanToken, K::GreaterThanGreaterThanToken,
+        K::GreaterThanGreaterThanGreaterThanToken, K::AmpersandToken, K::BarToken, K::CaretToken,
+        K::ExclamationToken, K::TildeToken, K::AmpersandAmpersandToken, K::BarBarToken,
+        K::QuestionToken, K::ColonToken, K::AtToken, K::QuestionQuestionToken, K::BacktickToken,
+        K::HashToken, K::EqualsToken, K::PlusEqualsToken, K::MinusEqualsToken, K::AsteriskEqualsToken,
+        K::AsteriskAsteriskEqualsToken, K::SlashEqualsToken, K::PercentEqualsToken,
+        K::LessThanLessThanEqualsToken, K::GreaterThanGreaterThanEqualsToken,
+        K::GreaterThanGreaterThanGreaterThanEqualsToken, K::AmpersandEqualsToken, K::BarEqualsToken,
+        K::BarBarEqualsToken, K::AmpersandAmpersandEqualsToken, K::QuestionQuestionEqualsToken,
+        K::CaretEqualsToken, K::Identifier, K::PrivateIdentifier, K::JsDocCommentTextToken,
+        K::BreakKeyword, K::CaseKeyword, K::CatchKeyword, K::ClassKeyword, K::ConstKeyword,
+        K::ContinueKeyword, K::DebuggerKeyword, K::DefaultKeyword, K::DeleteKeyword, K::DoKeyword,
+        K::ElseKeyword, K::EnumKeyword, K::ExportKeyword, K::ExtendsKeyword, K::FalseKeyword,
+        K::FinallyKeyword, K::ForKeyword, K::FunctionKeyword, K::IfKeyword, K::ImportKeyword,
+        K::InKeyword, K::InstanceOfKeyword, K::NewKeyword, K::NullKeyword, K::ReturnKeyword,
+        K::SuperKeyword, K::SwitchKeyword, K::ThisKeyword, K::ThrowKeyword, K::TrueKeyword,
+        K::TryKeyword, K::TypeOfKeyword, K::VarKeyword, K::VoidKeyword, K::WhileKeyword, K::WithKeyword,
+        K::ImplementsKeyword, K::InterfaceKeyword, K::LetKeyword, K::PackageKeyword, K::PrivateKeyword,
+        K::ProtectedKeyword, K::PublicKeyword, K::StaticKeyword, K::YieldKeyword, K::AbstractKeyword,
+        K::AccessorKeyword, K::AsKeyword, K::AssertsKeyword, K::AssertKeyword, K::AnyKeyword,
+        K::AsyncKeyword, K::AwaitKeyword, K::BooleanKeyword, K::ConstructorKeyword, K::DeclareKeyword,
+        K::GetKeyword, K::ImmediateKeyword, K::InferKeyword, K::IntrinsicKeyword, K::IsKeyword,
+        K::KeyOfKeyword, K::ModuleKeyword, K::NamespaceKeyword, K::NeverKeyword, K::OutKeyword,
+        K::ReadonlyKeyword, K::RequireKeyword, K::NumberKeyword, K::ObjectKeyword, K::SatisfiesKeyword,
+        K::SetKeyword, K::StringKeyword, K::SymbolKeyword, K::TypeKeyword, K::UndefinedKeyword,
+        K::UniqueKeyword, K::UnknownKeyword, K::UsingKeyword, K::FromKeyword, K::GlobalKeyword,
+        K::BigIntKeyword, K::OverrideKeyword, K::OfKeyword, K::DeferKeyword, K::SourceKeyword,
+        K::QualifiedName, K::ComputedPropertyName, K::TypeParameter, K::Parameter, K::Decorator,
+        K::PropertySignature, K::PropertyDeclaration, K::MethodSignature, K::MethodDeclaration,
+        K::ClassStaticBlockDeclaration, K::Constructor, K::GetAccessor, K::SetAccessor,
+        K::CallSignature, K::ConstructSignature, K::IndexSignature, K::TypePredicate, K::TypeReference,
+        K::FunctionType, K::ConstructorType, K::TypeQuery, K::TypeLiteral, K::ArrayType, K::TupleType,
+        K::OptionalType, K::RestType, K::UnionType, K::IntersectionType, K::ConditionalType,
+        K::InferType, K::ParenthesizedType, K::ThisType, K::TypeOperator, K::IndexedAccessType,
+        K::MappedType, K::LiteralType, K::NamedTupleMember, K::TemplateLiteralType,
+        K::TemplateLiteralTypeSpan, K::ImportType, K::ObjectBindingPattern, K::ArrayBindingPattern,
+        K::BindingElement, K::ArrayLiteralExpression, K::ObjectLiteralExpression,
+        K::PropertyAccessExpression, K::ElementAccessExpression, K::CallExpression, K::NewExpression,
+        K::TaggedTemplateExpression, K::TypeAssertionExpression, K::ParenthesizedExpression,
+        K::FunctionExpression, K::ArrowFunction, K::DeleteExpression, K::TypeOfExpression,
+        K::VoidExpression, K::AwaitExpression, K::PrefixUnaryExpression, K::PostfixUnaryExpression,
+        K::BinaryExpression, K::ConditionalExpression, K::TemplateExpression, K::YieldExpression,
+        K::SpreadElement, K::ClassExpression, K::OmittedExpression, K::ExpressionWithTypeArguments,
+        K::AsExpression, K::NonNullExpression, K::MetaProperty, K::SyntheticExpression,
+        K::SatisfiesExpression, K::TemplateSpan, K::SemicolonClassElement, K::Block, K::EmptyStatement,
+        K::VariableStatement, K::ExpressionStatement, K::IfStatement, K::DoStatement, K::WhileStatement,
+        K::ForStatement, K::ForInStatement, K::ForOfStatement, K::ContinueStatement, K::BreakStatement,
+        K::ReturnStatement, K::WithStatement, K::SwitchStatement, K::LabeledStatement,
+        K::ThrowStatement, K::TryStatement, K::DebuggerStatement, K::VariableDeclaration,
+        K::VariableDeclarationList, K::FunctionDeclaration, K::ClassDeclaration,
+        K::InterfaceDeclaration, K::TypeAliasDeclaration, K::EnumDeclaration, K::ModuleDeclaration,
+        K::ModuleBlock, K::CaseBlock, K::NamespaceExportDeclaration, K::ImportEqualsDeclaration,
+        K::ImportDeclaration, K::ImportClause, K::NamespaceImport, K::NamedImports, K::ImportSpecifier,
+        K::ExportAssignment, K::ExportDeclaration, K::NamedExports, K::NamespaceExport,
+        K::ExportSpecifier, K::MissingDeclaration, K::ExternalModuleReference, K::JsxElement,
+        K::JsxSelfClosingElement, K::JsxOpeningElement, K::JsxClosingElement, K::JsxFragment,
+        K::JsxOpeningFragment, K::JsxClosingFragment, K::JsxAttribute, K::JsxAttributes,
+        K::JsxSpreadAttribute, K::JsxExpression, K::JsxNamespacedName, K::CaseClause, K::DefaultClause,
+        K::HeritageClause, K::CatchClause, K::ImportAttributes, K::ImportAttribute,
+        K::PropertyAssignment, K::ShorthandPropertyAssignment, K::SpreadAssignment, K::EnumMember,
+        K::SourceFile, K::JsDocTypeExpression, K::JsDocNameReference, K::JsDocAllType,
+        K::JsDocNullableType, K::JsDocNonNullableType, K::JsDocOptionalType, K::JsDocVariadicType,
+        K::JsDoc, K::JsDocText, K::JsDocTypeLiteral, K::JsDocSignature, K::JsDocLink, K::JsDocLinkCode,
+        K::JsDocLinkPlain, K::JsDocUnknownTag, K::JsDocAugmentsTag, K::JsDocImplementsTag,
+        K::JsDocDeprecatedTag, K::JsDocPublicTag, K::JsDocPrivateTag, K::JsDocProtectedTag,
+        K::JsDocReadonlyTag, K::JsDocOverrideTag, K::JsDocCallbackTag, K::JsDocOverloadTag,
+        K::JsDocParameterTag, K::JsDocReturnTag, K::JsDocThisTag, K::JsDocTypeTag, K::JsDocTemplateTag,
+        K::JsDocTypedefTag, K::JsDocSeeTag, K::JsDocPropertyTag, K::JsDocThrowsTag,
+        K::JsDocSatisfiesTag, K::JsDocImportTag, K::SyntaxList, K::JsTypeAliasDeclaration,
+        K::JsImportDeclaration, K::NotEmittedStatement, K::PartiallyEmittedExpression,
+        K::SyntheticReferenceExpression, K::NotEmittedTypeElement,
+    ];
+    let mut table = [K::Unknown; 512];
+    let mut i = 0;
+    while i < ALL.len() {
+        table[i] = ALL[i];
+        i += 1;
+    }
+    table
+};
 
 /// One `FileBlock` and its `OnceLock` state in one cache line.
 #[repr(align(64))]
@@ -1884,9 +1990,9 @@ struct BlockPool {
     /// Each plain kind column of a node shell (`plain_kinds`), by the hash
     /// of its kinds.
     kind_columns: FxHashMap<u64, Vec<&'static [SyntaxKind]>>,
-    /// The hashes of the file names whose node shells have a plain kind
-    /// column.
-    kind_names: FxHashSet<u64>,
+    /// The newest plain kind column of each file whose node shells have
+    /// one, by the hash of its name (`plain_kinds`).
+    kind_names: FxHashMap<u64, &'static [SyntaxKind]>,
     /// The bytes of the plain kind columns of later versions of files
     /// (`LATER_KINDS_BUDGET`).
     later_kind_bytes: usize,
@@ -1903,7 +2009,7 @@ static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
     free: Vec::new(),
     quarantine: VecDeque::new(),
     kind_columns: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
-    kind_names: FxHashSet::with_hasher(rustc_hash::FxBuildHasher),
+    kind_names: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
     later_kind_bytes: 0,
 });
 
@@ -1921,25 +2027,44 @@ static POOL: Mutex<BlockPool> = Mutex::new(BlockPool {
 // 4 `--singleThreaded` gate projects. 4 MiB is about 2% of the server's
 // RSS on query-core; before edleak1 its shells leaked that in about 1,400
 // stock edits.
+// PERF (edleak3): the budget stays. With none (every later version
+// pooled), a 400-edit session cost +1.79% instructions:u on query-core and
+// +0.28% on hono with a table read inline at each kind read, and +0.46%
+// and +0.26% with the plain prefix too (`plain_kinds`); the inline read
+// cost `--singleThreaded --noEmit` up to +0.40% on effect. Past the budget
+// a shell reads its plain prefix, and the rest with the cold table read
+// (`BlockFile::shell_kind`).
 const LATER_KINDS_BUDGET: usize = 4 << 20;
 
 /// The plain kind column (`FileBlock::kinds`) of a node shell of file
-/// `name` whose store has kinds `kinds`, or `None` when its kinds go in its
-/// pooled block (`BlockFile::shell_kinds`):
+/// `name` whose store has kinds `kinds` (`Ok`), or the plain prefix of a
+/// shell whose kinds go in its pooled block (`Err`,
+/// `BlockFile::shell_kinds`):
 /// - an equal column that an earlier shell leaked (a column never changes,
 ///   so shells can share it). An edit inside a token or a literal keeps
 ///   every kind of the file, and a file parsed again with the same text (a
 ///   `tsc --watch` build after a config change) has the same kinds;
 /// - else `kinds`, leaked (it takes the vector), for the first shell of
 ///   `name`, and for a later one while the columns of later versions stay
-///   in `LATER_KINDS_BUDGET`.
+///   in `LATER_KINDS_BUDGET`;
+/// - else (`Err`) the slots of the newest plain column of `name` up to the
+///   first kind that differs, which the shell reads plain.
 // PORT: Go frees the kinds with the file. A plain column is not atomic, so
 // a later file cannot reuse it: before edleak1 each new column leaked, about
 // 0.4 columns per edit in a long editor session. The first columns grow
 // only with the files the process reads.
 // PERF: watchfree1. A column is hashed and compared once, about the cost
 // of the compare with the last column before.
-fn plain_kinds(name: &str, kinds: &mut Vec<SyntaxKind>) -> Option<&'static [SyntaxKind]> {
+// PERF (edleak3): the prefix. The parser makes the slots of a file in text
+// order, so the slots before an edit keep their kinds, and a pooled shell
+// reads them plain, at no cost: the prefix is part of a column that is
+// already leaked. Past the budget, a 400-edit query-core session (every
+// later version pooled) cost +0.46% instructions:u with the prefix, +1.79%
+// without it (an inline pooled read in both).
+fn plain_kinds(
+    name: &str,
+    kinds: &mut Vec<SyntaxKind>,
+) -> Result<&'static [SyntaxKind], &'static [SyntaxKind]> {
     use std::hash::BuildHasher;
     let hash = rustc_hash::FxBuildHasher.hash_one(kinds.as_slice());
     let name_hash = rustc_hash::FxBuildHasher.hash_one(name);
@@ -1949,20 +2074,30 @@ fn plain_kinds(name: &str, kinds: &mut Vec<SyntaxKind>) -> Option<&'static [Synt
         .kind_columns
         .get(&hash)
         .and_then(|columns| columns.iter().find(|column| ***column == **kinds))
+        .copied()
     {
-        return Some(column);
+        if let Some(newest) = pool.kind_names.get_mut(&name_hash) {
+            *newest = column;
+        }
+        return Ok(column);
     }
-    if !pool.kind_names.insert(name_hash) {
+    if let Some(&newest) = pool.kind_names.get(&name_hash) {
         // A later version of the file, with new kinds.
         let bytes = pool.later_kind_bytes + std::mem::size_of_val(kinds.as_slice());
         if bytes > LATER_KINDS_BUDGET {
-            return None;
+            let same = newest
+                .iter()
+                .zip(kinds.iter())
+                .take_while(|(old, new)| old == new)
+                .count();
+            return Err(&newest[..same]);
         }
         pool.later_kind_bytes = bytes;
     }
     let column: &'static [SyntaxKind] = Vec::leak(std::mem::take(kinds));
     pool.kind_columns.entry(hash).or_default().push(column);
-    Some(column)
+    pool.kind_names.insert(name_hash, column);
+    Ok(column)
 }
 
 fn lock_pool() -> std::sync::MutexGuard<'static, BlockPool> {
@@ -4835,7 +4970,8 @@ fn publish_static(base: usize, mut stores: Vec<FileStore>, go_files: Vec<GoFile>
 /// the block of its id, with the node columns of the store: its records and
 /// kids, copied into a pooled block (`BlockPool`, AST node records, step
 /// 4), which the caller gives to the version, its kinds (a plain column,
-/// or the pooled block past a budget: `plain_kinds`, edleak1), and its
+/// or past a budget the pooled block after a plain prefix: `plain_kinds`,
+/// edleak1, edleak3), and its
 /// foreign parents, moved out of `store` and leaked. Its
 /// `BlockFile` has no store, no `GoFile` and no child link column: the
 /// `BlockFile` of the pooled block (`PoolBlock::file`, edleak1 part 2), or
@@ -4915,7 +5051,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
     debug_assert_eq!(store.kinds.len(), len);
     let shell_kinds: &'static [AtomicU16] = &block.kinds[..len];
     let plain = plain_kinds(store.file_name, &mut store.kinds);
-    if plain.is_none() {
+    if plain.is_err() {
         for (to, &from) in shell_kinds.iter().zip(&store.kinds) {
             to.store(from as u16, Ordering::Relaxed);
         }
@@ -4946,7 +5082,7 @@ fn node_shell(file: usize, store: &mut FileStore) -> (FileBlock, PoolBlock) {
         })),
     };
     let shell = FileBlock {
-        kinds: plain.unwrap_or(&[]),
+        kinds: plain.unwrap_or_else(|prefix| prefix),
         records,
         kids,
         file,
@@ -6402,12 +6538,13 @@ pub fn frozen_find_ancestor(
     let file = n.file_index();
     let b = file_block(file)?;
     let index = slot_index(n);
-    if b.kinds.is_empty() {
-        // A node shell with pooled kinds (`BlockFile::shell_kinds`).
+    if b.kinds.len() < b.records.len() {
+        // A node shell with pooled kinds (`BlockFile::shell_kinds`) past
+        // its plain prefix.
         return Some(store_find_ancestor(
             file,
             b.records,
-            |slot| b.file.shell_kind(slot),
+            |slot| b.kind(slot),
             index,
             callback,
         ));
@@ -9423,18 +9560,34 @@ mod tests {
         }
     }
 
+    // edleak3: the pooled kind table names each kind at its value, and
+    // `Unknown` past the last (`BlockFile::shell_kind`).
+    #[test]
+    fn pooled_kind_table_has_every_kind() {
+        for (word, &kind) in KIND_OF_WORD.iter().enumerate() {
+            let expected = u16::try_from(word)
+                .ok()
+                .and_then(|word| SyntaxKind::try_from(word).ok())
+                .unwrap_or(SyntaxKind::Unknown);
+            assert_eq!(kind, expected, "word {word}");
+        }
+        assert!(SyntaxKind::COUNT <= KIND_OF_WORD.len());
+    }
+
     // edleak1 round 2: the first node shell of a file gets a plain kind
     // column. A later version with new kinds gets one while the columns of
     // later versions stay in `LATER_KINDS_BUDGET`; past it, its kinds go
-    // in its pooled block (`BlockFile::shell_kinds`). Equal kinds share a
-    // plain column at any time. It publishes, so no other test may build or
-    // publish stores while it runs (the runner uses one thread).
+    // in its pooled block (`BlockFile::shell_kinds`), and its plain column
+    // is the prefix of the newest column of the file that has the same
+    // kinds (edleak3). Equal kinds share a plain column at any time. It
+    // publishes, so no other test may build or publish stores while it
+    // runs (the runner uses one thread).
     #[test]
     fn later_new_kinds_go_in_the_pooled_block_past_the_budget() {
         use super::super::file_version::FileVersion;
         clear_block_pool();
         // Publishes a freeable version of file `name` with `count`
-        // identifiers, and gives its plain kind column (empty when its
+        // identifiers, and gives its plain kind column (a prefix when its
         // kinds are pooled) and its last node.
         let version = |name: &'static str, count: usize| {
             let names: Vec<String> = (0..count).map(|i| format!("n{i}")).collect();
@@ -9464,7 +9617,15 @@ mod tests {
 
         lock_pool().later_kind_bytes = LATER_KINDS_BUDGET;
         let (_v3, third, node) = version("/later/a.ts", 3);
-        assert!(third.is_empty(), "new kinds past the budget are pooled");
+        assert!(
+            third.len() <= slot_index(node),
+            "new kinds past the budget are pooled"
+        );
+        assert_eq!(
+            (third.as_ptr(), third.len()),
+            (second.as_ptr(), second.len()),
+            "the slots before the first new kind read the newest column"
+        );
         let pooled = registry_block(node.file_index()).expect("a published store node");
         assert_eq!(pooled.kind(slot_index(node)), SyntaxKind::Identifier);
         assert_eq!(pooled.kind(NIL_SLOT as usize), first[NIL_SLOT as usize]);

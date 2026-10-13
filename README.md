@@ -104,7 +104,7 @@ goes away when the port moves to a newer pin. tsc-rs 0.3.0 and earlier used the 
 (`typescript@7.1.0-dev.20260929.1`).
 
 - **Same results.** TanStack Query core and Hono check with diagnostics identical to Go's. All
-  184,745 ported Go tests pass. The language server and API answers match Go on the oracle test
+  184,749 ported Go tests pass. The language server and API answers match Go on the oracle test
   sets.
 - **Faster.** On 60 open-source projects, type checking takes about half of Go's time (geometric
   mean). The npm packages from 0.2.0 on are built in CI with PGO but without BOLT (0.1.0 has
