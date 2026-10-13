@@ -91,6 +91,9 @@ impl contentmapper::Spawner for OsSystemSpawner {
 
 // Go: cmd/tsc/api.go:45 runAPI
 pub fn run_api(args: &[String]) -> i32 {
+    // PORT: not in Go. A server makes checkers for many programs
+    // (flatarena1, `use_bounded_arenas`).
+    crate::checker::types::use_bounded_arenas();
     let Ok(flags) = parse_api_flags(args) else {
         return 2;
     };

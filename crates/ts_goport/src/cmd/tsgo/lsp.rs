@@ -20,6 +20,9 @@ use std::time::Duration;
 
 // Go: cmd/tsc/lsp.go:21 runLSP
 pub fn run_lsp(args: &[String]) -> i32 {
+    // PORT: not in Go. A server makes checkers for many programs
+    // (flatarena1, `use_bounded_arenas`).
+    crate::checker::types::use_bounded_arenas();
     let mut flag = new_flag_set("lsp", ErrorHandling::ContinueOnError);
     let stdio = flag.bool("stdio", false, "use stdio for communication");
     let pprof_dir = flag.string(
