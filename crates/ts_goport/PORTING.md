@@ -170,11 +170,13 @@ variant that embeds `X` (panic otherwise). Every other Go method on `*Type`
 - `inference_contexts: ChunkedArena<InferenceContext>` -> `self.inference_context(c)`, `self.inference_context_mut(c)`.
 A `ChunkedArena` (`checker/types.rs`) is one flat `Vec` on 64-bit targets
 that are not Windows (flatarena1), so a read is the base, one bounds check
-and the entry. It doubles up to 2 MiB, then moves once into a 2 GiB virtual
-reserve, so it does not copy every entry when it grows, as a doubling `Vec`
-does (infermem1: the `inference_contexts` `Vec` kept buffers of 512 and
-256 MiB on typebox). When the reserve fails, after `use_bounded_arenas`
-(the LSP and API servers call it) and past the reserve, it doubles.
+and the entry. It doubles up to 2 MiB, then moves into a 256 MiB virtual
+room, and into a 2 GiB room when it fills that one, so it does not copy
+every entry when it grows, as a doubling `Vec` does (infermem1: the
+`inference_contexts` `Vec` kept buffers of 512 and 256 MiB on typebox).
+Under strict overcommit or an address space or data limit below 32 GiB it
+takes no room. Then, and when a room fails or the last one is full, the
+later entries go into chunks of 8,192 (a read of them takes a cold path).
 Windows and 32-bit targets keep chunks of 8,192 entries.
 Each arena has a dummy entry at index 0. New entries are pushed; ids are
 `TypeId(len as u32)` etc. Go `c.newType`, `c.newSignature`,
