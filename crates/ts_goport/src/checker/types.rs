@@ -2917,11 +2917,24 @@ mod flat_arena {
             self.push_with(move || value);
         }
 
-        /// Pushes the value `make` returns. `make` runs after the room test.
+        /// Pushes the value `make` returns. `make` runs after the room
+        /// tests, so a large value (a `Type`) is built straight in its slot.
+        ///
+        /// PERF (flatarena1): with one test, the grow branch of `Vec::push`
+        /// stayed after `grow`, so `make` built each `Type` on the stack and
+        /// it was copied into its slot with 8 16-byte loads and stores
+        /// (`new_type_parameter`). The second test never fails (`grow` makes
+        /// room or stops the process), and with it LLVM knows there is room
+        /// at the push: when `make` makes no call, the grow branch of
+        /// `Vec::push` goes. When the first test fails, the second is known
+        /// to fail too, so the hot path makes one test.
         #[inline(always)]
         pub fn push_with(&mut self, make: impl FnOnce() -> T) {
             if self.items.len() == self.items.capacity() {
                 self.grow();
+            }
+            if self.items.len() == self.items.capacity() {
+                arena_full();
             }
             self.items.push(make());
         }
@@ -2948,6 +2961,13 @@ mod flat_arena {
             }
             self.items.reserve_exact(cap);
         }
+    }
+
+    /// The arena has no room after `grow`. `push_with` never gets here.
+    #[cold]
+    #[inline(never)]
+    fn arena_full() -> ! {
+        panic!("arena is full")
     }
 
     impl<T> std::ops::Index<usize> for ChunkedArena<T> {
