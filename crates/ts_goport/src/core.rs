@@ -1273,19 +1273,19 @@ const _: () = assert!(std::mem::size_of::<Symbol>() == 56);
 
 /// A growable array split into fixed-size chunks that clones share. Index
 /// `i` is value `i % COW_CHUNK_LEN` of chunk `i / COW_CHUNK_LEN`. The values
-/// after the last chunk are the tail, one `Vec` of at most one chunk. A
-/// chunk is owned by this array (written without an atomic operation),
-/// static (a chunk that lives until exit, `freeze_from`), shared with clones
-/// by `Arc` (`share_from`) or freed (`free_chunks`). A clone copies the owned
-/// chunks and the tail, and shares the others. The first write to a static
-/// or full shared chunk takes it back (a copy, unless no clone uses a shared
-/// chunk).
+/// after the last chunk are the tail, one `Vec` of at most one chunk. A full
+/// chunk is a block (`Block`, an `Arc` of its values): owned while this
+/// array holds its only count (written in place), shared with clones, or
+/// static (`freeze_from`: one count is never dropped, so the block lives
+/// until exit). A clone shares every block and copies the tail. The first
+/// write to a block that is not owned takes it back (a copy, unless no clone
+/// uses it any more). A chunk can also be a partial shared chunk
+/// (`Chunk::Shared`) or freed (`free_chunks`).
 ///
-/// An owned or static chunk is always full. Only a shared chunk can hold
-/// fewer values: the tail that `share_from` or `end_chunk` shared. A write
-/// to it keeps it shared, and the next push takes it back as the tail.
-/// So a read at or above the length panics (index out of bounds), as a
-/// `Vec` read does.
+/// Only a partial shared chunk holds fewer values than a chunk: the tail
+/// that `share_from` or `end_chunk` shared. A write to it keeps it shared,
+/// and the next push takes it back as the tail. So a read at or above the
+/// length panics (index out of bounds), as a `Vec` read does.
 ///
 /// Holes (lsshells M3d): `end_chunk` moves the length to the next chunk
 /// start, so the indexes left in the last chunk hold no value, and
@@ -1300,44 +1300,58 @@ const _: () = assert!(std::mem::size_of::<Symbol>() == 56);
 /// later lineage index is never one of a checker's own, and a checker can
 /// add the chunks that the lineage bound after its copy (`catch_up`), as a
 /// Go checker reads every bound file. In a checker copy, the lineage chunk
-/// that held the copy's last values is an owned chunk padded with default
+/// that held the copy's last values is an owned block padded with default
 /// values: its indexes after those values read as default, not as holes.
-// PERF: an owned or static chunk is a fixed array behind a thin pointer at
-// the same place in the chunk entry, so `get` of one is one bounds test (the
-// chunk list), one kind test and one load, with no branch between the two
-// kinds and no pointer hop. A read of the tail is one bounds test more (its
-// `Vec`), and that test also stops a read at or above the length. Shared and
-// freed chunks (only in the language service) go out of line.
+///
+/// A file arena (`new_file`) has no chunks: its values stay in the tail
+/// until `into_aligned` moves them into blocks.
+// PERF (symtag1): a read of a full chunk is one bounds test (the block
+// list), the load of the block pointer, a null test of it and the load of
+// the value: no kind test. A block keeps its values at the same offset
+// after its counts, so owned, shared and static blocks read alike. A read
+// of the tail is one bounds test more (its `Vec`), and that test also stops
+// a read at or above the length. Partial shared and freed chunks (only in
+// the language service) have no block and go out of line.
 // PERF (apisym1c): the parity is in the index, so `get` does not select a
 // part (a second array cost 0.8 to 2.5 percent instructions in a check).
 #[derive(Debug)]
 pub struct CowChunks<T: 'static> {
+    /// The block of each full chunk, by chunk; None for a partial shared
+    /// chunk or a freed chunk.
+    blocks: Vec<Option<Block<T>>>,
+    /// The partial shared chunks, by chunk, as long as `blocks`.
     chunks: Vec<Chunk<T>>,
-    /// The values from index `chunks.len() * COW_CHUNK_LEN` on. Empty, with
+    /// The values from index `blocks.len() * COW_CHUNK_LEN` on. Empty, with
     /// no capacity, while the length is inside the last chunk (a partial
     /// shared chunk).
     tail: Vec<T>,
     len: usize,
     /// Each sealed chunk is followed by a freed chunk (`new_interleaved`).
     interleaved: bool,
+    /// A file arena (`new_file`): pushes never seal the tail.
+    file: bool,
 }
 
-/// A clone copies the owned chunks and the tail, and shares the others
-/// (`CowChunks`). Its chunk list has `CLONE_CHUNK_ROOM` more entries of
-/// room, so the next pushes do not grow it.
+/// A clone shares every block and copies the tail (`CowChunks`). Its chunk
+/// lists have `CLONE_CHUNK_ROOM` more entries of room, so the next pushes do
+/// not grow them.
 // PERF (edleak3): the binder lineage is a clone after each change that a
 // program shares (`program::Lineage::symbols_mut`). A clone with no room
 // doubled its chunk list at the first new chunk, and the programs then kept
 // those lists with up to half of them unused.
 impl<T: Clone> Clone for CowChunks<T> {
     fn clone(&self) -> Self {
+        let mut blocks = Vec::with_capacity(self.blocks.len() + CLONE_CHUNK_ROOM);
+        blocks.extend(self.blocks.iter().cloned());
         let mut chunks = Vec::with_capacity(self.chunks.len() + CLONE_CHUNK_ROOM);
         chunks.extend(self.chunks.iter().cloned());
         Self {
+            blocks,
             chunks,
             tail: self.tail.clone(),
             len: self.len,
             interleaved: self.interleaved,
+            file: self.file,
         }
     }
 }
@@ -1353,106 +1367,51 @@ const COW_CHUNK_MASK: usize = COW_CHUNK_LEN - 1;
 
 type ChunkValues<T> = [T; COW_CHUNK_LEN];
 
+/// The values of a full chunk (see `CowChunks`).
+type Block<T> = Arc<ChunkValues<T>>;
+
+/// What a chunk holds besides its block (`CowChunks::blocks`).
 #[derive(Clone, Debug)]
 enum Chunk<T: 'static> {
-    /// Read in place (`get` tests for this kind once). Always full.
-    Fixed(Fixed<T>),
-    /// Only the first `len()` indexes hold values.
+    /// A full chunk (its block) or a freed chunk (no block).
+    Block,
+    /// A partial chunk that clones share (no block): only the first `len()`
+    /// indexes hold values.
     Shared(Arc<Vec<T>>),
-    Freed,
 }
 
-// PERF: the two kinds keep the pointer at the same place, so `get` reads
-// both with one load and no branch.
-#[derive(Clone, Debug)]
-enum Fixed<T: 'static> {
-    Owned(Box<ChunkValues<T>>),
-    /// A leaked full chunk (`CowChunks::freeze_from`).
-    Static(&'static ChunkValues<T>),
-}
-
-/// An owned chunk of `values`, which must be exactly `COW_CHUNK_LEN`. No
-/// copy when their capacity is one chunk.
-fn full_chunk<T>(values: Vec<T>) -> Chunk<T> {
-    let values: Box<ChunkValues<T>> = values
-        .into_boxed_slice()
+/// A block of `values`, which must be exactly `COW_CHUNK_LEN`. Each value
+/// moves (or clones) into the block once: the collect allocates the block
+/// first when the iterator knows its length.
+fn block_of<T>(values: impl IntoIterator<Item = T>) -> Block<T> {
+    let values: Arc<[T]> = values.into_iter().collect();
+    values
         .try_into()
-        .unwrap_or_else(|_| panic!("a fixed chunk holds {COW_CHUNK_LEN} values"));
-    Chunk::Fixed(Fixed::Owned(values))
+        .unwrap_or_else(|_| panic!("a block holds {COW_CHUNK_LEN} values"))
 }
 
-impl<T> Fixed<T> {
-    #[inline(always)]
-    fn values(&self) -> &ChunkValues<T> {
-        match self {
-            Fixed::Owned(values) => values,
-            Fixed::Static(values) => values,
-        }
-    }
-}
-
-impl<T: Clone> Chunk<T> {
-    /// Value `k` for a write. Takes the chunk back first if it is not owned.
-    #[inline]
-    fn value_mut(&mut self, k: usize) -> &mut T {
-        if !matches!(self, Chunk::Fixed(Fixed::Owned(_))) {
-            return self.take_back_value(k);
-        }
-        match self {
-            Chunk::Fixed(Fixed::Owned(values)) => &mut values[k],
-            _ => unreachable!("chunk was just tested"),
-        }
-    }
-
-    /// `value_mut` of a chunk that is not owned. A static or full shared
-    /// chunk becomes owned. A partial shared chunk stays shared (a copy when
-    /// a clone still uses it), so its holes still panic.
-    #[cold]
-    #[inline(never)]
-    fn take_back_value(&mut self, k: usize) -> &mut T {
-        if !matches!(self, Chunk::Shared(values) if values.len() < COW_CHUNK_LEN) {
-            *self = match std::mem::replace(self, Chunk::Freed) {
-                Chunk::Fixed(Fixed::Static(values)) => full_chunk(values.to_vec()),
-                Chunk::Shared(values) => full_chunk(Arc::unwrap_or_clone(values)),
-                Chunk::Fixed(Fixed::Owned(values)) => Chunk::Fixed(Fixed::Owned(values)),
-                Chunk::Freed => panic!("write to a freed chunk"),
-            };
-        }
-        match self {
-            Chunk::Fixed(Fixed::Owned(values)) => &mut values[k],
-            Chunk::Shared(values) => &mut Arc::make_mut(values)[k],
-            _ => unreachable!("chunk was just taken back"),
-        }
-    }
-
-    /// The values, moved out (or cloned from a chunk that a clone still
-    /// uses).
-    fn into_values(self) -> Vec<T> {
-        match self {
-            Chunk::Fixed(Fixed::Owned(values)) => Vec::from(values as Box<[T]>),
-            Chunk::Fixed(Fixed::Static(values)) => values.to_vec(),
-            Chunk::Shared(values) => Arc::unwrap_or_clone(values),
-            Chunk::Freed => Vec::new(),
-        }
-    }
-
-    fn has_values(&self) -> bool {
-        match self {
-            Chunk::Fixed(_) => true,
-            Chunk::Shared(values) => !values.is_empty(),
-            Chunk::Freed => false,
-        }
-    }
+/// An owned block that holds `values` (at most one chunk) and default
+/// values after them (see `CowChunks`).
+fn padded_block<T: Clone + Default>(values: &[T]) -> Block<T> {
+    let pad = COW_CHUNK_LEN - values.len();
+    block_of(
+        values
+            .iter()
+            .cloned()
+            .chain(std::iter::repeat_with(T::default).take(pad)),
+    )
 }
 
 impl<T: Clone> CowChunks<T> {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            blocks: Vec::new(),
             chunks: Vec::new(),
             tail: Vec::new(),
             len: 0,
             interleaved: false,
+            file: false,
         }
     }
 
@@ -1462,6 +1421,15 @@ impl<T: Clone> CowChunks<T> {
     pub fn new_interleaved() -> Self {
         Self {
             interleaved: true,
+            ..Self::new()
+        }
+    }
+
+    /// An empty file arena (see `CowChunks`): pushes grow the tail.
+    #[must_use]
+    pub fn new_file() -> Self {
+        Self {
+            file: true,
             ..Self::new()
         }
     }
@@ -1504,7 +1472,13 @@ impl<T: Clone> CowChunks<T> {
     /// The index of the first tail value.
     #[inline(always)]
     fn tail_start(&self) -> usize {
-        self.chunks.len() << COW_CHUNK_SHIFT
+        self.blocks.len() << COW_CHUNK_SHIFT
+    }
+
+    /// Adds chunk entries at the end of both lists.
+    fn push_chunk(&mut self, block: Option<Block<T>>, chunk: Chunk<T>) {
+        self.blocks.push(block);
+        self.chunks.push(chunk);
     }
 
     // PERF: the value is written into the tail inline when it has room, and
@@ -1521,15 +1495,20 @@ impl<T: Clone> CowChunks<T> {
 
     /// `push` when the tail has no room: takes a partial shared last chunk
     /// back as the tail, makes a full tail a chunk, and grows the tail (as
-    /// `Vec::push` does while the array has no chunk, else to one chunk).
+    /// `Vec::push` does while the array has no chunk, else to one chunk). A
+    /// file arena grows its tail as a `Vec` does.
     #[cold]
     #[inline(never)]
     fn make_room(&mut self) {
         if self.len < self.tail_start() {
             self.take_back_tail();
         }
+        if self.file {
+            self.tail.reserve(1);
+            return;
+        }
         self.seal_full_tail();
-        let room = if self.chunks.is_empty() {
+        let room = if self.blocks.is_empty() {
             (self.tail.capacity() * 2).clamp(4, COW_CHUNK_LEN)
         } else {
             COW_CHUNK_LEN
@@ -1542,20 +1521,25 @@ impl<T: Clone> CowChunks<T> {
     /// it).
     fn take_back_tail(&mut self) {
         debug_assert!(self.tail.is_empty(), "a tail after a partial chunk");
+        self.blocks.pop();
         self.tail = match self.chunks.pop() {
             Some(Chunk::Shared(values)) => Arc::unwrap_or_clone(values),
             _ => panic!("write to a freed chunk"),
         };
     }
 
-    /// Makes a full tail an owned chunk. In an interleaved array a freed
-    /// chunk follows it, and the length moves to the chunk after that.
+    /// Makes a full tail an owned block (one copy). In an interleaved array
+    /// a freed chunk follows it, and the length moves to the chunk after
+    /// that.
     fn seal_full_tail(&mut self) {
         if self.tail.len() == COW_CHUNK_LEN {
-            let values = std::mem::take(&mut self.tail);
-            self.chunks.push(full_chunk(values));
+            let values: Arc<[T]> = Arc::from(std::mem::take(&mut self.tail));
+            let block = values
+                .try_into()
+                .unwrap_or_else(|_| panic!("a block holds {COW_CHUNK_LEN} values"));
+            self.push_chunk(Some(block), Chunk::Block);
             if self.interleaved {
-                self.chunks.push(Chunk::Freed);
+                self.push_chunk(None, Chunk::Block);
                 self.len = self.tail_start();
             }
         }
@@ -1563,88 +1547,104 @@ impl<T: Clone> CowChunks<T> {
 
     /// Makes room for `additional` more values, so the pushes that follow
     /// do not grow step by step: in the tail up to one chunk while the array
-    /// has no chunk, and in the chunk list when the values need more than
-    /// one chunk. Capacity only.
+    /// has no chunk, and in the chunk lists when the values need more than
+    /// one chunk; in a file arena, in the tail. Capacity only.
     // PERF: bind D. A file arena started with a one-value first chunk,
-    // which `push` grew by doubling for every bound file. The tail gets at
-    // most one chunk of room: the chunks after it free one by one in
-    // `into_aligned`, so a large file arena (a lib snapshot load) does not
-    // hold its whole buffer while its values move.
+    // which `push` grew by doubling for every bound file.
     pub fn reserve(&mut self, additional: usize) {
-        if self.chunks.is_empty() {
+        if self.file {
+            self.tail.reserve(additional);
+            return;
+        }
+        if self.blocks.is_empty() {
             let room = COW_CHUNK_LEN.saturating_sub(self.tail.len());
             self.tail.reserve_exact(additional.min(room));
         }
         if self.len + additional > COW_CHUNK_LEN {
-            let chunks = (self.len + additional) >> COW_CHUNK_SHIFT;
-            self.chunks
-                .reserve(chunks.saturating_sub(self.chunks.len()));
+            let chunks =
+                ((self.len + additional) >> COW_CHUNK_SHIFT).saturating_sub(self.blocks.len());
+            self.blocks.reserve(chunks);
+            self.chunks.reserve(chunks);
         }
     }
 
     #[inline(always)]
     #[must_use]
     pub fn get(&self, i: usize) -> &T {
-        match self.chunks.get(i >> COW_CHUNK_SHIFT) {
-            Some(Chunk::Fixed(values)) => &values.values()[i & COW_CHUNK_MASK],
-            Some(_) => self.get_other(i),
+        match self.blocks.get(i >> COW_CHUNK_SHIFT) {
+            Some(Some(block)) => &block[i & COW_CHUNK_MASK],
+            Some(None) => self.get_other(i),
             None => &self.tail[i - self.tail_start()],
         }
     }
 
-    /// `get` from a shared or freed chunk.
+    /// `get` from a partial shared or freed chunk.
     #[cold]
     #[inline(never)]
     fn get_other(&self, i: usize) -> &T {
         match &self.chunks[i >> COW_CHUNK_SHIFT] {
             Chunk::Shared(values) => &values[i & COW_CHUNK_MASK],
-            _ => panic!("read of freed index {i}"),
+            Chunk::Block => panic!("read of freed index {i}"),
         }
     }
 
     /// Takes the chunk back first if it is not owned.
     #[inline]
     pub fn get_mut(&mut self, i: usize) -> &mut T {
-        let tail_start = self.tail_start();
-        match self.chunks.get_mut(i >> COW_CHUNK_SHIFT) {
-            Some(chunk) => chunk.value_mut(i & COW_CHUNK_MASK),
-            None => &mut self.tail[i - tail_start],
+        let (position, k) = (i >> COW_CHUNK_SHIFT, i & COW_CHUNK_MASK);
+        if position >= self.blocks.len() {
+            let tail_start = self.tail_start();
+            return &mut self.tail[i - tail_start];
+        }
+        if !matches!(&self.blocks[position], Some(block) if Arc::strong_count(block) == 1) {
+            return self.take_back_value(position, k);
+        }
+        match self.blocks[position].as_mut().and_then(Arc::get_mut) {
+            Some(values) => &mut values[k],
+            None => unreachable!("an owned block"),
         }
     }
 
-    /// Makes the owned chunks that hold values from index `from` on shared,
-    /// so clones copy none of them. The tail becomes a shared chunk too when
-    /// `from` is in or before its chunk. Pass 0 to share every chunk. Static
-    /// and freed chunks stay as they are.
+    /// `get_mut` of value `k` of chunk `position`, which has no owned block.
+    /// A static or shared block becomes owned (a copy, unless no clone uses
+    /// it any more). A partial shared chunk stays shared (a copy when a
+    /// clone still uses it), so its holes still panic.
+    #[cold]
+    #[inline(never)]
+    fn take_back_value(&mut self, position: usize, k: usize) -> &mut T {
+        if let Some(block) = &mut self.blocks[position] {
+            if Arc::get_mut(block).is_none() {
+                *block = block_of(block.iter().cloned());
+            }
+            return &mut Arc::get_mut(block).expect("a copied block is owned")[k];
+        }
+        match &mut self.chunks[position] {
+            Chunk::Shared(values) => &mut Arc::make_mut(values)[k],
+            Chunk::Block => panic!("write to a freed chunk"),
+        }
+    }
+
+    /// Makes the tail a shared chunk when `from` is in or before its chunk,
+    /// so clones copy none of the values from `from` on. Pass 0 to share
+    /// every chunk. Blocks need no step: a clone shares them.
     pub fn share_from(&mut self, from: usize) {
         self.seal_full_tail();
         let first = from >> COW_CHUNK_SHIFT;
-        for chunk in self.chunks.iter_mut().skip(first) {
-            if matches!(chunk, Chunk::Fixed(Fixed::Owned(_))) {
-                let values = std::mem::replace(chunk, Chunk::Freed).into_values();
-                *chunk = Chunk::Shared(Arc::new(values));
-            }
-        }
-        if !self.tail.is_empty() && first <= self.chunks.len() {
+        if !self.tail.is_empty() && first <= self.blocks.len() {
             let values = std::mem::take(&mut self.tail);
-            self.chunks.push(Chunk::Shared(Arc::new(values)));
+            self.push_chunk(None, Chunk::Shared(Arc::new(values)));
         }
     }
 
-    /// Leaks the owned chunks from index `from` on, so clones share them
-    /// with no copy and no reference count. Only for values that live until
-    /// exit, which are never freed (`free_chunks`). A later write to one
-    /// copies it (`Chunk::value_mut`) and leaves the leaked chunk. The tail
-    /// stays owned until it is full.
+    /// Keeps the owned blocks from index `from` on until exit: each keeps a
+    /// count that is never dropped. Only for values that live until exit,
+    /// which are never freed (`free_chunks`). A later write to one copies
+    /// it (`get_mut`). The tail stays owned until it is full.
     pub fn freeze_from(&mut self, from: usize) {
         self.seal_full_tail();
-        for chunk in self.chunks.iter_mut().skip(from >> COW_CHUNK_SHIFT) {
-            if matches!(chunk, Chunk::Fixed(Fixed::Owned(_))) {
-                let Chunk::Fixed(Fixed::Owned(values)) = std::mem::replace(chunk, Chunk::Freed)
-                else {
-                    unreachable!("chunk was just tested")
-                };
-                *chunk = Chunk::Fixed(Fixed::Static(Box::leak(values)));
+        for block in self.blocks.iter().skip(from >> COW_CHUNK_SHIFT).flatten() {
+            if Arc::strong_count(block) == 1 {
+                std::mem::forget(Arc::clone(block));
             }
         }
     }
@@ -1667,7 +1667,7 @@ impl<T: Clone> CowChunks<T> {
         self.share_from(self.len);
         self.len = self.len.next_multiple_of(COW_CHUNK_LEN);
         if self.interleaved {
-            self.chunks.push(Chunk::Freed);
+            self.push_chunk(None, Chunk::Block);
             self.len += COW_CHUNK_LEN;
         }
     }
@@ -1685,12 +1685,12 @@ impl<T: Clone> CowChunks<T> {
         // A tail that pushes filled to a chunk end (`end_chunk` does
         // nothing there) is a chunk that the range can hold.
         self.seal_full_tail();
-        let end = (to >> COW_CHUNK_SHIFT).min(self.chunks.len());
+        let end = (to >> COW_CHUNK_SHIFT).min(self.blocks.len());
         let first = from.div_ceil(COW_CHUNK_LEN).min(end);
-        let interleaved = self.interleaved;
-        for (position, chunk) in self.chunks.iter_mut().enumerate().take(end).skip(first) {
-            if !interleaved || position % 2 == 0 {
-                *chunk = Chunk::Freed;
+        for position in first..end {
+            if !self.interleaved || position % 2 == 0 {
+                self.blocks[position] = None;
+                self.chunks[position] = Chunk::Block;
             }
         }
     }
@@ -1700,10 +1700,8 @@ impl<T: Clone> CowChunks<T> {
     #[must_use]
     pub fn live_chunks(&self) -> usize {
         usize::from(!self.tail.is_empty())
-            + self
-                .chunks
-                .iter()
-                .filter(|chunk| chunk.has_values())
+            + (0..self.blocks.len())
+                .filter(|&position| !self.chunk_values(position).is_empty())
                 .count()
     }
 
@@ -1714,6 +1712,8 @@ impl<T: Clone> CowChunks<T> {
     /// fill a partial tail there (`head`).
     // PERF: a bind thread does the id remap (`f`) and the moves here, so
     // the loading thread only appends chunks (`SymbolArena::append_file_arena`).
+    // Each value of a file arena (`new_file`, all in the tail) moves once,
+    // into its block.
     pub fn into_aligned(
         mut self,
         skip: usize,
@@ -1721,43 +1721,40 @@ impl<T: Clone> CowChunks<T> {
         mut f: impl FnMut(&mut T),
     ) -> AlignedChunks<T> {
         debug_assert!(!self.interleaved, "a file arena is not interleaved");
-        let len = self.len.saturating_sub(skip);
+        let mut all = if self.blocks.is_empty() {
+            std::mem::take(&mut self.tail)
+        } else {
+            let mut all = Vec::with_capacity(self.len);
+            for position in 0..self.blocks.len() {
+                all.extend_from_slice(self.chunk_values(position));
+            }
+            all.append(&mut self.tail);
+            all
+        };
+        let skip = skip.min(all.len());
+        let len = all.len() - skip;
         let room = (COW_CHUNK_LEN - (at & COW_CHUNK_MASK)) & COW_CHUNK_MASK;
         let head_len = room.min(len);
-        let mut head = Vec::with_capacity(head_len);
-        let mut chunks = Vec::with_capacity((len - head_len) >> COW_CHUNK_SHIFT);
-        let mut tail = Vec::new();
-        let mut add = |mut value: T| {
+        let mut values = all.drain(skip..).map(|mut value| {
             f(&mut value);
-            if head.len() < room {
-                head.push(value);
-                return;
-            }
-            if tail.capacity() == 0 {
-                tail.reserve_exact(COW_CHUNK_LEN);
-            }
-            tail.push(value);
-            if tail.len() == COW_CHUNK_LEN {
-                chunks.push(full_chunk(std::mem::take(&mut tail)));
-            }
-        };
-        std::mem::take(&mut self.chunks)
-            .into_iter()
-            .flat_map(Chunk::into_values)
-            .chain(std::mem::take(&mut self.tail))
-            .skip(skip)
-            .for_each(&mut add);
-        debug_assert_eq!(head.len(), head_len, "aligned head length");
-        debug_assert_eq!(
-            chunks.len(),
-            (len - head_len) >> COW_CHUNK_SHIFT,
-            "aligned chunk count"
-        );
+            value
+        });
+        let head: Vec<T> = values.by_ref().take(head_len).collect();
+        let count = (len - head_len) >> COW_CHUNK_SHIFT;
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            blocks.push(block_of(values.by_ref().take(COW_CHUNK_LEN)));
+        }
+        let mut tail = Vec::new();
+        if len - head_len > count << COW_CHUNK_SHIFT {
+            tail.reserve_exact(COW_CHUNK_LEN);
+            tail.extend(values);
+        }
         AlignedChunks {
             at,
             len,
             head,
-            chunks,
+            blocks,
             tail,
         }
     }
@@ -1777,16 +1774,17 @@ impl<T: Clone> CowChunks<T> {
         // The head fills the tail up to a chunk end at most.
         self.tail.reserve_exact(aligned.head.len());
         self.tail.extend(aligned.head);
-        if !aligned.chunks.is_empty() || !aligned.tail.is_empty() {
+        if !aligned.blocks.is_empty() || !aligned.tail.is_empty() {
             self.seal_full_tail();
             debug_assert!(self.tail.is_empty(), "aligned chunks after a partial tail");
-            if self.interleaved {
-                self.chunks.reserve(2 * aligned.chunks.len());
-                for chunk in aligned.chunks {
-                    self.chunks.extend([chunk, Chunk::Freed]);
+            let step = if self.interleaved { 2 } else { 1 };
+            self.blocks.reserve(step * aligned.blocks.len());
+            self.chunks.reserve(step * aligned.blocks.len());
+            for block in aligned.blocks {
+                self.push_chunk(Some(block), Chunk::Block);
+                if self.interleaved {
+                    self.push_chunk(None, Chunk::Block);
                 }
-            } else {
-                self.chunks.extend(aligned.chunks);
             }
             self.tail = aligned.tail;
         }
@@ -1796,11 +1794,13 @@ impl<T: Clone> CowChunks<T> {
     /// The values that chunk `position` holds: the tail at the chunk after
     /// the last, and none after it.
     fn chunk_values(&self, position: usize) -> &[T] {
-        match self.chunks.get(position) {
-            Some(Chunk::Fixed(values)) => values.values(),
-            Some(Chunk::Shared(values)) => values,
-            Some(Chunk::Freed) => &[],
-            None if position == self.chunks.len() => &self.tail,
+        match self.blocks.get(position) {
+            Some(Some(block)) => &block[..],
+            Some(None) => match &self.chunks[position] {
+                Chunk::Shared(values) => values,
+                Chunk::Block => &[],
+            },
+            None if position == self.blocks.len() => &self.tail,
             None => &[],
         }
     }
@@ -1808,7 +1808,7 @@ impl<T: Clone> CowChunks<T> {
     /// The indexes of the values in the odd chunks, the tail too when it is
     /// in one, in order: the own values of a checker copy (`for_checker`).
     pub fn odd_indexes(&self) -> impl Iterator<Item = usize> + '_ {
-        (1..=self.chunks.len())
+        (1..=self.blocks.len())
             .step_by(2)
             .flat_map(move |position| {
                 let start = position << COW_CHUNK_SHIFT;
@@ -1817,38 +1817,33 @@ impl<T: Clone> CowChunks<T> {
     }
 }
 
-/// An owned chunk that holds `values` (at most one chunk) and default
-/// values after them (see `CowChunks`).
-fn padded_chunk<T: Clone + Default>(values: &[T]) -> Chunk<T> {
-    let mut padded = Vec::with_capacity(COW_CHUNK_LEN);
-    padded.extend_from_slice(values);
-    padded.resize_with(COW_CHUNK_LEN, T::default);
-    full_chunk(padded)
-}
-
 // apisym1c: the checker copies of the binder lineage.
 impl<T: Clone + Default> CowChunks<T> {
     /// A checker copy of this interleaved lineage array. It shares the
     /// lineage chunks as a clone does, holds the lineage's tail as an owned
-    /// chunk padded with default values, and pushes its own values from the
+    /// block padded with default values, and pushes its own values from the
     /// next odd chunk on.
     #[must_use]
     pub fn for_checker(&self) -> CowChunks<T> {
         debug_assert!(self.interleaved, "a checker copies the binder lineage");
-        let mut chunks = Vec::with_capacity(self.chunks.len() + 2);
-        chunks.extend(self.chunks.iter().cloned());
-        if !self.tail.is_empty() {
-            chunks.push(padded_chunk(&self.tail));
-        }
-        if chunks.len() % 2 == 0 {
-            chunks.push(Chunk::Freed);
-        }
-        CowChunks {
-            len: chunks.len() << COW_CHUNK_SHIFT,
-            chunks,
+        let mut copy = CowChunks {
+            blocks: Vec::with_capacity(self.blocks.len() + 2),
+            chunks: Vec::with_capacity(self.blocks.len() + 2),
             tail: Vec::new(),
+            len: 0,
             interleaved: true,
+            file: false,
+        };
+        copy.blocks.extend(self.blocks.iter().cloned());
+        copy.chunks.extend(self.chunks.iter().cloned());
+        if !self.tail.is_empty() {
+            copy.push_chunk(Some(padded_block(&self.tail)), Chunk::Block);
         }
+        if copy.blocks.len() % 2 == 0 {
+            copy.push_chunk(None, Chunk::Block);
+        }
+        copy.len = copy.tail_start();
+        copy
     }
 
     /// Adds the lineage values of `from` from index `seen` on. `from` is
@@ -1856,8 +1851,8 @@ impl<T: Clone + Default> CowChunks<T> {
     /// (`for_checker`) whose lineage length was `seen`, so each lineage
     /// index below `seen` holds the same value in both, except where this
     /// array wrote. The values here do not change. The later lineage chunks
-    /// are shared as `from` holds them (static, shared by `Arc`, or freed),
-    /// and a chunk that `from` still fills is padded. When the lineage
+    /// are shared as `from` holds them (blocks, partial shared or freed),
+    /// and the chunk that holds `from`'s tail is padded. When the lineage
     /// passes this array's tail, the tail ends in its chunk, as `end_chunk`
     /// ends one, and the next own value starts after the lineage.
     pub fn catch_up(&mut self, seen: usize, from: &CowChunks<T>) {
@@ -1870,11 +1865,11 @@ impl<T: Clone + Default> CowChunks<T> {
         }
         // The last even chunk with indexes below the lineage length.
         let last = ((from.len - 1) >> COW_CHUNK_SHIFT) & !1;
-        if last >= self.chunks.len() {
+        if last >= self.blocks.len() {
             let mut own = std::mem::take(&mut self.tail);
-            self.chunks.push(match own.len() {
-                0 => Chunk::Freed,
-                COW_CHUNK_LEN => full_chunk(own),
+            match own.len() {
+                0 => self.push_chunk(None, Chunk::Block),
+                COW_CHUNK_LEN => self.push_chunk(Some(block_of(own)), Chunk::Block),
                 // The tail has room for a whole chunk (`make_room`), and no
                 // value goes in this chunk again: keep only its values.
                 // PERF (followups31): the shrink copies the values (1 to 255)
@@ -1888,10 +1883,11 @@ impl<T: Clone + Default> CowChunks<T> {
                 // rise of 2 to 4%, inside zbook's noise.
                 _ => {
                     own.shrink_to_fit();
-                    Chunk::Shared(Arc::new(own))
+                    self.push_chunk(None, Chunk::Shared(Arc::new(own)));
                 }
-            });
-            self.chunks.resize_with(last + 1, || Chunk::Freed);
+            }
+            self.blocks.resize_with(last + 1, || None);
+            self.chunks.resize_with(last + 1, || Chunk::Block);
             self.len = self.tail_start();
         }
         let first = seen >> COW_CHUNK_SHIFT;
@@ -1902,53 +1898,54 @@ impl<T: Clone + Default> CowChunks<T> {
                 // This array holds the values before `seen` in this chunk.
                 let held = seen - start;
                 if values.len() > held {
-                    let chunk = self.padded_chunk_mut(position);
-                    chunk[held..values.len()].clone_from_slice(&values[held..]);
+                    let block = self.padded_block_mut(position);
+                    block[held..values.len()].clone_from_slice(&values[held..]);
                 }
                 continue;
             }
             debug_assert!(
-                matches!(self.chunks[position], Chunk::Freed),
+                self.blocks[position].is_none() && matches!(self.chunks[position], Chunk::Block),
                 "lineage chunk {position} is new here"
             );
-            self.chunks[position] = match from.chunks.get(position) {
-                Some(
-                    chunk @ (Chunk::Fixed(Fixed::Static(_)) | Chunk::Shared(_) | Chunk::Freed),
-                ) => chunk.clone(),
-                _ if values.is_empty() => Chunk::Freed,
-                // An owned chunk of `from`, or its tail.
-                _ => padded_chunk(values),
-            };
+            match (from.blocks.get(position), from.chunks.get(position)) {
+                (Some(Some(block)), _) => self.blocks[position] = Some(Arc::clone(block)),
+                (_, Some(chunk @ Chunk::Shared(_))) => self.chunks[position] = chunk.clone(),
+                // `from`'s tail, or a freed chunk.
+                _ if values.is_empty() => {}
+                _ => self.blocks[position] = Some(padded_block(values)),
+            }
         }
     }
 
-    /// The values of chunk `position` for a write, as an owned chunk padded
+    /// The values of chunk `position` for a write, as an owned block padded
     /// with default values.
-    fn padded_chunk_mut(&mut self, position: usize) -> &mut ChunkValues<T> {
-        let chunk = &mut self.chunks[position];
-        if !matches!(chunk, Chunk::Fixed(Fixed::Owned(_))) {
-            *chunk = match std::mem::replace(chunk, Chunk::Freed) {
-                Chunk::Fixed(Fixed::Static(values)) => full_chunk(values.to_vec()),
-                Chunk::Shared(values) => padded_chunk(&values),
-                _ => padded_chunk(&[]),
-            };
+    fn padded_block_mut(&mut self, position: usize) -> &mut ChunkValues<T> {
+        let block = match (&self.blocks[position], &self.chunks[position]) {
+            (Some(block), _) if Arc::strong_count(block) == 1 => None,
+            (Some(block), _) => Some(block_of(block.iter().cloned())),
+            (None, Chunk::Shared(values)) => Some(padded_block(values)),
+            (None, Chunk::Block) => Some(padded_block(&[])),
+        };
+        if let Some(block) = block {
+            self.blocks[position] = Some(block);
+            self.chunks[position] = Chunk::Block;
         }
-        match chunk {
-            Chunk::Fixed(Fixed::Owned(values)) => values,
-            _ => unreachable!("chunk was just padded"),
+        match self.blocks[position].as_mut().and_then(Arc::get_mut) {
+            Some(values) => values,
+            None => unreachable!("an owned block"),
         }
     }
 }
 
 /// Values moved out of a `CowChunks` for `CowChunks::append_aligned` at
 /// index `at`: the values that fill the partial tail at `at`, then whole
-/// chunks and the values after them (the new tail).
+/// blocks and the values after them (the new tail).
 #[derive(Debug)]
 pub struct AlignedChunks<T: 'static> {
     at: usize,
     len: usize,
     head: Vec<T>,
-    chunks: Vec<Chunk<T>>,
+    blocks: Vec<Block<T>>,
     tail: Vec<T>,
 }
 
@@ -2856,7 +2853,7 @@ impl SymbolArena {
     /// them.
     #[must_use]
     pub fn new_file() -> Self {
-        Self::with_arrays(CowChunks::new(), CowChunks::new())
+        Self::with_arrays(CowChunks::new_file(), CowChunks::new_file())
     }
 
     fn with_arrays(mut symbols: CowChunks<Symbol>, mut tables: CowChunks<Table>) -> Self {
@@ -2890,7 +2887,7 @@ impl SymbolArena {
             "a checker arena is made from a binder lineage arena"
         );
         let symbols = self.symbols.for_checker();
-        let own_base = u32::try_from(symbols.chunks.len() >> 1).expect("symbol overflow");
+        let own_base = u32::try_from(symbols.blocks.len() >> 1).expect("symbol overflow");
         SymbolArena {
             symbols,
             tables: self.tables.for_checker(),
