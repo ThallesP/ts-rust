@@ -5695,12 +5695,13 @@ impl NodeRef {
 
     /// Go `node.Parent` (`Node::parent`). A parent in the same store keeps
     /// the block; a parent in another store makes its own lookup.
-    // PERF: parentname1. The same-store step (and the nil parent at the
-    // root) is always inlined, as Go loads `node.Parent`. A node with no
-    // block and a parent in another store take the cold `parent_far`. In
-    // the PGO build `parent` was out of line, with about 20 instructions of
-    // call overhead per step (checkline1).
-    #[inline(always)]
+    // PERF: parentname1. The body is only the same-store step (and the nil
+    // parent at the root), as Go loads `node.Parent`. A node with no block
+    // and a parent in another store take the cold `parent_far`, so the body
+    // is small enough to inline at the hot sites. In the PGO build the old
+    // body, with two `NodeRef::new` lookups, was out of line, with about 20
+    // instructions of call overhead per step (checkline1).
+    #[inline]
     #[must_use]
     pub fn parent(self) -> NodeRef {
         if let Some(b) = self.block {
