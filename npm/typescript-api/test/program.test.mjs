@@ -715,7 +715,7 @@ test("repeated openClientFile with new content stays fast, and every program it 
     assert.ok(perUpdate < 100, `${perUpdate.toFixed(1)} ms per update`);
 });
 
-test("project references give TS 6.0's resolved references and redirects; tsc-rs compiles their sources", needsTs6, () => {
+test("project references give TS 6.0's resolved references, redirects and declaration outputs", needsTs6, () => {
     const describe = anyTs => {
         const dir = writeFixture(`references-${anyTs === ts ? "tsrs" : "ts6"}`, {
             "lib/tsconfig.json": JSON.stringify({ compilerOptions: { composite: true, outDir: "dist", rootDir: "src", types: [] }, include: ["src"] }),
@@ -742,14 +742,8 @@ test("project references give TS 6.0's resolved references and redirects; tsc-rs
         };
     };
     const actual = describe(ts);
-    const expected = describe(ts6);
-    // tsc-rs programs hold the referenced project's sources (TS 6.0 does that only with
-    // useSourceOfProjectReferenceRedirect); TS 6.0's compiler holds its declaration output.
-    assert.deepEqual(actual.files, ["lib/src/index.ts", "app/src/main.ts"]);
-    assert.deepEqual(expected.files, ["lib/dist/index.d.ts", "app/src/main.ts"]);
-    delete actual.files;
-    delete expected.files;
-    assert.deepEqual(actual, expected);
+    assert.deepEqual(actual.files, ["lib/dist/index.d.ts", "app/src/main.ts"]);
+    assert.deepEqual(actual, describe(ts6));
 });
 
 // A compiler host over in-memory files, like TS 6.0's own tests use. Lib files come from the

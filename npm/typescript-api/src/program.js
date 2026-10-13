@@ -135,6 +135,11 @@ class NativeProgram {
         this.moduleResolutionCache = undefined;
 
         const nativeOptions = toNativeOptions(ts, options, { currentDirectory: this.nativeDirectory, typeScriptVersion });
+        // TS 6.0: src/compiler/program.ts useSourceOfProjectReferenceRedirect. A program compiles the
+        // declaration outputs of referenced projects unless its host asks for their sources (a language
+        // service does); tsc-rs's API compiles the sources unless told otherwise.
+        this.useSourceOfProjectReferenceRedirect = this.host.useSourceOfProjectReferenceRedirect?.() === true && !options.disableSourceOfProjectReferenceRedirect;
+        nativeOptions.options.disableSourceOfProjectReferenceRedirect = !this.useSourceOfProjectReferenceRedirect;
         this.nativeOptions = nativeOptions.options;
         this.optionDiagnostics = nativeOptions.diagnostics;
         this.nativeRootFiles = rootNames.map(name => {
@@ -1744,10 +1749,8 @@ class NativeProgram {
         return this.outputFileToResolvedRef?.get(path);
     }
 
-    // tsc-rs programs hold the source files of referenced projects, as TS 6.0 does with
-    // useSourceOfProjectReferenceRedirect (its language service), not their declaration outputs.
     isSourceOfProjectReferenceRedirect(fileName) {
-        return this.getRedirectFromSourceFile(fileName) !== undefined;
+        return this.useSourceOfProjectReferenceRedirect && this.getRedirectFromSourceFile(fileName) !== undefined;
     }
 
     getResolvedProjectReferenceByPath(projectReferencePath) {

@@ -933,6 +933,13 @@ function addReferences(ts, program, files, referencedMap, oldState) {
             if (path && programPaths.has(path)) {
                 return path;
             }
+            // A source of a referenced project resolves to its declaration output in the program
+            // (TS 6.0: src/compiler/program.ts getRedirectFromSourceFile).
+            const outputDts = path && program.getRedirectFromSourceFile(fileName)?.outputDts;
+            const outputPath = outputDts && program.toPath(outputDts);
+            if (outputPath && programPaths.has(outputPath)) {
+                return outputPath;
+            }
         }
         return undefined;
     };
