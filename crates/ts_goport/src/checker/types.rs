@@ -2851,9 +2851,29 @@ pub type StringLiteralType = Type;
 // memory resident. Later chunks are made at full size: a program that fills
 // the first chunk is large, and growing each chunk too cost about 1.5% of
 // check time on hono, zod and effect (rss2 grid: copies and page faults).
+// flatarena1 PROBE3 (study only, not for merge): the chunked arena until it holds GOPORT_FA1_MOVE bytes (default
+// 32 MiB), then one move into a flat `Vec` with a reserve of GOPORT_FA1_RESERVE bytes (default 2 GiB). A read tests
+// the flat `Vec` first: its bounds test is the mode test, so a flat arena reads as layout1 B2.
 pub struct ChunkedArena<T> {
+    flat: Vec<T>,
     chunks: Vec<Vec<T>>,
     len: usize,
+}
+
+fn fa1_knobs() -> (usize, usize) {
+    static K: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let g = |n: &str, d: usize| {
+            std::env::var(n)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        (
+            g("GOPORT_FA1_MOVE", 32 << 20),
+            g("GOPORT_FA1_RESERVE", 1 << 31),
+        )
+    })
 }
 
 // PERF: 8,192 entries a chunk. Every `ty(t)` reads the chunk table before the
@@ -2876,6 +2896,7 @@ impl<T> ChunkedArena<T> {
     /// Creates an arena that holds only `nil`, the dummy entry at index 0.
     pub fn with_nil(nil: T) -> Self {
         let mut arena = ChunkedArena {
+            flat: Vec::new(),
             chunks: vec![Vec::with_capacity(ARENA_FIRST_CAPACITY)],
             len: 1,
         };
@@ -2916,25 +2937,50 @@ impl<T> ChunkedArena<T> {
     /// fail too, so the hot path makes one test, as before.
     #[inline(always)]
     pub fn push_with(&mut self, make: impl FnOnce() -> T) {
-        if self.len & ARENA_CHUNK_MASK == 0 {
-            self.add_chunk();
+        if self.flat.is_empty() && (self.len & ARENA_CHUNK_MASK != 0 || !self.add_chunk()) {
+            let chunk = self.chunks.last_mut().expect("arena chunk");
+            if chunk.len() == chunk.capacity() {
+                grow_chunk(chunk);
+            }
+            if chunk.len() == chunk.capacity() {
+                arena_chunk_full();
+            }
+            chunk.push(make());
+            self.len += 1;
+            return;
         }
-        let chunk = self.chunks.last_mut().expect("arena chunk");
-        if chunk.len() == chunk.capacity() {
-            grow_chunk(chunk);
+        if self.flat.len() == self.flat.capacity() {
+            self.grow_flat();
         }
-        if chunk.len() == chunk.capacity() {
-            arena_chunk_full();
-        }
-        chunk.push(make());
+        self.flat.push(make());
         self.len += 1;
     }
 
-    /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries.
+    /// Adds the empty chunk for the next `ARENA_CHUNK_LEN` entries, or moves
+    /// every entry into the flat `Vec` (true) once the arena holds
+    /// GOPORT_FA1_MOVE bytes.
     #[cold]
     #[inline(never)]
-    fn add_chunk(&mut self) {
+    fn add_chunk(&mut self) -> bool {
+        let (move_bytes, reserve_bytes) = fa1_knobs();
+        let size = std::mem::size_of::<T>().max(1);
+        if self.len.saturating_mul(size) >= move_bytes {
+            let mut flat = Vec::with_capacity((reserve_bytes / size).max(self.len * 2));
+            for chunk in std::mem::take(&mut self.chunks) {
+                flat.extend(chunk);
+            }
+            self.flat = flat;
+            return true;
+        }
         self.chunks.push(Vec::with_capacity(ARENA_CHUNK_LEN));
+        false
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_flat(&mut self) {
+        let cap = self.flat.capacity();
+        self.flat.reserve_exact(cap);
     }
 }
 
@@ -2960,13 +3006,19 @@ impl<T> std::ops::Index<usize> for ChunkedArena<T> {
 
     #[inline]
     fn index(&self, i: usize) -> &T {
-        &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
+        match self.flat.get(i) {
+            Some(v) => v,
+            None => &self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK],
+        }
     }
 }
 
 impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
     #[inline]
     fn index_mut(&mut self, i: usize) -> &mut T {
+        if i < self.flat.len() {
+            return &mut self.flat[i];
+        }
         &mut self.chunks[i >> ARENA_CHUNK_SHIFT][i & ARENA_CHUNK_MASK]
     }
 }
