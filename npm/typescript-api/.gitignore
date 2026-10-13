@@ -1,0 +1,4 @@
+/lib/
+/native/*.node
+/.cache/
+/node_modules/

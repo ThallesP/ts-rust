@@ -1,0 +1,1653 @@
+"use strict";
+
+const { getSession } = require("./session.js");
+const { NativeSourceFile, parseHandle } = require("./nodes.js");
+const { bundledLibText, fileSystemFor, HostModuleResolver, isDefaultHost, usesHostModuleResolution } = require("./host.js");
+const { toNativeOptions, toTsOptionDiagnostics } = require("./options.js");
+const { toTsDiagnostics } = require("./diagnostics.js");
+const { syntaxKindToNative, syntaxKindToTs6 } = require("./flags.js");
+
+const bundledLibs = "bundled:///libs/";
+
+// The newest program that gave out each SourceFile. A language service or a ts.server project
+// shares unchanged SourceFiles between its programs, as TS 6.0 does, and an older program's
+// compiler state can be released (see NativeProgram). No WeakRef: one keeps its program alive
+// until the end of the current job, and a synchronous loop of programs would keep them all.
+const programsOfSourceFiles = new WeakMap();
+
+function programOfSourceFile(sourceFile) {
+    const program = programsOfSourceFiles.get(sourceFile);
+    return program === undefined || program.released ? undefined : program;
+}
+
+// Native state a program holds: its snapshot and, with a custom module resolver, the resolver.
+// A failed release after garbage collection has nobody to report to (and must not end the process).
+const releaseNative = new FinalizationRegistry(native => {
+    try {
+        releaseNativeState(native);
+    }
+    catch {
+        // The session is closed or the snapshot is gone already.
+    }
+});
+
+function releaseNativeState({ session, snapshot, resolver }) {
+    session.request("release", { snapshot });
+    if (resolver !== undefined) {
+        session.unregisterCallback(resolver.callbackName);
+        session.request("releaseModuleResolver", { resolver: resolver.id });
+    }
+}
+
+// TS 6.0: src/compiler/program.ts:1499 createProgram
+function createProgram(ts, rootNamesOrOptions, options, host, oldProgram, configFileParsingDiagnostics) {
+    const createProgramOptions = ts.isArray(rootNamesOrOptions)
+        ? { rootNames: rootNamesOrOptions, options, host, oldProgram, configFileParsingDiagnostics }
+        : rootNamesOrOptions;
+    return new NativeProgram(ts, createProgramOptions);
+}
+
+// A TS 6.0 Program whose files, checker and emit come from one tsc-rs snapshot. Source files are
+// TS 6.0 SourceFile objects: the host's, when it gives them, or parsed in JS from the text that
+// tsc-rs compiled.
+//
+// A program made from an oldProgram of this session updates the old snapshot with the files whose
+// text changed instead of reading every file again. The snapshot of the program before the
+// oldProgram is released then, so a chain of programs (a language service, ts.server projects,
+// watch) holds at most two snapshots.
+class NativeProgram {
+    constructor(ts, { rootNames, options, projectReferences, host, oldProgram, configFileParsingDiagnostics, typeScriptVersion }) {
+        // TS 6.0's program members are closures, and TS 6.0 passes some around unbound
+        // (src/compiler/utilities.ts setSymlinksFromResolutions(program.forEachResolvedModule, ...)).
+        for (const name of programMethods) {
+            this[name] = this[name].bind(this);
+        }
+        this.ts = ts;
+        this.rootNames = rootNames;
+        this.options = options;
+        this.projectReferences = projectReferences;
+        this.host = host ?? ts.createCompilerHost(options);
+        this.configFileParsingDiagnostics = configFileParsingDiagnostics;
+        this.typeScriptVersion = typeScriptVersion;
+        this.currentDirectory = this.host.getCurrentDirectory();
+        this.nativeDirectory = ts.getNormalizedAbsolutePath(this.currentDirectory, ts.sys.getCurrentDirectory());
+        this.getCanonicalFileName = ts.createGetCanonicalFileName(this.host.useCaseSensitiveFileNames());
+        this.libLocation = ts.normalizePath(this.host.getDefaultLibLocation?.() ?? ts.getDirectoryPath(this.host.getDefaultLibFileName(options)));
+        this.session = getSession(ts);
+        this.usesDefaultHost = isDefaultHost(this.host);
+        this.fileSystem = fileSystemFor(ts, this);
+        this.released = false;
+        this.previousProgram = undefined;
+        this.structureIsReused = ts.StructureIsReused.Not;
+        this.rootNativeToJs = new Map();
+        this.hostSourceFiles = new Map();
+        this.hostTexts = new Map();
+        this.structureKeys = new Map();
+        this.foreignTexts = new Set();
+        this.sourceFileOptions = new Map();
+        this.nativeFiles = new Map();
+        this.sourceFiles = new Map();
+        this.moduleResolutions = new Map();
+        this.typeReferenceResolutions = new Map();
+        this.metadata = new Map();
+        this.diagnosticsCache = new Map();
+        this.checker = undefined;
+        this.moduleResolutionCache = undefined;
+
+        const nativeOptions = toNativeOptions(ts, options, { currentDirectory: this.nativeDirectory, typeScriptVersion });
+        this.nativeOptions = nativeOptions.options;
+        this.optionDiagnostics = nativeOptions.diagnostics;
+        this.nativeRootFiles = rootNames.map(name => {
+            const nativeName = ts.getNormalizedAbsolutePath(name, this.nativeDirectory);
+            this.rootNativeToJs.set(nativeName, ts.normalizePath(name));
+            return nativeName;
+        });
+        this.hostResolver = this.fileSystem !== undefined && usesHostModuleResolution(this.host) ? new HostModuleResolver(this) : undefined;
+
+        const previous = oldProgram instanceof NativeProgram && oldProgram.session === this.session ? oldProgram : undefined;
+        // TS 6.0: src/compiler/program.ts shouldProgramCreateNewSourceFiles
+        this.shouldCreateNewSourceFile = previous !== undefined && ts.optionsHaveChanges(previous.options, options, ts.sourceFileAffectingCompilerOptions);
+        const base = previous !== undefined && !previous.released && previous.usesDefaultHost === this.usesDefaultHost ? previous : undefined;
+        // TS 6.0 asks the host for referenced project configs while it builds the program.
+        this.getResolvedProjectReferences();
+        const changes = base === undefined ? undefined : this.changesFrom(base);
+        try {
+            const response = this.withFileSystem(() => base === undefined ? this.createSnapshot() : this.updateSnapshot(base, changes));
+            this.snapshot = response.snapshot;
+            this.project = base === undefined ? response.operation.createdPrograms[0] : base.project;
+        }
+        catch (error) {
+            this.hostResolver?.release();
+            throw error;
+        }
+        releaseNative.register(this, this.nativeState(), this);
+        this.nativeFileNames = this.request("getSourceFileNames");
+        this.indexFileNames();
+        if (this.fileSystem !== undefined) {
+            this.adoptHostLibFiles(base);
+            this.hostResolver?.finish(this.nativeFileNames);
+        }
+        if (base !== undefined) {
+            this.reuseFrom(base, changes);
+        }
+        if (previous !== undefined) {
+            this.releaseOldSourceFiles(previous);
+            previous.previousProgram?.releaseNative();
+            previous.previousProgram = undefined;
+            this.previousProgram = previous;
+        }
+    }
+
+    nativeState() {
+        const { hostResolver } = this;
+        return {
+            session: this.session,
+            snapshot: this.snapshot,
+            resolver: hostResolver === undefined ? undefined : { id: hostResolver.id, callbackName: hostResolver.callbackName },
+        };
+    }
+
+    programParams() {
+        const { ts } = this;
+        return {
+            rootFiles: this.nativeRootFiles,
+            compilerOptions: this.nativeOptions,
+            options: {
+                projectReferences: this.projectReferences?.map(reference => ({
+                    path: ts.getNormalizedAbsolutePath(reference.path, this.nativeDirectory),
+                    originalPath: reference.originalPath,
+                    circular: reference.circular,
+                })),
+                moduleResolver: this.hostResolver?.id,
+            },
+        };
+    }
+
+    createSnapshot() {
+        return this.session.request("createSnapshot", {
+            fileNotifications: { invalidateAll: true },
+            createPrograms: [this.programParams()],
+        });
+    }
+
+    updateSnapshot(base, changes) {
+        return this.session.request("updateSnapshot", {
+            snapshot: base.snapshot,
+            changes: {
+                fileNotifications: changes.invalidateAll ? { invalidateAll: true } : { changed: changes.changed },
+                reconfigurePrograms: [{ id: base.project, ...this.programParams() }],
+            },
+        });
+    }
+
+    // TS 6.0: src/compiler/program.ts tryReuseStructureFromOldProgram asks the host for every file of
+    // the old program; the files whose text changed are the ones tsc-rs reads again. Programs that
+    // read the disk do not know what changed, so tsc-rs reads every file again.
+    changesFrom(base) {
+        const changes = { invalidateAll: this.fileSystem === undefined, changed: [], unchanged: [], fileRemoved: false, resolutionsInvalidated: false };
+        if (changes.invalidateAll) {
+            return changes;
+        }
+        const hasInvalidatedResolutions = this.host.hasInvalidatedResolutions;
+        for (const nativeFileName of base.nativeFileNames) {
+            if (nativeFileName.startsWith(bundledLibs)) {
+                continue;
+            }
+            const sourceFile = this.adoptHostSourceFile(nativeFileName);
+            if (sourceFile === undefined) {
+                changes.fileRemoved = true;
+            }
+            else if (sourceFile.text !== base.hostTexts.get(nativeFileName)) {
+                changes.changed.push(nativeFileName);
+            }
+            else if (hasInvalidatedResolutions?.(sourceFile.path)) {
+                changes.resolutionsInvalidated = true;
+            }
+            else {
+                changes.unchanged.push(nativeFileName);
+            }
+        }
+        // tsc-rs remembers what it found missing; a file that appeared needs everything read again.
+        const missingFileAppeared = this.ts.forEachEntry(base.getMissingFilePaths(), fileName => this.host.fileExists(fileName)) ?? false;
+        changes.invalidateAll = changes.fileRemoved || changes.resolutionsInvalidated || missingFileAppeared;
+        changes.missingFileAppeared = missingFileAppeared;
+        // TS 6.0 keeps the module resolutions of the files that did not change.
+        if (!changes.invalidateAll && !this.ts.changesAffectModuleResolution(base.options, this.options)) {
+            for (const nativeFileName of changes.unchanged) {
+                const resolutions = base.moduleResolutions.get(nativeFileName);
+                if (resolutions !== undefined) {
+                    this.moduleResolutions.set(nativeFileName, resolutions);
+                }
+            }
+        }
+        return changes;
+    }
+
+    // TS 6.0: src/compiler/program.ts createProgram releases the old program's files that this one
+    // does not have (a language service's document registry counts them).
+    releaseOldSourceFiles(oldProgram) {
+        const { host } = this;
+        if (host.onReleaseOldSourceFile === undefined || this.fileSystem === undefined) {
+            return;
+        }
+        for (const oldSourceFile of oldProgram.hostSourceFiles.values()) {
+            if (oldSourceFile === undefined || oldProgram.getSourceFileByPath(oldSourceFile.resolvedPath) !== oldSourceFile) {
+                continue;
+            }
+            const newFile = this.getSourceFileByPath(oldSourceFile.resolvedPath);
+            if (this.shouldCreateNewSourceFile || newFile === undefined || newFile.impliedNodeFormat !== oldSourceFile.impliedNodeFormat) {
+                host.onReleaseOldSourceFile(oldSourceFile, oldProgram.options, this.getSourceFileByPath(oldSourceFile.path) !== undefined, newFile);
+            }
+        }
+        if (host.getParsedCommandLine === undefined) {
+            oldProgram.forEachResolvedProjectReference(reference => {
+                if (this.getResolvedProjectReferenceByPath(reference.sourceFile.path) === undefined) {
+                    host.onReleaseOldSourceFile(reference.sourceFile, oldProgram.options, false, undefined);
+                }
+            });
+        }
+    }
+
+    // Carries over what the old program knew about files that did not change.
+    reuseFrom(base, changes) {
+        this.structureIsReused = this.structureReuse(base, changes);
+        if (changes.invalidateAll) {
+            return;
+        }
+        // tsc-rs keeps the syntax trees of unchanged files, so their node handles stay the same.
+        const unchanged = [...changes.unchanged, ...this.nativeFileNames.filter(name => name.startsWith(bundledLibs))];
+        for (const nativeFileName of unchanged) {
+            if (!this.nativeFileNameSet.has(nativeFileName)) {
+                continue;
+            }
+            if (base.metadata.has(nativeFileName)) {
+                this.metadata.set(nativeFileName, base.metadata.get(nativeFileName));
+            }
+            if (base.nativeFiles.has(nativeFileName)) {
+                this.nativeFiles.set(nativeFileName, base.nativeFiles.get(nativeFileName));
+            }
+        }
+    }
+
+    // TS 6.0: src/compiler/program.ts tryReuseStructureFromOldProgram
+    structureReuse(base, changes) {
+        const { ts } = this;
+        const { StructureIsReused } = ts;
+        const sameFiles = ts.arrayIsEqualTo(base.nativeFileNames, this.nativeFileNames);
+        if (
+            ts.changesAffectModuleResolution(base.options, this.options)
+            || !ts.arrayIsEqualTo(base.rootNames, this.rootNames)
+            || !ts.arrayIsEqualTo(base.projectReferences, this.projectReferences, ts.projectReferenceIsEqualTo)
+            || changes.fileRemoved
+            || changes.missingFileAppeared
+        ) {
+            return StructureIsReused.Not;
+        }
+        // A program that reads the disk does not see which files changed.
+        if (this.fileSystem === undefined) {
+            return sameFiles ? StructureIsReused.SafeModules : StructureIsReused.Not;
+        }
+        if (
+            changes.resolutionsInvalidated
+            || !sameFiles
+            || changes.changed.some(name => this.structureKeys.get(name) !== base.structureKeys.get(name))
+            || ts.changesAffectingProgramStructure(base.options, this.options)
+            || this.host.hasChangedAutomaticTypeDirectiveNames?.()
+        ) {
+            return StructureIsReused.SafeModules;
+        }
+        return StructureIsReused.Completely;
+    }
+
+    indexFileNames() {
+        this.nativeFileNameSet = new Set(this.nativeFileNames);
+        this.pathToNativeFileName = new Map();
+        this.nativePathToNativeFileName = new Map();
+        for (const name of this.nativeFileNames) {
+            this.pathToNativeFileName.set(this.toPath(this.toJsFileName(name)), name);
+            this.nativePathToNativeFileName.set(this.nativePathOf(name), name);
+        }
+    }
+
+    // The path key tsc-rs puts in node handles.
+    nativePathOf(nativeFileName) {
+        return nativeFileName.startsWith(bundledLibs) ? nativeFileName : this.ts.toPath(nativeFileName, this.nativeDirectory, this.getCanonicalFileName);
+    }
+
+    // Native requests on a program whose snapshot was released (see the class comment) fail.
+    request(method, params) {
+        this.assertNative(method);
+        return this.withFileSystem(() => this.session.request(method, { snapshot: this.snapshot, project: this.project, ...params }));
+    }
+
+    requestBinary(method, params) {
+        this.assertNative(method);
+        return this.withFileSystem(() => this.session.requestBinary(method, { snapshot: this.snapshot, project: this.project, ...params }));
+    }
+
+    requestBatch(method, paramsList) {
+        this.assertNative(method);
+        const requests = paramsList.map(params => ({ method, params: { snapshot: this.snapshot, project: this.project, ...params } }));
+        return this.withFileSystem(() => this.session.requestBatch(requests));
+    }
+
+    assertNative(method) {
+        if (this.released) {
+            throw new Error(`tsc-rs: ${method} is not supported on this program: two newer programs were created from it (createProgram oldProgram), so its compiler state was released`);
+        }
+    }
+
+    releaseNative() {
+        if (this.released) {
+            return;
+        }
+        this.released = true;
+        releaseNative.unregister(this);
+        releaseNativeState(this.nativeState());
+        this.nativeFiles.clear();
+    }
+
+    withFileSystem(run) {
+        return this.session.withFileSystem(this.fileSystem, run);
+    }
+
+    toPath(fileName) {
+        return this.ts.toPath(fileName, this.currentDirectory, this.getCanonicalFileName);
+    }
+
+    toJsFileName(nativeFileName) {
+        if (nativeFileName.startsWith(bundledLibs)) {
+            return this.ts.combinePaths(this.libLocation, nativeFileName.slice(bundledLibs.length));
+        }
+        return this.rootNativeToJs.get(nativeFileName) ?? nativeFileName;
+    }
+
+    toNativeFileName(fileName) {
+        return this.pathToNativeFileName?.get(this.toPath(fileName)) ?? this.ts.getNormalizedAbsolutePath(fileName, this.nativeDirectory);
+    }
+
+    nativeFileNameOf(sourceFile) {
+        const nativeFileName = this.pathToNativeFileName.get(sourceFile.path ?? this.toPath(sourceFile.fileName));
+        if (nativeFileName === undefined) {
+            throw new Error(`tsc-rs: ${sourceFile.fileName} is not a file of this program`);
+        }
+        return nativeFileName;
+    }
+
+    // The binary syntax tree of a program file, for node handles.
+    nativeFile(nativeFileName) {
+        let file = this.nativeFiles.get(nativeFileName);
+        if (file === undefined) {
+            const bytes = this.requestBinary("getSourceFile", { file: nativeFileName });
+            if (bytes === undefined) {
+                return undefined;
+            }
+            file = new NativeSourceFile(bytes);
+            this.nativeFiles.set(nativeFileName, file);
+        }
+        return file;
+    }
+
+    // TS 6.0: src/compiler/program.ts getCreateSourceFileOptions
+    createSourceFileOptions(fileName) {
+        const { ts, options, host } = this;
+        this.moduleResolutionCache ??= host.getModuleResolutionCache?.() ?? ts.createModuleResolutionCache(this.currentDirectory, this.getCanonicalFileName, options);
+        const result = ts.getImpliedNodeFormatForFileWorker(ts.getNormalizedAbsolutePath(fileName, this.currentDirectory), this.moduleResolutionCache.getPackageJsonInfoCache(), host, options);
+        const languageVersion = ts.getEmitScriptTarget(options);
+        const setExternalModuleIndicator = ts.getSetExternalModuleIndicator(options);
+        return typeof result === "object"
+            ? { ...result, languageVersion, setExternalModuleIndicator, jsDocParsingMode: host.jsDocParsingMode }
+            : { languageVersion, impliedNodeFormat: result, setExternalModuleIndicator, jsDocParsingMode: host.jsDocParsingMode };
+    }
+
+    // The host's SourceFile for a program file (called while tsc-rs reads it through the host).
+    adoptHostSourceFile(nativeFileName) {
+        if (this.hostSourceFiles.has(nativeFileName)) {
+            return this.hostSourceFiles.get(nativeFileName);
+        }
+        const fileName = this.toJsFileName(nativeFileName);
+        const sourceFileOptions = this.createSourceFileOptions(fileName);
+        const sourceFile = this.getHostSourceFile(fileName, sourceFileOptions);
+        this.adopt(nativeFileName, fileName, sourceFile, sourceFileOptions);
+        return sourceFile;
+    }
+
+    getHostSourceFile(fileName, sourceFileOptions) {
+        const { host, shouldCreateNewSourceFile } = this;
+        return host.getSourceFileByPath === undefined
+            ? host.getSourceFile(fileName, sourceFileOptions, undefined, shouldCreateNewSourceFile)
+            : host.getSourceFileByPath(fileName, this.toPath(fileName), sourceFileOptions, undefined, shouldCreateNewSourceFile);
+    }
+
+    adopt(nativeFileName, fileName, sourceFile, sourceFileOptions) {
+        this.hostSourceFiles.set(nativeFileName, sourceFile);
+        if (sourceFile === undefined) {
+            return;
+        }
+        this.hostTexts.set(nativeFileName, sourceFile.text);
+        this.sourceFileOptions.set(nativeFileName, sourceFileOptions);
+        this.prepareSourceFile(sourceFile, nativeFileName, fileName);
+        this.structureKeys.set(nativeFileName, structureKey(this.ts, sourceFile));
+        if (!nativeFileName.startsWith(bundledLibs)) {
+            this.hostResolver?.addFile(nativeFileName, fileName);
+        }
+    }
+
+    // Lib files come from tsc-rs's bundled libs; TS 6.0 gets them from the host like any file (a
+    // language service keeps them in its document registry with their versions). A host lib whose
+    // text is not tsc-rs's has no node handles.
+    adoptHostLibFiles(base) {
+        for (const nativeFileName of this.nativeFileNames) {
+            if (!nativeFileName.startsWith(bundledLibs) || this.hostSourceFiles.has(nativeFileName)) {
+                continue;
+            }
+            const fileName = this.toJsFileName(nativeFileName);
+            const sourceFileOptions = this.createSourceFileOptions(fileName);
+            const sourceFile = this.getHostSourceFile(fileName, sourceFileOptions);
+            if (sourceFile === undefined) {
+                continue;
+            }
+            if (sourceFile === base?.hostSourceFiles.get(nativeFileName) ? base.foreignTexts.has(nativeFileName) : sourceFile.text !== this.textOf(nativeFileName)) {
+                this.foreignTexts.add(nativeFileName);
+            }
+            this.adopt(nativeFileName, fileName, sourceFile, sourceFileOptions);
+        }
+    }
+
+    // TS 6.0: src/compiler/program.ts findSourceFileWorker sets these on every program file.
+    prepareSourceFile(sourceFile, nativeFileName, fileName) {
+        const { ts } = this;
+        programsOfSourceFiles.set(sourceFile, this);
+        const sourceFileOptions = this.sourceFileOptions.get(nativeFileName);
+        sourceFile.fileName = fileName;
+        sourceFile.path = this.toPath(fileName);
+        sourceFile.resolvedPath = sourceFile.path;
+        sourceFile.originalFileName = fileName;
+        sourceFile.packageJsonLocations = sourceFileOptions?.packageJsonLocations?.length ? sourceFileOptions.packageJsonLocations : undefined;
+        sourceFile.packageJsonScope = sourceFileOptions?.packageJsonScope;
+        if (sourceFile.statements.length !== 0 && sourceFile.statements[0].parent === undefined) {
+            ts.setParentRecursive(sourceFile, true);
+        }
+        this.collectExternalModuleReferences(sourceFile);
+    }
+
+    sourceFileOfNative(nativeFileName) {
+        let sourceFile = this.sourceFiles.get(nativeFileName);
+        if (sourceFile !== undefined) {
+            return sourceFile;
+        }
+        if (!this.nativeFileNameSet.has(nativeFileName)) {
+            return undefined;
+        }
+        sourceFile = this.hostSourceFiles.get(nativeFileName);
+        if (sourceFile === undefined) {
+            const fileName = this.toJsFileName(nativeFileName);
+            const sourceFileOptions = this.createSourceFileOptions(fileName);
+            this.sourceFileOptions.set(nativeFileName, sourceFileOptions);
+            sourceFile = this.ts.createSourceFile(fileName, this.textOf(nativeFileName), sourceFileOptions, true);
+            this.prepareSourceFile(sourceFile, nativeFileName, fileName);
+        }
+        this.sourceFiles.set(nativeFileName, sourceFile);
+        return sourceFile;
+    }
+
+    // The file tsc-rs compiled where the host's SourceFile has another text (a host's own lib files).
+    shadowSourceFile(nativeFileName) {
+        this.shadowSourceFiles ??= new Map();
+        let sourceFile = this.shadowSourceFiles.get(nativeFileName);
+        if (sourceFile === undefined) {
+            const fileName = this.toJsFileName(nativeFileName);
+            sourceFile = this.ts.createSourceFile(fileName, this.textOf(nativeFileName), this.createSourceFileOptions(fileName), true);
+            this.shadowSourceFiles.set(nativeFileName, sourceFile);
+        }
+        return sourceFile;
+    }
+
+    // The text tsc-rs compiled, without the binary syntax tree when the disk or lib/ has it.
+    textOf(nativeFileName) {
+        if (nativeFileName.startsWith(bundledLibs)) {
+            return bundledLibText(nativeFileName) ?? this.nativeFile(nativeFileName).text;
+        }
+        if (this.usesDefaultHost) {
+            const text = this.host.readFile(nativeFileName);
+            if (text !== undefined) {
+                return text;
+            }
+        }
+        return this.nativeFile(nativeFileName).text;
+    }
+
+    // TS 6.0: src/compiler/program.ts collectExternalModuleReferences
+    collectExternalModuleReferences(file) {
+        if (file.imports) {
+            return;
+        }
+        const { ts, options } = this;
+        const isJavaScriptFile = ts.isSourceFileJS(file);
+        const isExternalModuleFile = ts.isExternalModule(file);
+        let imports;
+        let moduleAugmentations;
+        let ambientModules;
+        if (isJavaScriptFile || (!file.isDeclarationFile && (ts.getIsolatedModules(options) || isExternalModuleFile))) {
+            if (options.importHelpers) {
+                imports = [createSyntheticImport(ts, ts.externalHelpersModuleNameText, file)];
+            }
+            const jsxImport = ts.getJSXRuntimeImport(ts.getJSXImplicitImportBase(options, file), options);
+            if (jsxImport) {
+                (imports ??= []).push(createSyntheticImport(ts, jsxImport, file));
+            }
+        }
+        const collectModuleReferences = (node, inAmbientModule) => {
+            if (ts.isAnyImportOrReExport(node)) {
+                const moduleNameExpr = ts.getExternalModuleName(node);
+                if (moduleNameExpr && ts.isStringLiteral(moduleNameExpr) && moduleNameExpr.text && (!inAmbientModule || !ts.isExternalModuleNameRelative(moduleNameExpr.text))) {
+                    ts.setParentRecursive(node, false);
+                    (imports ??= []).push(moduleNameExpr);
+                }
+                return;
+            }
+            if (!ts.isModuleDeclaration(node) || !ts.isAmbientModule(node) || !(inAmbientModule || ts.hasSyntacticModifier(node, ts.ModifierFlags.Ambient) || file.isDeclarationFile)) {
+                return;
+            }
+            node.name.parent = node;
+            const nameText = ts.getTextOfIdentifierOrLiteral(node.name);
+            if (isExternalModuleFile || (inAmbientModule && !ts.isExternalModuleNameRelative(nameText))) {
+                (moduleAugmentations ??= []).push(node.name);
+                return;
+            }
+            if (inAmbientModule) {
+                return;
+            }
+            if (file.isDeclarationFile) {
+                (ambientModules ??= []).push(nameText);
+            }
+            for (const statement of node.body?.statements ?? []) {
+                collectModuleReferences(statement, true);
+            }
+        };
+        for (const node of file.statements) {
+            collectModuleReferences(node, false);
+        }
+        if ((file.flags & ts.NodeFlags.PossiblyContainsDynamicImport) || isJavaScriptFile) {
+            ts.forEachDynamicImportOrRequireCall(file, true, true, (node, moduleSpecifier) => {
+                ts.setParentRecursive(node, false);
+                (imports ??= []).push(moduleSpecifier);
+            });
+        }
+        file.imports = imports ?? ts.emptyArray;
+        file.moduleAugmentations = moduleAugmentations ?? ts.emptyArray;
+        file.ambientModuleNames = ambientModules ?? ts.emptyArray;
+    }
+
+    // TS 6.0: src/compiler/program.ts getModuleNames
+    moduleNameLiterals(sourceFile) {
+        this.collectExternalModuleReferences(sourceFile);
+        const literals = [...sourceFile.imports];
+        for (const augmentation of sourceFile.moduleAugmentations) {
+            if (augmentation.kind === this.ts.SyntaxKind.StringLiteral) {
+                literals.push(augmentation);
+            }
+        }
+        return literals;
+    }
+
+    // The tsc-rs node handle of a TS 6.0 node of this program, or undefined.
+    nodeToHandle(node) {
+        const { ts } = this;
+        const parseNode = ts.getParseTreeNode(node);
+        if (parseNode === undefined) {
+            return undefined;
+        }
+        const sourceFile = ts.getSourceFileOfNode(parseNode);
+        if (sourceFile === undefined || this.getSourceFile(sourceFile.fileName) !== sourceFile) {
+            return undefined;
+        }
+        const nativeFileName = this.toNativeFileName(sourceFile.fileName);
+        if (this.foreignTexts.has(nativeFileName)) {
+            return undefined;
+        }
+        if (parseNode === sourceFile) {
+            return `1.${syntaxKindToNative(ts.SyntaxKind.SourceFile)}.${this.nativePathOf(nativeFileName)}`;
+        }
+        const file = this.nativeFile(nativeFileName);
+        const index = file.indexOf(syntaxKindToNative(parseNode.kind), parseNode.pos, parseNode.end);
+        return index === undefined ? undefined : file.handle(index);
+    }
+
+    // The TS 6.0 node for a tsc-rs node handle, or undefined.
+    handleToNode(handle) {
+        const { index, path } = parseHandle(handle);
+        const nativeFileName = this.nativePathToNativeFileName.get(path);
+        if (nativeFileName === undefined) {
+            return undefined;
+        }
+        const sourceFile = this.foreignTexts.has(nativeFileName) ? this.shadowSourceFile(nativeFileName) : this.sourceFileOfNative(nativeFileName);
+        if (index === 1) {
+            return sourceFile;
+        }
+        const file = this.nativeFile(nativeFileName);
+        return findNode(this.ts, sourceFile, syntaxKindToTs6(file.kind(index)), file.pos(index), file.end(index));
+    }
+
+    // Diagnostics do not change for a program, so each answer is kept.
+    diagnostics(method, sourceFile, cancellationToken) {
+        cancellationToken?.throwIfCancellationRequested();
+        let byFile = this.diagnosticsCache.get(method);
+        if (byFile === undefined) {
+            byFile = new Map();
+            this.diagnosticsCache.set(method, byFile);
+        }
+        const key = sourceFile === undefined ? undefined : this.nativeFileNameOf(sourceFile);
+        let result = byFile.get(key);
+        if (result === undefined) {
+            const responses = this.request(method, { files: key === undefined ? undefined : [key] }) ?? [];
+            result = toTsDiagnostics(this.ts, responses, name => this.sourceFileOfNative(name));
+            byFile.set(key, result);
+        }
+        return result;
+    }
+
+    // SourceFileMetadata of program files, fetched for all files at once.
+    metadataOf(nativeFileName) {
+        if (!this.metadata.has(nativeFileName)) {
+            const missing = this.nativeFileNames.filter(name => !this.metadata.has(name));
+            const results = this.requestBatch("getSourceFileMetadata", missing.map(file => ({ file })));
+            missing.forEach((name, index) => this.metadata.set(name, results[index] instanceof Error ? undefined : results[index]));
+        }
+        return this.metadata.get(nativeFileName);
+    }
+
+    // ScriptReferenceHost
+
+    getCompilerOptions() {
+        return this.options;
+    }
+
+    getSourceFile(fileName) {
+        return this.getSourceFileByPath(this.toPath(fileName));
+    }
+
+    getSourceFileByPath(path) {
+        const nativeFileName = this.pathToNativeFileName.get(path);
+        return nativeFileName === undefined ? undefined : this.sourceFileOfNative(nativeFileName);
+    }
+
+    getCurrentDirectory() {
+        return this.currentDirectory;
+    }
+
+    // Program
+
+    getRootFileNames() {
+        return this.rootNames;
+    }
+
+    getSourceFiles() {
+        this.sourceFileList ??= this.nativeFileNames.map(name => this.sourceFileOfNative(name));
+        return this.sourceFileList;
+    }
+
+    emit(targetSourceFile, writeFile, cancellationToken, emitOnlyDtsFiles, customTransformers, forceDtsEmit, skipBuildInfo) {
+        cancellationToken?.throwIfCancellationRequested();
+        return require("./emit.js").emit(this, targetSourceFile, writeFile, cancellationToken, emitOnlyDtsFiles, customTransformers, forceDtsEmit, skipBuildInfo);
+    }
+
+    // TS 6.0: src/compiler/builder.ts emitBuildInfo; incremental state belongs to builder programs.
+    emitBuildInfo(writeFile, cancellationToken) {
+        const emit = require("./emit.js");
+        if (emit.emitBuildInfo !== undefined) {
+            return emit.emitBuildInfo(this, writeFile, cancellationToken);
+        }
+        return { emitSkipped: true, diagnostics: this.ts.emptyArray };
+    }
+
+    getOptionsDiagnostics(cancellationToken) {
+        cancellationToken?.throwIfCancellationRequested();
+        this.optionsDiagnostics ??= this.ts.sortAndDeduplicateDiagnostics([
+            ...this.optionDiagnostics,
+            ...toTsOptionDiagnostics(this.ts, this.options, this.request("getProgramDiagnostics") ?? [], name => this.sourceFileOfNative(name)),
+        ]);
+        return this.optionsDiagnostics;
+    }
+
+    // tsc-rs's global diagnostics also hold its program diagnostics; TS 6.0 reports those as
+    // options diagnostics only.
+    getGlobalDiagnostics(cancellationToken) {
+        if (this.globalDiagnostics === undefined) {
+            const programKeys = new Set(this.diagnostics("getProgramDiagnostics", undefined, cancellationToken).map(diagnosticKey));
+            this.globalDiagnostics = this.diagnostics("getGlobalDiagnostics", undefined, cancellationToken).filter(diagnostic => !programKeys.has(diagnosticKey(diagnostic)));
+        }
+        return this.globalDiagnostics;
+    }
+
+    getSyntacticDiagnostics(sourceFile, cancellationToken) {
+        return this.diagnostics("getSyntacticDiagnostics", sourceFile, cancellationToken);
+    }
+
+    // `nodesToCheck` (the language service's region diagnostics) is answered for the whole file.
+    getSemanticDiagnostics(sourceFile, cancellationToken) {
+        return this.diagnostics("getSemanticDiagnostics", sourceFile, cancellationToken);
+    }
+
+    getCachedSemanticDiagnostics(sourceFile) {
+        const byFile = this.diagnosticsCache.get("getSemanticDiagnostics");
+        return byFile?.get(sourceFile === undefined ? undefined : this.pathToNativeFileName.get(sourceFile.path));
+    }
+
+    getBindAndCheckDiagnostics(sourceFile, cancellationToken) {
+        return this.getSemanticDiagnostics(sourceFile, cancellationToken);
+    }
+
+    // TS 6.0 reports file processing diagnostics of a file here; tsc-rs reports them as program diagnostics.
+    getProgramDiagnostics() {
+        return this.ts.emptyArray;
+    }
+
+    getSuggestionDiagnostics(sourceFile, cancellationToken) {
+        return this.diagnostics("getSuggestionDiagnostics", sourceFile, cancellationToken);
+    }
+
+    getDeclarationDiagnostics(sourceFile, cancellationToken) {
+        return this.diagnostics("getDeclarationDiagnostics", sourceFile, cancellationToken);
+    }
+
+    getConfigFileParsingDiagnostics() {
+        return this.configFileParsingDiagnostics ?? this.ts.emptyArray;
+    }
+
+    getTypeChecker() {
+        this.checker ??= completeChecker(this, require("./checker.js").createChecker(this));
+        return this.checker;
+    }
+
+    getClassifiableNames() {
+        if (this.classifiableNames === undefined) {
+            this.classifiableNames = new Set();
+            for (const sourceFile of this.getSourceFiles()) {
+                sourceFile.identifiers?.forEach((_, name) => this.classifiableNames.add(this.ts.escapeLeadingUnderscores(name)));
+            }
+        }
+        return this.classifiableNames;
+    }
+
+    // TS 6.0 counts come from its checker; tsc-rs reports no symbol, type or relation counts.
+    getNodeCount() {
+        return this.getSourceFiles().reduce((count, file) => count + (file.nodeCount ?? 0), 0);
+    }
+
+    getIdentifierCount() {
+        return this.getSourceFiles().reduce((count, file) => count + (file.identifierCount ?? 0), 0);
+    }
+
+    getSymbolCount() {
+        return 0;
+    }
+
+    getTypeCount() {
+        return 0;
+    }
+
+    getInstantiationCount() {
+        return 0;
+    }
+
+    getRelationCacheSizes() {
+        return { assignable: 0, identity: 0, subtype: 0, strictSubtype: 0 };
+    }
+
+    getFileProcessingDiagnostics() {
+        return undefined;
+    }
+
+    // TS 6.0: src/compiler/program.ts automaticTypeDirectiveNames
+    getAutomaticTypeDirectiveNames() {
+        this.automaticTypeDirectiveNames ??= this.ts.getAutomaticTypeDirectiveNames(this.options, this.host);
+        return this.automaticTypeDirectiveNames;
+    }
+
+    getAutomaticTypeDirectiveResolutions() {
+        if (this.automaticTypeDirectiveResolutions === undefined) {
+            const { ts } = this;
+            const resolutions = ts.createModeAwareCache();
+            const containingFile = ts.combinePaths(this.options.configFilePath ? ts.getDirectoryPath(this.options.configFilePath) : this.currentDirectory, ts.inferredTypesContainingFile);
+            for (const name of this.getAutomaticTypeDirectiveNames()) {
+                resolutions.set(name, undefined, ts.resolveTypeReferenceDirective(name, containingFile, this.options, this.host, undefined, undefined, undefined));
+            }
+            this.automaticTypeDirectiveResolutions = resolutions;
+        }
+        return this.automaticTypeDirectiveResolutions;
+    }
+
+    isSourceFileFromExternalLibrary(file) {
+        const nativeFileName = this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName));
+        return nativeFileName !== undefined && (this.metadataOf(nativeFileName)?.isFromExternalLibrary ?? false);
+    }
+
+    isSourceFileDefaultLibrary(file) {
+        const nativeFileName = this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName));
+        return nativeFileName !== undefined && (this.metadataOf(nativeFileName)?.isDefaultLibrary ?? false);
+    }
+
+    // Module formats follow TS 6.0's rules over the TS 6.0 SourceFiles.
+
+    // TS 6.0: src/compiler/program.ts getCompilerOptionsForFile: a source file of a referenced
+    // project resolves with that project's options.
+    getCompilerOptionsForFile(sourceFile) {
+        return this.getRedirectFromSourceFile(sourceFile.originalFileName ?? sourceFile.fileName)?.resolvedRef.commandLine.options ?? this.options;
+    }
+
+    getModeForUsageLocation(file, usage) {
+        return this.ts.getModeForUsageLocation(file, usage, this.getCompilerOptionsForFile(file));
+    }
+
+    getEmitSyntaxForUsageLocation(file, usage) {
+        return getEmitSyntaxForUsageLocation(this.ts, file, usage, this.getCompilerOptionsForFile(file));
+    }
+
+    getModeForResolutionAtIndex(file, index) {
+        this.collectExternalModuleReferences(file);
+        return this.ts.getModeForResolutionAtIndex(file, index, this.getCompilerOptionsForFile(file));
+    }
+
+    getDefaultResolutionModeForFile(sourceFile) {
+        return this.ts.getDefaultResolutionModeForFileWorker(sourceFile, this.getCompilerOptionsForFile(sourceFile));
+    }
+
+    getImpliedNodeFormatForEmit(sourceFile) {
+        return this.ts.getImpliedNodeFormatForEmitWorker(sourceFile, this.getCompilerOptionsForFile(sourceFile));
+    }
+
+    getEmitModuleFormatOfFile(sourceFile) {
+        return this.ts.getEmitModuleFormatOfFileWorker(sourceFile, this.getCompilerOptionsForFile(sourceFile));
+    }
+
+    shouldTransformImportCall(sourceFile) {
+        return shouldTransformImportCall(this.ts, sourceFile, this.getCompilerOptionsForFile(sourceFile));
+    }
+
+    // Module and type reference resolutions, in TS 6.0's shapes with the program's file names.
+
+    // TS 6.0 resolves every module name of every file while it builds the program; tsc-rs is asked
+    // per file, when a caller needs it.
+    moduleResolutionsOf(nativeFileName) {
+        let resolutions = this.moduleResolutions.get(nativeFileName);
+        if (resolutions === undefined) {
+            this.resolveModulesOf([nativeFileName]);
+            resolutions = this.moduleResolutions.get(nativeFileName);
+        }
+        return resolutions;
+    }
+
+    resolveModulesOf(nativeFileNames) {
+        const { ts } = this;
+        const requests = [];
+        const entries = [];
+        for (const nativeFileName of nativeFileNames) {
+            const resolutions = ts.createModeAwareCache();
+            this.moduleResolutions.set(nativeFileName, resolutions);
+            if (nativeFileName.startsWith(bundledLibs)) {
+                continue;
+            }
+            const sourceFile = this.sourceFileOfNative(nativeFileName);
+            const options = this.getCompilerOptionsForFile(sourceFile);
+            for (const literal of this.moduleNameLiterals(sourceFile)) {
+                const mode = ts.getModeForUsageLocation(sourceFile, literal, options);
+                entries.push({ resolutions, name: literal.text, mode, nativeFileName });
+                requests.push({ file: nativeFileName, moduleName: literal.text, mode: mode ?? 0 });
+            }
+        }
+        const results = this.requestBatch("getResolvedModule", requests);
+        const retries = [];
+        entries.forEach((entry, index) => {
+            const result = results[index];
+            if (result === undefined || result === null || result instanceof Error) {
+                retries.push(entry);
+                return;
+            }
+            entry.resolutions.set(entry.name, entry.mode, this.toResolvedModule(result));
+        });
+        this.retryModuleResolutions(retries);
+    }
+
+    // tsc-rs keys a resolution by the mode it used, which can differ from TS 6.0's mode.
+    retryModuleResolutions(entries) {
+        const { ModuleKind } = this.ts;
+        const requests = [];
+        const owners = [];
+        for (const entry of entries) {
+            for (const mode of [0, ModuleKind.ESNext, ModuleKind.CommonJS]) {
+                if (mode !== (entry.mode ?? 0)) {
+                    requests.push({ file: entry.nativeFileName, moduleName: entry.name, mode });
+                    owners.push(entry);
+                }
+            }
+        }
+        const results = this.requestBatch("getResolvedModule", requests);
+        const found = new Set();
+        results.forEach((result, index) => {
+            const entry = owners[index];
+            if (found.has(entry) || result === undefined || result === null || result instanceof Error) {
+                return;
+            }
+            found.add(entry);
+            entry.resolutions.set(entry.name, entry.mode, this.toResolvedModule(result));
+        });
+        for (const entry of entries) {
+            if (!found.has(entry)) {
+                entry.resolutions.set(entry.name, entry.mode, { resolvedModule: undefined });
+            }
+        }
+    }
+
+    toResolvedModule(native) {
+        return {
+            resolvedModule: {
+                resolvedFileName: this.toJsFileName(native.resolvedFileName),
+                originalPath: native.originalPath || undefined,
+                extension: native.extension,
+                isExternalLibraryImport: native.isExternalLibraryImport ?? false,
+                packageId: toPackageId(native.packageId),
+                resolvedUsingTsExtension: native.resolvedUsingTsExtension ?? false,
+            },
+            failedLookupLocations: undefined,
+            affectingLocations: undefined,
+            resolutionDiagnostics: undefined,
+        };
+    }
+
+    getResolvedModule(file, moduleName, mode) {
+        const nativeFileName = this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName));
+        return nativeFileName === undefined ? undefined : this.moduleResolutionsOf(nativeFileName).get(moduleName, mode);
+    }
+
+    getResolvedModuleFromModuleSpecifier(moduleSpecifier, sourceFile) {
+        sourceFile ??= this.ts.getSourceFileOfNode(moduleSpecifier);
+        if (sourceFile === undefined) {
+            throw new Error("tsc-rs: `moduleSpecifier` must have a `SourceFile` ancestor. Use `program.getResolvedModule` instead to provide the containing file and resolution mode.");
+        }
+        return this.getResolvedModule(sourceFile, moduleSpecifier.text, this.getModeForUsageLocation(sourceFile, moduleSpecifier));
+    }
+
+    forEachResolvedModule(callback, file) {
+        const nativeFileNames = file === undefined ? this.nativeFileNames : [this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName))].filter(name => name !== undefined);
+        const missing = nativeFileNames.filter(name => !this.moduleResolutions.has(name));
+        if (missing.length !== 0) {
+            this.resolveModulesOf(missing);
+        }
+        for (const nativeFileName of nativeFileNames) {
+            const filePath = this.toPath(this.toJsFileName(nativeFileName));
+            this.moduleResolutions.get(nativeFileName).forEach((resolution, moduleName, mode) => callback(resolution, moduleName, mode, filePath));
+        }
+    }
+
+    get resolvedModules() {
+        const result = new Map();
+        this.forEachResolvedModule((resolution, moduleName, mode, filePath) => {
+            let resolutions = result.get(filePath);
+            if (resolutions === undefined) {
+                resolutions = this.ts.createModeAwareCache();
+                result.set(filePath, resolutions);
+            }
+            resolutions.set(moduleName, mode, resolution);
+        });
+        return result;
+    }
+
+    typeReferenceResolutionsOf(nativeFileName) {
+        let resolutions = this.typeReferenceResolutions.get(nativeFileName);
+        if (resolutions !== undefined) {
+            return resolutions;
+        }
+        const { ts } = this;
+        resolutions = ts.createModeAwareCache();
+        this.typeReferenceResolutions.set(nativeFileName, resolutions);
+        const sourceFile = this.sourceFileOfNative(nativeFileName);
+        const references = sourceFile?.typeReferenceDirectives ?? [];
+        const entries = references.map(reference => ({ name: ts.toFileNameLowerCase(reference.fileName), mode: reference.resolutionMode || this.getDefaultResolutionModeForFile(sourceFile) }));
+        const results = this.requestBatch("getResolvedTypeReferenceDirective", entries.map(({ name, mode }) => ({ file: nativeFileName, typeDirectiveName: name, mode: mode ?? 0 })));
+        entries.forEach(({ name, mode }, index) => {
+            const result = results[index];
+            const resolved = result === undefined || result === null || result instanceof Error ? undefined : {
+                primary: result.primary,
+                resolvedFileName: this.toJsFileName(result.resolvedFileName),
+                originalPath: result.originalPath || undefined,
+                packageId: toPackageId(result.packageId),
+                isExternalLibraryImport: result.isExternalLibraryImport ?? false,
+            };
+            resolutions.set(name, mode, { resolvedTypeReferenceDirective: resolved, failedLookupLocations: undefined, affectingLocations: undefined, resolutionDiagnostics: undefined });
+        });
+        return resolutions;
+    }
+
+    getResolvedTypeReferenceDirective(file, typeDirectiveName, mode) {
+        const nativeFileName = this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName));
+        return nativeFileName === undefined ? undefined : this.typeReferenceResolutionsOf(nativeFileName).get(typeDirectiveName, mode);
+    }
+
+    getResolvedTypeReferenceDirectiveFromTypeReferenceDirective(typeReference, sourceFile) {
+        return this.getResolvedTypeReferenceDirective(sourceFile, typeReference.fileName, typeReference.resolutionMode || this.getDefaultResolutionModeForFile(sourceFile));
+    }
+
+    forEachResolvedTypeReferenceDirective(callback, file) {
+        const nativeFileNames = file === undefined ? this.nativeFileNames : [this.pathToNativeFileName.get(file.path ?? this.toPath(file.fileName))].filter(name => name !== undefined);
+        for (const nativeFileName of nativeFileNames) {
+            const filePath = this.toPath(this.toJsFileName(nativeFileName));
+            this.typeReferenceResolutionsOf(nativeFileName).forEach((resolution, name, mode) => callback(resolution, name, mode, filePath));
+        }
+    }
+
+    get resolvedTypeReferenceDirectiveNames() {
+        const result = new Map();
+        this.forEachResolvedTypeReferenceDirective((resolution, name, mode, filePath) => {
+            let resolutions = result.get(filePath);
+            if (resolutions === undefined) {
+                resolutions = this.ts.createModeAwareCache();
+                result.set(filePath, resolutions);
+            }
+            resolutions.set(name, mode, resolution);
+        });
+        return result;
+    }
+
+    // TS 6.0: src/compiler/program.ts findSourceFileWorker records the package of each file found
+    // through a resolution with a package id.
+    get sourceFileToPackageName() {
+        if (this.packageNames === undefined) {
+            this.packageNames = new Map();
+            this.packageMap = new Map();
+            this.forEachResolvedModule(resolution => {
+                const resolved = resolution.resolvedModule;
+                if (resolved?.packageId === undefined) {
+                    return;
+                }
+                const packageName = this.ts.packageIdToPackageName(resolved.packageId);
+                const path = this.toPath(resolved.resolvedFileName);
+                if (!this.packageNames.has(path)) {
+                    this.packageNames.set(path, packageName);
+                }
+                // TS 6.0: src/compiler/program.ts processImportedModules
+                this.packageMap.set(resolved.packageId.name, (this.packageMap.get(resolved.packageId.name) ?? false) || resolved.extension === this.ts.Extension.Dts);
+            });
+        }
+        return this.packageNames;
+    }
+
+    getCurrentPackagesMap() {
+        void this.sourceFileToPackageName;
+        return this.packageMap;
+    }
+
+    typesPackageExists(packageName) {
+        return this.getCurrentPackagesMap().has(this.ts.getTypesPackageName(packageName));
+    }
+
+    packageBundlesTypes(packageName) {
+        return !!this.getCurrentPackagesMap().get(packageName);
+    }
+
+    get redirectTargetsMap() {
+        this.redirectTargets ??= this.ts.createMultiMap();
+        return this.redirectTargets;
+    }
+
+    // TS 6.0: src/compiler/program.ts collectExternalModuleReferences, over the files that are not
+    // from node_modules.
+    get usesUriStyleNodeCoreModules() {
+        if (this.uriStyleNodeCoreModules === undefined) {
+            const { ts } = this;
+            let uses;
+            for (const sourceFile of this.getSourceFiles()) {
+                if (sourceFile.isDeclarationFile || this.isSourceFileFromExternalLibrary(sourceFile)) {
+                    continue;
+                }
+                for (const literal of sourceFile.imports) {
+                    if (literal.text.startsWith("node:") && !ts.exclusivelyPrefixedNodeCoreModules.has(literal.text)) {
+                        uses = true;
+                        break;
+                    }
+                    if (uses === undefined && ts.unprefixedNodeCoreModules.has(literal.text)) {
+                        uses = false;
+                    }
+                }
+                if (uses) {
+                    break;
+                }
+            }
+            this.uriStyleNodeCoreModules = { uses };
+        }
+        return this.uriStyleNodeCoreModules.uses;
+    }
+
+    // TS 6.0: src/compiler/program.ts resolvedLibReferences
+    get resolvedLibReferences() {
+        if (this.libReferences === undefined) {
+            this.libReferences = new Map();
+            for (const nativeFileName of this.nativeFileNames) {
+                if (nativeFileName.startsWith(bundledLibs)) {
+                    this.libReferences.set(nativeFileName.slice(bundledLibs.length), { resolution: { resolvedModule: undefined }, actual: this.toJsFileName(nativeFileName) });
+                }
+            }
+        }
+        return this.libReferences;
+    }
+
+    getLibFileFromReference(reference) {
+        const libFileName = this.ts.getLibFileNameFromLibReference(reference);
+        const actual = libFileName && this.resolvedLibReferences.get(libFileName)?.actual;
+        return actual === undefined ? undefined : this.getSourceFile(actual);
+    }
+
+    // TS 6.0: src/compiler/program.ts getSourceFileFromReference
+    getSourceFileFromReference(referencingFile, reference) {
+        const { ts } = this;
+        const fileName = ts.resolveTripleslashReference(reference.fileName, referencingFile.fileName);
+        if (ts.hasExtension(fileName)) {
+            return this.getSourceFile(fileName);
+        }
+        for (const extension of ts.getSupportedExtensions(this.options).flat()) {
+            const sourceFile = this.getSourceFile(fileName + extension);
+            if (sourceFile !== undefined) {
+                return sourceFile;
+            }
+        }
+        return undefined;
+    }
+
+    getModuleResolutionCache() {
+        this.moduleResolutionCache ??= this.host.getModuleResolutionCache?.() ?? this.ts.createModuleResolutionCache(this.currentDirectory, this.getCanonicalFileName, this.options);
+        return this.moduleResolutionCache;
+    }
+
+    getFilesByNameMap() {
+        const result = new Map();
+        for (const nativeFileName of this.nativeFileNames) {
+            result.set(this.toPath(this.toJsFileName(nativeFileName)), this.sourceFileOfNative(nativeFileName));
+        }
+        for (const path of this.getMissingFilePaths().keys()) {
+            result.set(path, false);
+        }
+        return result;
+    }
+
+    // TS 6.0: src/compiler/program.ts missingFileNames: root files and `/// <reference path>`
+    // targets that are not in the program.
+    getMissingFilePaths() {
+        if (this.missingFilePaths === undefined) {
+            const { ts } = this;
+            const missing = new Map();
+            const addMissing = fileName => {
+                const path = this.toPath(fileName);
+                if (!this.pathToNativeFileName.has(path)) {
+                    missing.set(path, fileName);
+                }
+            };
+            for (const name of this.rootNames) {
+                addMissing(ts.normalizePath(name));
+            }
+            if (!this.options.noResolve) {
+                for (const nativeFileName of this.nativeFileNames.filter(name => !name.startsWith(bundledLibs))) {
+                    const sourceFile = this.sourceFileOfNative(nativeFileName);
+                    for (const reference of sourceFile.referencedFiles) {
+                        const fileName = ts.resolveTripleslashReference(reference.fileName, sourceFile.fileName);
+                        if (ts.hasExtension(fileName) && this.getSourceFileFromReference(sourceFile, reference) === undefined) {
+                            addMissing(fileName);
+                        }
+                    }
+                }
+            }
+            this.missingFilePaths = missing;
+        }
+        return this.missingFilePaths;
+    }
+
+    // TS 6.0: src/compiler/program.ts fileReasons, rebuilt from the program's files and resolutions.
+    getFileIncludeReasons() {
+        if (this.fileIncludeReasons !== undefined) {
+            return this.fileIncludeReasons;
+        }
+        const { ts } = this;
+        const { FileIncludeKind } = ts;
+        const reasons = ts.createMultiMap();
+        const add = (fileName, reason) => {
+            const path = fileName === undefined ? undefined : this.toPath(fileName);
+            if (path !== undefined && this.pathToNativeFileName.has(path)) {
+                reasons.add(path, reason);
+            }
+        };
+        this.rootNames.forEach((name, index) => add(ts.normalizePath(name), { kind: FileIncludeKind.RootFile, index }));
+        const libs = this.options.lib?.map(lib => ts.libMap.get(lib.toLowerCase()) ?? lib);
+        for (const nativeFileName of this.nativeFileNames) {
+            const fileName = this.toJsFileName(nativeFileName);
+            const sourceFile = this.sourceFileOfNative(nativeFileName);
+            if (nativeFileName.startsWith(bundledLibs)) {
+                const index = libs?.indexOf(nativeFileName.slice(bundledLibs.length));
+                if (libs === undefined || index !== -1) {
+                    reasons.add(this.toPath(fileName), libs === undefined ? { kind: FileIncludeKind.LibFile } : { kind: FileIncludeKind.LibFile, index });
+                }
+            }
+            sourceFile.libReferenceDirectives.forEach((reference, index) => {
+                add(this.getLibFileFromReference(reference)?.fileName, { kind: FileIncludeKind.LibReferenceDirective, file: sourceFile.path, index });
+            });
+            sourceFile.referencedFiles.forEach((reference, index) => {
+                add(this.getSourceFileFromReference(sourceFile, reference)?.fileName, { kind: FileIncludeKind.ReferenceFile, file: sourceFile.path, index });
+            });
+            if (nativeFileName.startsWith(bundledLibs)) {
+                continue;
+            }
+            sourceFile.typeReferenceDirectives.forEach((reference, index) => {
+                const resolution = this.getResolvedTypeReferenceDirectiveFromTypeReferenceDirective(reference, sourceFile);
+                add(resolution?.resolvedTypeReferenceDirective?.resolvedFileName, { kind: FileIncludeKind.TypeReferenceDirective, file: sourceFile.path, index });
+            });
+            // TS 6.0: src/compiler/program.ts processImportedModules adds files for imports only.
+            sourceFile.imports.forEach((literal, index) => {
+                const resolved = this.getResolvedModule(sourceFile, literal.text, this.getModeForUsageLocation(sourceFile, literal))?.resolvedModule;
+                if (resolved === undefined || ts.getResolutionDiagnostic(this.options, resolved, sourceFile) || (!ts.isInJSFile(literal) && (literal.flags & ts.NodeFlags.JSDoc))) {
+                    return;
+                }
+                add(resolved.resolvedFileName, { kind: FileIncludeKind.Import, file: sourceFile.path, index });
+            });
+        }
+        this.getAutomaticTypeDirectiveResolutions().forEach((resolution, typeReference) => {
+            const resolved = resolution.resolvedTypeReferenceDirective;
+            add(resolved?.resolvedFileName, { kind: FileIncludeKind.AutomaticTypeDirectiveFile, typeReference, packageId: resolved?.packageId });
+        });
+        this.fileIncludeReasons = reasons;
+        return reasons;
+    }
+
+    // TS 6.0: src/compiler/program.ts getCommonSourceDirectory
+    getCommonSourceDirectory() {
+        if (this.commonSourceDirectory === undefined) {
+            const { ts } = this;
+            const emittedFiles = this.getSourceFiles().filter(file => ts.sourceFileMayBeEmitted(file, this));
+            this.commonSourceDirectory = ts.getCommonSourceDirectory(
+                this.options,
+                () => emittedFiles.filter(file => !file.isDeclarationFile).map(file => file.fileName),
+                this.currentDirectory,
+                this.getCanonicalFileName,
+            );
+        }
+        return this.commonSourceDirectory;
+    }
+
+    // TS 6.0: src/compiler/program.ts isEmittedFile
+    isEmittedFile(file) {
+        const { ts, options } = this;
+        if (options.noEmit) {
+            return false;
+        }
+        const filePath = this.toPath(file);
+        if (this.getSourceFileByPath(filePath)) {
+            return false;
+        }
+        const isSameFile = (a, b) => ts.comparePaths(a, b, this.currentDirectory, !this.host.useCaseSensitiveFileNames()) === ts.Comparison.EqualTo;
+        if (options.outFile) {
+            return isSameFile(filePath, options.outFile) || isSameFile(filePath, ts.removeFileExtension(options.outFile) + ts.Extension.Dts);
+        }
+        if (options.declarationDir && ts.containsPath(options.declarationDir, filePath, this.currentDirectory, !this.host.useCaseSensitiveFileNames())) {
+            return true;
+        }
+        if (options.outDir) {
+            return ts.containsPath(options.outDir, filePath, this.currentDirectory, !this.host.useCaseSensitiveFileNames());
+        }
+        if (ts.fileExtensionIsOneOf(filePath, ts.supportedJSExtensionsFlat) || ts.isDeclarationFileName(filePath)) {
+            const filePathWithoutExtension = ts.removeFileExtension(filePath);
+            return !!this.getSourceFileByPath(filePathWithoutExtension + ts.Extension.Ts) || !!this.getSourceFileByPath(filePathWithoutExtension + ts.Extension.Tsx);
+        }
+        return false;
+    }
+
+    // Project references: TS 6.0 parses the referenced configs in JS; tsc-rs builds the program.
+
+    getProjectReferences() {
+        return this.projectReferences;
+    }
+
+    getResolvedProjectReferences() {
+        if (this.resolvedProjectReferences === undefined && this.projectReferences !== undefined) {
+            this.projectReferenceRedirects = new Map();
+            this.sourceFileToResolvedRef = new Map();
+            this.outputFileToResolvedRef = new Map();
+            this.resolvedProjectReferences = this.projectReferences.map(reference => this.parseProjectReferenceConfigFile(reference));
+        }
+        return this.resolvedProjectReferences;
+    }
+
+    // TS 6.0: src/compiler/program.ts parseProjectReferenceConfigFile
+    parseProjectReferenceConfigFile(reference) {
+        const { ts, host } = this;
+        const refPath = ts.resolveProjectReferencePath(reference);
+        const sourceFilePath = this.toPath(refPath);
+        const fromCache = this.projectReferenceRedirects.get(sourceFilePath);
+        if (fromCache !== undefined) {
+            return fromCache || undefined;
+        }
+        let commandLine;
+        let sourceFile;
+        if (host.getParsedCommandLine) {
+            commandLine = host.getParsedCommandLine(refPath);
+            sourceFile = commandLine?.options.configFile;
+        }
+        else {
+            sourceFile = host.getSourceFile(refPath, ts.ScriptTarget.JSON);
+            if (sourceFile !== undefined) {
+                const basePath = ts.getNormalizedAbsolutePath(ts.getDirectoryPath(refPath), this.currentDirectory);
+                commandLine = ts.parseJsonSourceFileConfigFileContent(sourceFile, ts.parseConfigHostFromCompilerHostLike(host), basePath, undefined, refPath);
+            }
+        }
+        if (commandLine === undefined || sourceFile === undefined) {
+            this.projectReferenceRedirects.set(sourceFilePath, false);
+            return undefined;
+        }
+        sourceFile.fileName = refPath;
+        sourceFile.path = sourceFilePath;
+        sourceFile.resolvedPath = sourceFilePath;
+        sourceFile.originalFileName = refPath;
+        const resolvedRef = { commandLine, sourceFile };
+        this.projectReferenceRedirects.set(sourceFilePath, resolvedRef);
+        if (this.options.configFile !== sourceFile) {
+            this.mapProjectReferenceFiles(resolvedRef);
+        }
+        if (commandLine.projectReferences) {
+            resolvedRef.references = commandLine.projectReferences.map(child => this.parseProjectReferenceConfigFile(child));
+        }
+        return resolvedRef;
+    }
+
+    mapProjectReferenceFiles(resolvedRef) {
+        const { ts } = this;
+        const { commandLine } = resolvedRef;
+        const ignoreCase = !this.host.useCaseSensitiveFileNames();
+        let outDts;
+        if (commandLine.options.outFile) {
+            outDts = ts.changeExtension(commandLine.options.outFile, ts.Extension.Dts);
+            this.outputFileToResolvedRef.set(this.toPath(outDts), { resolvedRef });
+        }
+        const getCommonSourceDirectory = ts.memoize(() => ts.getCommonSourceDirectoryOfConfig(commandLine, ignoreCase));
+        for (const fileName of commandLine.fileNames) {
+            let outputDts;
+            if (!ts.isDeclarationFileName(fileName) && !ts.fileExtensionIs(fileName, ts.Extension.Json)) {
+                if (commandLine.options.outFile) {
+                    outputDts = outDts;
+                }
+                else {
+                    outputDts = ts.getOutputDeclarationFileName(fileName, commandLine, ignoreCase, getCommonSourceDirectory);
+                    this.outputFileToResolvedRef.set(this.toPath(outputDts), { resolvedRef, source: fileName });
+                }
+            }
+            this.sourceFileToResolvedRef.set(this.toPath(fileName), { resolvedRef, outputDts });
+        }
+    }
+
+    forEachResolvedProjectReference(callback) {
+        return this.ts.forEachResolvedProjectReference(this.getResolvedProjectReferences(), callback);
+    }
+
+    getRedirectFromSourceFile(fileName) {
+        this.getResolvedProjectReferences();
+        return this.sourceFileToResolvedRef?.get(this.toPath(fileName));
+    }
+
+    getRedirectFromOutput(path) {
+        this.getResolvedProjectReferences();
+        return this.outputFileToResolvedRef?.get(path);
+    }
+
+    // tsc-rs programs hold the source files of referenced projects, as TS 6.0 does with
+    // useSourceOfProjectReferenceRedirect (its language service), not their declaration outputs.
+    isSourceOfProjectReferenceRedirect(fileName) {
+        return this.getRedirectFromSourceFile(fileName) !== undefined;
+    }
+
+    getResolvedProjectReferenceByPath(projectReferencePath) {
+        this.getResolvedProjectReferences();
+        return this.projectReferenceRedirects?.get(projectReferencePath) || undefined;
+    }
+
+    // Host access, as TS 6.0's program forwards it.
+
+    fileExists(fileName) {
+        return this.host.fileExists(fileName);
+    }
+
+    readFile(fileName) {
+        return this.host.readFile(fileName);
+    }
+
+    directoryExists(directoryName) {
+        return this.host.directoryExists === undefined ? true : this.host.directoryExists(directoryName);
+    }
+
+    realpath(path) {
+        return this.host.realpath === undefined ? path : this.host.realpath(path);
+    }
+
+    getSymlinkCache() {
+        this.symlinkCache ??= this.host.getSymlinkCache?.() ?? this.ts.createSymlinkCache(this.currentDirectory, this.getCanonicalFileName);
+        return this.symlinkCache;
+    }
+
+    useCaseSensitiveFileNames() {
+        return this.host.useCaseSensitiveFileNames();
+    }
+
+    // TS 6.0: src/compiler/program.ts writeFile
+    writeFile(fileName, text, writeByteOrderMark, onError, sourceFiles, data) {
+        this.host.writeFile(fileName, text, writeByteOrderMark, onError, sourceFiles, data);
+    }
+
+    getGlobalTypingsCacheLocation() {
+        return this.host.getGlobalTypingsCacheLocation?.();
+    }
+}
+
+// What TS 6.0's tryReuseStructureFromOldProgram compares between two versions of a file.
+function structureKey(ts, sourceFile) {
+    const names = nodes => nodes.map(node => node.text).join("\0");
+    const references = references => references.map(reference => `${reference.fileName}:${reference.resolutionMode ?? ""}:${reference.preserve ?? ""}`).join("\0");
+    return [
+        sourceFile.impliedNodeFormat,
+        sourceFile.hasNoDefaultLib,
+        sourceFile.flags & ts.NodeFlags.PermanentlySetIncrementalFlags,
+        references(sourceFile.referencedFiles),
+        references(sourceFile.typeReferenceDirectives),
+        references(sourceFile.libReferenceDirectives),
+        names(sourceFile.imports),
+        names(sourceFile.moduleAugmentations),
+    ].join("\n");
+}
+
+// TS 6.0's PackageId leaves peerDependencies undefined when there are none.
+function toPackageId(packageId) {
+    if (!packageId) {
+        return undefined;
+    }
+    const { name, subModuleName, version, peerDependencies } = packageId;
+    return { name, subModuleName, version, peerDependencies: peerDependencies || undefined };
+}
+
+function diagnosticKey(diagnostic) {
+    const text = typeof diagnostic.messageText === "string" ? diagnostic.messageText : diagnostic.messageText.messageText;
+    return `${diagnostic.code}\0${text}`;
+}
+
+const programMethods = Object.getOwnPropertyNames(NativeProgram.prototype).filter(name => name !== "constructor" && typeof Object.getOwnPropertyDescriptor(NativeProgram.prototype, name).value === "function");
+
+// TS 6.0: src/compiler/program.ts createSyntheticImport
+function createSyntheticImport(ts, text, file) {
+    const literal = ts.factory.createStringLiteral(text);
+    const declaration = ts.factory.createImportDeclaration(undefined, undefined, literal);
+    ts.addInternalEmitFlags(declaration, ts.InternalEmitFlags.NeverApplyImportHelper);
+    ts.setParent(literal, declaration);
+    ts.setParent(declaration, file);
+    literal.flags &= ~ts.NodeFlags.Synthesized;
+    declaration.flags &= ~ts.NodeFlags.Synthesized;
+    return literal;
+}
+
+// TS 6.0: src/compiler/program.ts shouldTransformImportCallWorker
+function shouldTransformImportCall(ts, sourceFile, options) {
+    const moduleKind = ts.getEmitModuleKind(options);
+    if ((ts.ModuleKind.Node16 <= moduleKind && moduleKind <= ts.ModuleKind.NodeNext) || moduleKind === ts.ModuleKind.Preserve) {
+        return false;
+    }
+    return ts.getEmitModuleFormatOfFileWorker(sourceFile, options) < ts.ModuleKind.ES2015;
+}
+
+// TS 6.0: src/compiler/program.ts getEmitSyntaxForUsageLocationWorker
+function getEmitSyntaxForUsageLocation(ts, file, usage, options) {
+    const exprParentParent = ts.walkUpParenthesizedExpressions(usage.parent)?.parent;
+    if ((exprParentParent && ts.isImportEqualsDeclaration(exprParentParent)) || ts.isRequireCall(usage.parent, false)) {
+        return ts.ModuleKind.CommonJS;
+    }
+    if (ts.isImportCall(ts.walkUpParenthesizedExpressions(usage.parent))) {
+        return shouldTransformImportCall(ts, file, options) ? ts.ModuleKind.CommonJS : ts.ModuleKind.ESNext;
+    }
+    const fileEmitMode = ts.getEmitModuleFormatOfFileWorker(file, options);
+    if (fileEmitMode === ts.ModuleKind.CommonJS) {
+        return ts.ModuleKind.CommonJS;
+    }
+    return ts.emitModuleKindIsNonNodeESM(fileEmitMode) || fileEmitMode === ts.ModuleKind.Preserve ? ts.ModuleKind.ESNext : undefined;
+}
+
+// The members of TS 6.0's TypeChecker (src/compiler/checker.ts createTypeChecker). Those that
+// ./checker.js does not provide answer from the program or throw a "not supported" error, so that
+// TS 6.0 code that needs the TS 6.0 checker (language service quick info, completions, find
+// references, ...) stops with a clear message.
+const typeCheckerMembers = "containsArgumentsReference createAnonymousType createArrayType createIndexInfo createPromiseType createSignature createSymbol fillMissingTypeArguments forEachExportAndPropertyOfModule getAccessibleSymbolChain getAliasedSymbol getAllPossiblePropertiesOfTypes getAmbientModules getAnyAsyncIterableType getAnyType getApparentType getAugmentedPropertiesOfType getAwaitedType getBaseConstraintOfType getBaseTypeOfLiteralType getBaseTypes getBigIntLiteralType getBigIntType getBooleanType getCandidateSignaturesForStringLiteralCompletions getConstantValue getContextualType getContextualTypeForArgumentAtIndex getContextualTypeForJsxAttribute getContextualTypeForObjectLiteralElement getDeclaredTypeOfSymbol getDefaultFromTypeParameter getDiagnostics getESSymbolType getElementTypeOfArrayType getEmitResolver getExactOptionalProperties getExpandedParameters getExportSpecifierLocalTargetSymbol getExportSymbolOfSymbol getExportsAndPropertiesOfModule getExportsOfModule getFalseType getFullyQualifiedName getGlobalDiagnostics getIdentifierCount getImmediateAliasedSymbol getIndexInfoOfType getIndexInfosAtLocation getIndexInfosOfIndexSymbol getIndexInfosOfType getIndexType getIndexTypeOfType getInstantiationCount getJsxFragmentFactory getJsxIntrinsicTagNamesAt getJsxNamespace getLocalTypeParametersOfClassOrInterfaceOrTypeAlias getMemberOverrideModifierStatus getMergedSymbol getNeverType getNodeCount getNonNullableType getNonOptionalType getNonPrimitiveType getNullType getNullableType getNumberLiteralType getNumberType getOptionalType getParameterIdentifierInfoAtPosition getParameterType getPrivateIdentifierPropertyOfType getPromiseLikeType getPromiseType getPromisedTypeOfPromise getPropertiesOfType getPropertyOfType getPropertySymbolOfDestructuringAssignment getRecursionIdentity getRelationCacheSizes getResolvedSignature getResolvedSignatureForSignatureHelp getReturnTypeOfSignature getRootSymbols getShorthandAssignmentValueSymbol getSignatureFromDeclaration getSignaturesOfType getStringLiteralType getStringType getSuggestedSymbolForNonexistentClassMember getSuggestedSymbolForNonexistentJSXAttribute getSuggestedSymbolForNonexistentModule getSuggestedSymbolForNonexistentProperty getSuggestedSymbolForNonexistentSymbol getSuggestionDiagnostics getSymbolAtLocation getSymbolCount getSymbolFlags getSymbolOfExpando getSymbolWalker getSymbolsInScope getSymbolsOfParameterPropertyDeclaration getTrueType getTypeArgumentConstraint getTypeArguments getTypeArgumentsForResolvedSignature getTypeAtLocation getTypeCount getTypeFromTypeNode getTypeOfAssignmentPattern getTypeOfPropertyOfContextualType getTypeOfPropertyOfType getTypeOfSymbol getTypeOfSymbolAtLocation getTypeOnlyAliasDeclaration getTypePredicateOfSignature getUndefinedType getUnionType getUnknownType getUnmatchedProperties getVoidType getWidenedLiteralType getWidenedType hasEffectiveRestParameter indexInfoToIndexSignatureDeclaration isArgumentsSymbol isArrayLikeType isArrayType isContextSensitive isDeclarationVisible isEmptyAnonymousObjectType isImplementationOfOverload isLibType isNullableType isOptionalParameter isPropertyAccessible isSymbolAccessible isTupleType isTypeAssignableTo isTypeInvalidDueToUnionDiscriminant isTypeParameterPossiblyReferenced isUndefinedSymbol isUnknownSymbol isValidPropertyAccess isValidPropertyAccessForCompletions requiresAddingImplicitUndefined resolveExternalModuleName resolveExternalModuleSymbol resolveName runWithCancellationToken signatureToSignatureDeclaration signatureToString symbolIsValue symbolToEntityName symbolToExpression symbolToNode symbolToParameterDeclaration symbolToString symbolToTypeParameterDeclarations tryFindAmbientModule tryGetMemberInModuleExports tryGetMemberInModuleExportsAndProperties tryGetThisTypeAt typeHasCallOrConstructSignatures typeParameterToDeclaration typePredicateToString typePredicateToTypePredicateNode typeToString typeToTypeNode writeSignature writeSymbol writeType writeTypePredicate".split(" ");
+
+function completeChecker(program, checker) {
+    const fromProgram = {
+        getNodeCount: () => program.getNodeCount(),
+        getIdentifierCount: () => program.getIdentifierCount(),
+        getSymbolCount: () => program.getSymbolCount(),
+        getTypeCount: () => program.getTypeCount(),
+        getInstantiationCount: () => program.getInstantiationCount(),
+        getRelationCacheSizes: () => program.getRelationCacheSizes(),
+        getDiagnostics: (sourceFile, cancellationToken) => program.getSemanticDiagnostics(sourceFile, cancellationToken),
+        getGlobalDiagnostics: () => program.getGlobalDiagnostics(),
+        getSuggestionDiagnostics: (sourceFile, cancellationToken) => program.getSuggestionDiagnostics(sourceFile, cancellationToken),
+        // TS 6.0: src/compiler/checker.ts runWithCancellationToken
+        runWithCancellationToken: (cancellationToken, callback) => callback(checker),
+    };
+    for (const name of typeCheckerMembers) {
+        if (name in checker) {
+            continue;
+        }
+        checker[name] = fromProgram[name] ?? (() => {
+            throw new Error(`tsc-rs: checker.${name} is not supported: it needs the TypeScript 6.0 checker, which does not run here`);
+        });
+    }
+    return checker;
+}
+
+// Language service features whose TS 6.0 implementation reads the TS 6.0 checker's internals
+// (src/services/services.ts). Where tsc-rs's checker cannot answer them, they fail with a
+// "not supported" error instead of a TypeError from deep inside TS 6.0's services.
+const checkerFeatures = [
+    "applyCodeActionCommand",
+    "findReferences",
+    "findRenameLocations",
+    "getApplicableRefactors",
+    "getCombinedCodeFix",
+    "getCodeFixesAtPosition",
+    "getCompletionEntryDetails",
+    "getCompletionEntrySymbol",
+    "getCompletionsAtPosition",
+    "getDefinitionAndBoundSpan",
+    "getDefinitionAtPosition",
+    "getDocumentHighlights",
+    "getEditsForFileRename",
+    "getEditsForRefactor",
+    "getEncodedSemanticClassifications",
+    "getFileReferences",
+    "getImplementationAtPosition",
+    "getInlayHints",
+    "getMoveToRefactoringFileSuggestions",
+    "getNavigateToItems",
+    "getQuickInfoAtPosition",
+    "getReferencesAtPosition",
+    "getRenameInfo",
+    "getSemanticClassifications",
+    "getSignatureHelpItems",
+    "getTypeDefinitionAtPosition",
+    "organizeImports",
+    "prepareCallHierarchy",
+    "provideCallHierarchyIncomingCalls",
+    "provideCallHierarchyOutgoingCalls",
+];
+
+function wrapLanguageService(service) {
+    if (service.tsrsCheckerFeatures) {
+        return service;
+    }
+    for (const name of checkerFeatures) {
+        const feature = service[name];
+        if (typeof feature !== "function") {
+            continue;
+        }
+        service[name] = (...args) => {
+            try {
+                return feature(...args);
+            }
+            catch (error) {
+                throw notSupportedFeature(name, error);
+            }
+        };
+    }
+    service.tsrsCheckerFeatures = true;
+    return service;
+}
+
+function notSupportedFeature(name, error) {
+    const obscure = error instanceof TypeError || (error instanceof Error && error.message.startsWith("Debug Failure."));
+    if (!obscure) {
+        return error;
+    }
+    return new Error(`tsc-rs: languageService.${name} is not supported here: it needs the TypeScript 6.0 checker (${error.message})`, { cause: error });
+}
+
+// The node of `sourceFile` with this kind and range, searched from the top.
+function findNode(ts, sourceFile, kind, pos, end) {
+    let found;
+    const visit = node => {
+        if (found !== undefined || node.pos > pos || node.end < end) {
+            return;
+        }
+        if (node.kind === kind && node.pos === pos && node.end === end) {
+            found = node;
+            return;
+        }
+        for (const jsDoc of node.jsDoc ?? ts.emptyArray) {
+            visit(jsDoc);
+        }
+        ts.forEachChild(node, visit, nodes => nodes.forEach(visit));
+    };
+    visit(sourceFile);
+    return found;
+}
+
+function install(ts, hooks, originals) {
+    const host = require("./host.js");
+    host.installServerProjectTracking(ts);
+    hooks.createProgram = (...args) => createProgram(ts, ...args);
+    hooks.createCompilerHostWorker = (...args) => host.createCompilerHostWorker(ts, originals.createCompilerHostWorker, ...args);
+    hooks.createTypeChecker = () => {
+        throw new Error("tsc-rs: the TypeScript 6.0 type checker does not run here; programs and checkers come from tsc-rs");
+    };
+    if (originals.createLanguageService !== undefined) {
+        hooks.createLanguageService = (...args) => wrapLanguageService(originals.createLanguageService(...args));
+        return;
+    }
+    // Without that hook point, at least the language services of ts.server projects.
+    const project = ts.server?.Project?.prototype;
+    if (project !== undefined) {
+        const getLanguageService = project.getLanguageService;
+        project.getLanguageService = function getWrappedLanguageService(...args) {
+            const service = getLanguageService.apply(this, args);
+            return service === undefined ? service : wrapLanguageService(service);
+        };
+    }
+}
+
+module.exports = { createProgram, install, NativeProgram, programOfSourceFile };
