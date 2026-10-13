@@ -3092,24 +3092,16 @@ mod flat_arena {
 
         #[inline]
         fn index(&self, i: usize) -> &T {
-            if i < self.items.len() {
-                &self.items[i]
-            } else {
-                std::hint::cold_path();
-                self.rest_entry(i)
-            }
+            // STUDY (not for merge): the read of round 1, no `rest`.
+            &self.items[i]
         }
     }
 
     impl<T> std::ops::IndexMut<usize> for ChunkedArena<T> {
         #[inline]
         fn index_mut(&mut self, i: usize) -> &mut T {
-            if i < self.items.len() {
-                &mut self.items[i]
-            } else {
-                std::hint::cold_path();
-                self.rest_entry_mut(i)
-            }
+            // STUDY (not for merge): the read of round 1, no `rest`.
+            &mut self.items[i]
         }
     }
 
